@@ -1,0 +1,37 @@
+# 基础科学计算
+numpy
+scipy
+matplotlib
+pillow
+
+# 计算机视觉常用库
+opencv-python
+opencv-contrib-python
+scikit-image
+imageio
+
+# 深度学习框架
+torch
+torchvision
+torchaudio
+tensorflow
+tensorflow-datasets
+
+# 数据增强 & 图像处理
+albumentations
+imgaug
+
+# Jupyter 支持
+jupyter
+notebook
+ipykernel
+
+fastapi
+uvicorn
+pydantic
+python-multipart
+
+# 原代码中其他的库
+sklearn
+joblib
+timm
