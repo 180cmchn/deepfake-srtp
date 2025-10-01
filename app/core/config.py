@@ -20,6 +20,18 @@ class Settings(BaseSettings):
         extra="allow"
     )
     
+    # Application Settings
+    APP_NAME: str = "Deepfake Detection Platform"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = False
+    ENVIRONMENT: str = "development"
+    
+    # Server Settings
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    WORKERS: int = 1
+    RELOAD: bool = False
+    
     # API Settings
     API_V1_STR: str = "/api/v1"
     PROJECT_NAME: str = "Deepfake Detection Platform"
@@ -62,12 +74,31 @@ class Settings(BaseSettings):
     MODEL_DIR: str = "./models"
     LOG_DIR: str = "./logs"
     DATA_DIR: str = "./data"
+    MODELS_DIR: str = "./models"  # Added for consistency with .env
+    
+    # Logging Settings
+    LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: str = "json"
     
     # Model Settings
     DEFAULT_MODEL_TYPE: str = "vgg"
-    SUPPORTED_MODELS: List[str] = ["vgg", "lrcn", "swin", "vit", "resnet"]
+    _SUPPORTED_MODELS: str = "vgg,lrcn,swin,vit,resnet"
     MODEL_BATCH_SIZE: int = 32
     MODEL_INPUT_SIZE: int = 224
+    
+    @property
+    def SUPPORTED_MODELS(self) -> List[str]:
+        """Convert comma-separated string to list of strings"""
+        if hasattr(self, '_supported_models_cache'):
+            return self._supported_models_cache
+        
+        models_str = os.getenv('SUPPORTED_MODELS', self._SUPPORTED_MODELS)
+        if isinstance(models_str, str):
+            self._supported_models_cache = [model.strip() for model in models_str.split(",") if model.strip()]
+        else:
+            self._supported_models_cache = ["vgg", "lrcn", "swin", "vit", "resnet"]
+        
+        return self._supported_models_cache
     
     # Training Settings
     MAX_CONCURRENT_TRAINING_JOBS: int = 2
@@ -110,6 +141,25 @@ class Settings(BaseSettings):
     def validate_learning_rate(cls, v):
         if v <= 0:
             raise ValueError('DEFAULT_LEARNING_RATE must be positive')
+        return v
+    
+    @field_validator('PORT', 'WORKERS', mode='before')
+    @classmethod
+    def convert_str_to_int(cls, v):
+        """Convert string values to integers for environment variables"""
+        if isinstance(v, str):
+            try:
+                return int(v)
+            except ValueError:
+                raise ValueError(f'Unable to convert {v} to integer')
+        return v
+    
+    @field_validator('RELOAD', 'DEBUG', mode='before')
+    @classmethod
+    def convert_str_to_bool(cls, v):
+        """Convert string values to booleans for environment variables"""
+        if isinstance(v, str):
+            return v.lower() in ('true', '1', 'yes', 'on')
         return v
     
     @model_validator(mode='after')
