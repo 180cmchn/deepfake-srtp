@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     # Database Settings
     DATABASE_URL: str = "sqlite:///./deepfake_detection.db"
     
+    # MySQL Settings (for MySQL database)
+    MYSQL_HOST: str = "localhost"
+    MYSQL_PORT: int = 3306
+    MYSQL_USER: str = "root"
+    MYSQL_PASSWORD: str = ""
+    MYSQL_DATABASE: str = "deepfake_detection"
+    
+    @property
+    def MYSQL_URL(self) -> str:
+        """Generate MySQL connection URL"""
+        return f"mysql+pymysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DATABASE}"
+    
     # Redis Settings (for Celery)
     REDIS_URL: str = "redis://localhost:6379/0"
     
