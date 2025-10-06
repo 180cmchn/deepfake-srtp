@@ -53,11 +53,30 @@ deepfake-srtp/
 └── README.md                  # This file
 ```
 
+## 💻 System Requirements
+
+### Minimum Requirements
+- **Python**: 3.8 or higher
+- **RAM**: 8GB (16GB recommended for training)
+- **Storage**: 10GB free space (more for datasets and models)
+- **GPU**: Optional, but recommended for training (NVIDIA CUDA-compatible)
+
+### Recommended Requirements
+- **Python**: 3.9 or 3.10
+- **RAM**: 16GB or more
+- **Storage**: 50GB+ SSD
+- **GPU**: NVIDIA GPU with 8GB+ VRAM (RTX 3060 or better)
+
+### Supported Operating Systems
+- Windows 10/11
+- macOS 10.15+
+- Ubuntu 18.04+ / CentOS 7+
+
 ## 🛠️ Installation
 
 1. **Clone the repository**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/180cmchn/deepfake-srtp.git
    cd deepfake-srtp
    ```
 
@@ -86,11 +105,65 @@ deepfake-srtp/
 5. **Initialize database**
    ```bash
    # Create database tables
-   python -c "from app.core.database import init_db; init_db()"
+   python -c "from app.core.database import create_tables; create_tables()"
    
    # Or use Alembic for migrations
    alembic upgrade head
    ```
+
+6. **Test database connection**
+   ```bash
+   python test_db_connection.py
+   ```
+
+## 🔧 Troubleshooting
+
+### Common Issues
+
+1. **CUDA/GPU Issues**
+   ```bash
+   # Check CUDA availability
+   python -c "import torch; print(torch.cuda.is_available())"
+   
+   # If False, install CUDA toolkit or set GPU_ENABLED=False
+   ```
+
+2. **Database Connection Issues**
+   ```bash
+   # Test database connection
+   python test_db_connection.py
+   
+   # For MySQL, ensure pymysql is installed
+   pip install pymysql
+   ```
+
+3. **Memory Issues**
+   - Reduce `BATCH_SIZE` in `.env`
+   - Use smaller model input size
+   - Close other applications
+
+4. **Import Errors**
+   ```bash
+   # Reinstall dependencies
+   pip install -r requirements.txt --force-reinstall
+   ```
+
+### Performance Optimization
+
+1. **Enable GPU acceleration**
+   - Install CUDA toolkit
+   - Set `GPU_ENABLED=True` in `.env`
+   - Use appropriate batch sizes
+
+2. **Database optimization**
+   - Use PostgreSQL/MySQL for production
+   - Configure connection pooling
+   - Enable query logging for debugging
+
+3. **Model optimization**
+   - Use model quantization for inference
+   - Implement model caching
+   - Use appropriate precision (FP16/FP32)
 
 ## 🚀 Running the Application
 
@@ -128,6 +201,29 @@ Key environment variables:
 | `MODEL_INPUT_SIZE` | Input image size for models | `224` |
 | `MAX_CONCURRENT_TRAINING_JOBS` | Max concurrent training jobs | `2` |
 | `GPU_ENABLED` | Enable GPU acceleration | `True` |
+| `HOST` | Server host address | `0.0.0.0` |
+| `PORT` | Server port | `8000` |
+| `DEBUG` | Enable debug mode | `False` |
+| `LOG_LEVEL` | Logging level | `INFO` |
+
+### Database Configuration
+
+The platform supports multiple database backends:
+
+- **SQLite** (default): `sqlite:///./deepfake_detection.db`
+- **PostgreSQL**: `postgresql://user:password@localhost/dbname`
+- **MySQL**: `mysql+pymysql://user:password@localhost/dbname`
+
+### GPU Support
+
+For GPU acceleration, ensure you have CUDA installed and uncomment the following in `requirements.txt`:
+
+```bash
+# torch-audio==2.1.1
+# torchtext==0.16.1
+```
+
+Set `GPU_ENABLED=True` in your `.env` file.
 
 ## 🤖 Supported Models
 
