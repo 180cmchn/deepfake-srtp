@@ -76,3 +76,7 @@ class DatasetProcessingConfig(BaseModel):
     balance_classes: bool = Field(default=True)
     validation_split: float = Field(default=0.2, ge=0.1, le=0.5)
     test_split: float = Field(default=0.1, ge=0.05, le=0.3)
+    # Added missing attributes for dataset creation
+    image_size: int = Field(default=224, ge=32, le=1024)
+    frame_extraction_interval: int = Field(default=4, ge=1, le=30)
+    max_frames_per_video: int = Field(default=20, ge=1, le=100)

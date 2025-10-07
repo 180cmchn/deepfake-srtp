@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
 import uuid
+from pathlib import Path
 
 from app.core.database import get_db
 from app.core.logging import logger
@@ -17,6 +18,54 @@ from app.schemas.datasets import (
 from app.services.dataset_service import DatasetService
 
 router = APIRouter()
+
+# Supported file types
+ALLOWED_IMAGE_TYPES = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
+ALLOWED_VIDEO_TYPES = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm'}
+ALLOWED_TYPES = ALLOWED_IMAGE_TYPES | ALLOWED_VIDEO_TYPES
+
+# File size limits (in bytes)
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+MAX_IMAGE_SIZE = 50 * 1024 * 1024   # 50MB for images
+MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500MB for videos
+
+
+def validate_file(file: UploadFile) -> tuple[str, str]:
+    """Validate file type and size"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    
+    # Check file extension
+    file_extension = Path(file.filename).suffix.lower()
+    if file_extension not in ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported file type: {file_extension}. "
+                   f"Allowed types: {', '.join(sorted(ALLOWED_TYPES))}"
+        )
+    
+    # Determine file type
+    file_type = "image" if file_extension in ALLOWED_IMAGE_TYPES else "video"
+    
+    # Check file size
+    if hasattr(file, 'size') and file.size:
+        if file_type == "image" and file.size > MAX_IMAGE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Image file too large. Maximum size: {MAX_IMAGE_SIZE // (1024*1024)}MB"
+            )
+        elif file_type == "video" and file.size > MAX_VIDEO_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video file too large. Maximum size: {MAX_VIDEO_SIZE // (1024*1024)}MB"
+            )
+        elif file.size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB"
+            )
+    
+    return file_type, file_extension
 
 
 @router.post("/", response_model=DatasetResponse)
@@ -113,25 +162,43 @@ async def upload_dataset(
     db: Session = Depends(get_db)
 ):
     """Upload and process dataset"""
+    file_path = None
     try:
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="No file provided")
+        # Validate file type and size
+        file_type, file_extension = validate_file(file)
         
-        # Generate unique filename
-        file_extension = os.path.splitext(file.filename)[1].lower()
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
+        # Generate unique filename with type prefix
+        type_prefix = "img" if file_type == "image" else "vid"
+        unique_filename = f"{type_prefix}_{uuid.uuid4()}{file_extension}"
         file_path = os.path.join("data", unique_filename)
         
-        # Save uploaded file
+        # Ensure data directory exists
         os.makedirs("data", exist_ok=True)
+        
+        # Read file content with size check
+        content = await file.read()
+        
+        # Additional size check for files without size attribute
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB"
+            )
+        
+        # Save uploaded file
         with open(file_path, "wb") as buffer:
-            content = await file.read()
             buffer.write(content)
+        
+        logger.info("File uploaded successfully", 
+                   filename=file.filename, 
+                   file_type=file_type, 
+                   size=len(content),
+                   saved_path=file_path)
         
         # Create dataset entry
         dataset_data = DatasetCreate(
             name=name or file.filename,
-            description=description,
+            description=description or f"Uploaded {file_type} file",
             path=file_path,
             image_size=config.image_size,
             frame_extraction_interval=config.frame_extraction_interval,
@@ -148,13 +215,42 @@ async def upload_dataset(
             config.dict()
         )
         
+        logger.info("Dataset created and processing started", 
+                   dataset_id=result.id, 
+                   dataset_name=result.name)
+        
         return result
         
     except HTTPException:
+        # Clean up uploaded file if it exists
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info("Cleaned up uploaded file", file_path=file_path)
+            except Exception as cleanup_error:
+                logger.error("Failed to clean up file", 
+                           file_path=file_path, 
+                           error=str(cleanup_error))
         raise
     except Exception as e:
-        logger.error("Failed to upload dataset", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to upload dataset")
+        logger.error("Failed to upload dataset", 
+                   error=str(e), 
+                   filename=file.filename if file else "Unknown")
+        
+        # Clean up uploaded file if it exists
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info("Cleaned up uploaded file after error", file_path=file_path)
+            except Exception as cleanup_error:
+                logger.error("Failed to clean up file after error", 
+                           file_path=file_path, 
+                           error=str(cleanup_error))
+        
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to upload dataset: {str(e)}"
+        )
 
 
 @router.post("/{dataset_id}/process")
