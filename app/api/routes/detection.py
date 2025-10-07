@@ -2,7 +2,7 @@
 Detection API routes for deepfake detection platform
 """
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks, Header, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
@@ -11,6 +11,7 @@ from datetime import datetime
 
 from app.core.database import get_db
 from app.core.logging import logger
+from app.core.auth import get_current_user, get_optional_user
 from app.schemas.detection import (
     DetectionRequest, DetectionResponse, BatchDetectionRequest, 
     BatchDetectionResponse, VideoDetectionRequest, VideoDetectionResponse,
@@ -26,11 +27,13 @@ async def detect_deepfake(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     request: DetectionRequest = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
 ):
     """
     Detect deepfake in uploaded file
     """
+    file_path = None
     try:
         # Validate file
         if not file.filename:
@@ -57,18 +60,46 @@ async def detect_deepfake(
             background_tasks=background_tasks
         )
         
-        logger.info("Detection completed", 
-                   file_name=file.filename, 
-                   result=result.prediction,
-                   confidence=result.confidence)
+        if result.success and result.result:
+            logger.info("Detection completed", 
+                       file_name=file.filename, 
+                       result=result.result.prediction,
+                       confidence=result.result.confidence,
+                       user=current_user)
+        else:
+            logger.info("Detection completed", 
+                       file_name=file.filename, 
+                       success=result.success,
+                       error_message=result.error_message,
+                       user=current_user)
         
         return result
         
     except HTTPException:
+        # Clean up uploaded file if it exists
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info("Cleaned up uploaded file", file_path=file_path)
+            except Exception as cleanup_error:
+                logger.error("Failed to clean up file", 
+                           file_path=file_path, 
+                           error=str(cleanup_error))
         raise
     except Exception as e:
-        logger.error("Detection failed", error=str(e), file_name=file.filename)
-        raise HTTPException(status_code=500, detail="Detection failed")
+        logger.error("Detection failed", error=str(e), file_name=file.filename, user=current_user)
+        
+        # Clean up uploaded file if it exists
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info("Cleaned up uploaded file after error", file_path=file_path)
+            except Exception as cleanup_error:
+                logger.error("Failed to clean up file after error", 
+                           file_path=file_path, 
+                           error=str(cleanup_error))
+        
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
 
 
 @router.post("/detect/batch", response_model=BatchDetectionResponse)
@@ -179,14 +210,19 @@ async def detect_deepfake_video(
 
 @router.get("/history", response_model=DetectionHistoryList)
 async def get_detection_history(
-    skip: int = 0,
-    limit: int = 100,
-    prediction: Optional[str] = None,
-    model_type: Optional[str] = None,
-    db: Session = Depends(get_db)
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
+    prediction: Optional[str] = Query(None, description="Filter by prediction result"),
+    model_type: Optional[str] = Query(None, description="Filter by model type"),
+    user_id: Optional[str] = Query(None, description="Filter by user ID"),
+    search: Optional[str] = Query(None, description="Search in filename"),
+    order_by: str = Query("created_at", description="Field to order by"),
+    order_desc: bool = Query(True, description="Order in descending order"),
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
 ):
     """
-    Get detection history
+    Get detection history with filtering, searching, and pagination
     """
     try:
         detection_service = DetectionService(db)
@@ -194,12 +230,16 @@ async def get_detection_history(
             skip=skip,
             limit=limit,
             prediction=prediction,
-            model_type=model_type
+            model_type=model_type,
+            user_id=user_id,
+            search=search,
+            order_by=order_by,
+            order_desc=order_desc
         )
         return history
         
     except Exception as e:
-        logger.error("Failed to get detection history", error=str(e))
+        logger.error("Failed to get detection history", error=str(e), user=current_user)
         raise HTTPException(status_code=500, detail="Failed to get detection history")
 
 

@@ -7,6 +7,7 @@ from .detection import router as detection_router
 from .training import router as training_router
 from .models import router as models_router
 from .datasets import router as datasets_router
+from .health import router as health_router
 
 api_router = APIRouter()
 
@@ -15,3 +16,4 @@ api_router.include_router(detection_router, prefix="/detection", tags=["detectio
 api_router.include_router(training_router, prefix="/training", tags=["training"])
 api_router.include_router(models_router, prefix="/models", tags=["models"])
 api_router.include_router(datasets_router, prefix="/datasets", tags=["datasets"])
+api_router.include_router(health_router, prefix="/health", tags=["health"])

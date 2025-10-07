@@ -305,20 +305,48 @@ class DetectionService:
         skip: int = 0,
         limit: int = 100,
         prediction: Optional[str] = None,
-        model_type: Optional[str] = None
+        model_type: Optional[str] = None,
+        user_id: Optional[str] = None,
+        search: Optional[str] = None,
+        order_by: str = "created_at",
+        order_desc: bool = True
     ) -> DetectionHistoryList:
-        """Get detection history"""
+        """Get detection history with filtering, searching, and pagination"""
         try:
             query = self.db.query(DetectionResult).filter(DetectionResult.del_flag == 0)
             
+            # Apply filters
             if prediction:
                 query = query.filter(DetectionResult.prediction == prediction)
             
             if model_type:
                 query = query.join(ModelRegistry).filter(ModelRegistry.model_type == model_type)
             
+            # TODO: Add user_id filtering when DetectionResult model has user_id field
+            # if user_id:
+            #     query = query.filter(DetectionResult.user_id == user_id)
+            
+            # Apply search
+            if search:
+                search_term = f"%{search}%"
+                query = query.filter(DetectionResult.file_name.ilike(search_term))
+            
+            # Apply ordering
+            if hasattr(DetectionResult, order_by):
+                order_column = getattr(DetectionResult, order_by)
+                if order_desc:
+                    query = query.order_by(order_column.desc())
+                else:
+                    query = query.order_by(order_column.asc())
+            else:
+                # Default ordering
+                query = query.order_by(DetectionResult.created_at.desc())
+            
+            # Get total count
             total = query.count()
-            results = query.order_by(DetectionResult.created_at.desc()).offset(skip).limit(limit).all()
+            
+            # Apply pagination
+            results = query.offset(skip).limit(limit).all()
             
             detections = []
             for result in results:

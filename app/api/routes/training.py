@@ -2,12 +2,13 @@
 Training API routes for deepfake detection platform
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from app.core.database import get_db
 from app.core.logging import logger
+from app.core.auth import get_current_user, require_admin
 from app.schemas.training import (
     TrainingJobCreate, TrainingJobResponse, TrainingJobList,
     TrainingJobUpdate, TrainingProgress, TrainingMetrics
@@ -21,33 +22,61 @@ router = APIRouter()
 async def create_training_job(
     job: TrainingJobCreate,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db)
+    auto_start: bool = Query(False, description="Automatically start the job after creation"),
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
 ):
     """Create a new training job"""
     try:
         training_service = TrainingService(db)
-        result = await training_service.create_job(job, background_tasks)
+        result = await training_service.create_job(
+            job, 
+            background_tasks, 
+            created_by=current_user,
+            auto_start=auto_start
+        )
+        
+        logger.info("Training job created", 
+                   job_id=result.id, 
+                   job_name=result.name,
+                   created_by=current_user,
+                   auto_start=auto_start)
+        
         return result
     except Exception as e:
-        logger.error("Failed to create training job", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to create training job")
+        logger.error("Failed to create training job", error=str(e), user=current_user)
+        raise HTTPException(status_code=500, detail=f"Failed to create training job: {str(e)}")
 
 
 @router.get("/jobs", response_model=TrainingJobList)
 async def get_training_jobs(
-    skip: int = 0,
-    limit: int = 100,
-    status: Optional[str] = None,
-    model_type: Optional[str] = None,
-    db: Session = Depends(get_db)
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
+    status: Optional[str] = Query(None, description="Filter by job status"),
+    model_type: Optional[str] = Query(None, description="Filter by model type"),
+    created_by: Optional[str] = Query(None, description="Filter by job creator"),
+    search: Optional[str] = Query(None, description="Search in job name and description"),
+    order_by: str = Query("created_at", description="Field to order by"),
+    order_desc: bool = Query(True, description="Order in descending order"),
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
 ):
-    """Get training jobs list"""
+    """Get training jobs list with filtering, searching, and pagination"""
     try:
         training_service = TrainingService(db)
-        result = await training_service.get_jobs(skip, limit, status, model_type)
+        result = await training_service.get_jobs(
+            skip=skip, 
+            limit=limit, 
+            status=status, 
+            model_type=model_type,
+            created_by=created_by,
+            search=search,
+            order_by=order_by,
+            order_desc=order_desc
+        )
         return result
     except Exception as e:
-        logger.error("Failed to get training jobs", error=str(e))
+        logger.error("Failed to get training jobs", error=str(e), user=current_user)
         raise HTTPException(status_code=500, detail="Failed to get training jobs")
 
 
@@ -129,3 +158,131 @@ async def get_training_metrics(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error("Failed to get training metrics", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to get training metrics")
+
+
+@router.post("/jobs/{job_id}/start")
+async def start_training_job(
+    job_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
+):
+    """Start a training job manually"""
+    try:
+        training_service = TrainingService(db)
+        
+        # Get the job first to check its current status
+        job = await training_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Training job not found")
+        
+        # Start the job
+        success = await training_service.start_job(job_id, background_tasks, current_user)
+        
+        if not success:
+            raise HTTPException(status_code=400, detail="Cannot start job in current status")
+        
+        logger.info("Training job started", 
+                   job_id=job_id, 
+                   job_name=job.name,
+                   started_by=current_user)
+        
+        return {
+            "message": f"Training job '{job.name}' (ID: {job_id}) started successfully",
+            "job_id": job_id,
+            "job_name": job.name,
+            "started_by": current_user
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to start training job", error=str(e), job_id=job_id, user=current_user)
+        raise HTTPException(status_code=500, detail=f"Failed to start training job: {str(e)}")
+
+
+@router.post("/jobs/{job_id}/stop")
+async def stop_training_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
+):
+    """Stop a running training job"""
+    try:
+        training_service = TrainingService(db)
+        
+        # Get the job first to check its current status
+        job = await training_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Training job not found")
+        
+        # Stop the job
+        success = await training_service.stop_job(job_id, current_user)
+        
+        if not success:
+            raise HTTPException(status_code=400, detail="Cannot stop job in current status")
+        
+        logger.info("Training job stopped", 
+                   job_id=job_id, 
+                   job_name=job.name,
+                   stopped_by=current_user)
+        
+        return {
+            "message": f"Training job '{job.name}' (ID: {job_id}) stopped successfully",
+            "job_id": job_id,
+            "job_name": job.name,
+            "stopped_by": current_user
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to stop training job", error=str(e), job_id=job_id, user=current_user)
+        raise HTTPException(status_code=500, detail=f"Failed to stop training job: {str(e)}")
+
+
+@router.get("/jobs/{job_id}/logs")
+async def get_training_job_logs(
+    job_id: int,
+    tail_lines: int = Query(100, ge=0, le=10000, description="Number of lines to return from end of log"),
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
+):
+    """Get logs for a training job"""
+    try:
+        training_service = TrainingService(db)
+        job = await training_service.get_job(job_id)
+        
+        if not job:
+            raise HTTPException(status_code=404, detail="Training job not found")
+        
+        logs = await training_service.get_job_logs(job_id, tail_lines)
+        
+        return {
+            "job_id": job_id,
+            "job_name": job.name,
+            "logs": logs,
+            "tail_lines": tail_lines
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to get training job logs", error=str(e), job_id=job_id, user=current_user)
+        raise HTTPException(status_code=500, detail=f"Failed to get training job logs: {str(e)}")
+
+
+@router.get("/statistics")
+async def get_training_job_statistics(
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user)
+):
+    """Get training job statistics"""
+    try:
+        training_service = TrainingService(db)
+        stats = await training_service.get_job_statistics()
+        return stats
+        
+    except Exception as e:
+        logger.error("Failed to get training job statistics", error=str(e), user=current_user)
+        raise HTTPException(status_code=500, detail="Failed to get training job statistics")
