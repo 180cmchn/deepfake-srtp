@@ -5,6 +5,7 @@ Training service for deepfake detection platform
 import os
 import time
 import asyncio
+from datetime import datetime
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from fastapi import BackgroundTasks
@@ -298,7 +299,7 @@ class TrainingService:
                 return
             
             job.status = JobStatus.RUNNING.value
-            job.started_at = time.time()
+            job.started_at = datetime.now()
             self.db.commit()
             
             # TODO: Implement actual training logic
@@ -320,7 +321,7 @@ class TrainingService:
             if job:
                 job.status = JobStatus.FAILED.value
                 job.error_message = str(e)
-                job.completed_at = time.time()
+                job.completed_at = datetime.now()
                 self.db.commit()
     
     async def _simulate_training(self, job_id: int, parameters: Dict[str, Any]):
@@ -350,7 +351,7 @@ class TrainingService:
         if job:
             job.status = JobStatus.COMPLETED.value
             job.progress = 100.0
-            job.completed_at = time.time()
+            job.completed_at = datetime.now()
             job.accuracy = 0.95
             job.loss = 0.1
             job.model_path = f"models/trained_model_{job_id}.pth"

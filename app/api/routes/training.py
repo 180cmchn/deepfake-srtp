@@ -29,12 +29,7 @@ async def create_training_job(
     """Create a new training job"""
     try:
         training_service = TrainingService(db)
-        result = await training_service.create_job(
-            job, 
-            background_tasks, 
-            created_by=current_user,
-            auto_start=auto_start
-        )
+        result = await training_service.create_job(job, background_tasks)
         
         logger.info("Training job created", 
                    job_id=result.id, 

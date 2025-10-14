@@ -80,3 +80,28 @@ class DatasetProcessingConfig(BaseModel):
     image_size: int = Field(default=224, ge=32, le=1024)
     frame_extraction_interval: int = Field(default=4, ge=1, le=30)
     max_frames_per_video: int = Field(default=20, ge=1, le=100)
+
+
+class DatasetFileAddRequest(BaseModel):
+    """Schema for adding files to existing dataset"""
+    reprocess: bool = Field(default=True, description="Whether to reprocess the dataset after adding files")
+    description: Optional[str] = Field(None, max_length=500, description="Description for the added files")
+
+
+class DatasetFileAddResponse(BaseModel):
+    """Schema for response after adding files to dataset"""
+    dataset_id: int
+    files_added: List[str]
+    total_files_added: int
+    message: str
+    processing_started: bool
+
+
+class DatasetFileInfo(BaseModel):
+    """Schema for individual file information in dataset"""
+    filename: str
+    file_path: str
+    file_type: str
+    file_size: int
+    created_at: datetime
+    description: Optional[str] = None

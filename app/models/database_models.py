@@ -80,6 +80,7 @@ class ModelRegistry(Base):
     model_type = Column(String(50), nullable=False)
     version = Column(String(50), nullable=False)
     file_path = Column(String(500), nullable=False)
+    description = Column(Text)
     
     # Model metadata
     input_size = Column(Integer, default=224)
@@ -181,6 +182,39 @@ class DatasetInfo(Base):
     
     # Soft delete
     del_flag = Column(Integer, default=0)
+    
+    # Relationships
+    files = relationship("DatasetFile", back_populates="dataset", cascade="all, delete-orphan")
+
+
+class DatasetFile(Base):
+    """Individual files within a dataset"""
+    __tablename__ = "dataset_files"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    dataset_id = Column(Integer, ForeignKey("dataset_info.id"), nullable=False)
+    
+    # File information
+    filename = Column(String(255), nullable=False)
+    file_path = Column(String(500), nullable=False)
+    file_type = Column(String(20), nullable=False)  # image, video
+    file_size = Column(Integer, nullable=False)  # in bytes
+    description = Column(Text)
+    
+    # Processing status
+    is_processed = Column(Boolean, default=False)
+    processing_status = Column(String(20), default="pending")
+    error_message = Column(Text)
+    
+    # Metadata
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Soft delete
+    del_flag = Column(Integer, default=0)
+    
+    # Relationships
+    dataset = relationship("DatasetInfo", back_populates="files")
 
 
 class SystemConfig(Base):

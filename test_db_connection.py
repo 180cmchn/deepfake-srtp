@@ -73,7 +73,7 @@ def test_mysql_connection():
                     print(f"🔧 MySQL 版本: {version}")
                     
                     # 检查数据库是否存在
-                    result = conn.execute(text("SHOW DATABASES LIKE %s"), (settings.MYSQL_DATABASE,))
+                    result = conn.execute(text("SHOW DATABASES LIKE :db_name"), {"db_name": settings.MYSQL_DATABASE})
                     db_exists = result.fetchone()
                     
                     if db_exists:
