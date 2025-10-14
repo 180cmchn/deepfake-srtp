@@ -10,10 +10,11 @@ from sqlalchemy.orm import Session
 
 from app.core.logging import logger
 from app.core.config import settings
-from app.models.database_models import DatasetInfo
+from app.models.database_models import DatasetInfo, DatasetFile
 from app.schemas.datasets import (
     DatasetCreate, DatasetResponse, DatasetList, DatasetUpdate,
-    DatasetStats, DatasetProcessingConfig
+    DatasetStats, DatasetProcessingConfig, DatasetFileAddRequest,
+    DatasetFileAddResponse, DatasetFileInfo
 )
 
 
@@ -248,6 +249,110 @@ class DatasetService:
             } if dataset.real_samples and dataset.fake_samples else None,
             data_quality_score=0.95  # Simulated quality score
         )
+    
+    async def add_files_to_dataset(
+        self, 
+        dataset_id: int, 
+        files: List[tuple], 
+        request: DatasetFileAddRequest
+    ) -> DatasetFileAddResponse:
+        """Add files to existing dataset"""
+        try:
+            # Check if dataset exists
+            dataset = self.db.query(DatasetInfo).filter(
+                DatasetInfo.id == dataset_id,
+                DatasetInfo.del_flag == 0
+            ).first()
+            
+            if not dataset:
+                raise ValueError(f"Dataset with ID {dataset_id} not found")
+            
+            added_files = []
+            file_paths = []
+            
+            # Process each file
+            for file_info in files:
+                file_obj, file_path, file_type, file_size = file_info
+                
+                # Create file record
+                db_file = DatasetFile(
+                    dataset_id=dataset_id,
+                    filename=file_obj.filename,
+                    file_path=file_path,
+                    file_type=file_type,
+                    file_size=file_size,
+                    description=request.description
+                )
+                
+                self.db.add(db_file)
+                added_files.append(file_obj.filename)
+                file_paths.append(file_path)
+            
+            # Commit all file records
+            self.db.commit()
+            
+            # Update dataset status if needed
+            if request.reprocess:
+                dataset.is_processed = False
+                dataset.processing_status = "pending"
+                self.db.commit()
+            
+            logger.info("Files added to dataset", 
+                       dataset_id=dataset_id, 
+                       files_count=len(added_files),
+                       files=added_files)
+            
+            return DatasetFileAddResponse(
+                dataset_id=dataset_id,
+                files_added=added_files,
+                total_files_added=len(added_files),
+                message=f"Successfully added {len(added_files)} files to dataset",
+                processing_started=request.reprocess
+            )
+            
+        except Exception as e:
+            logger.error("Failed to add files to dataset", 
+                       error=str(e), 
+                       dataset_id=dataset_id)
+            self.db.rollback()
+            
+            # Clean up uploaded files on error
+            for file_info in files:
+                _, file_path, _, _ = file_info
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        logger.info("Cleaned up file after error", file_path=file_path)
+                    except Exception as cleanup_error:
+                        logger.error("Failed to clean up file", 
+                                   file_path=file_path, 
+                                   error=str(cleanup_error))
+            
+            raise
+    
+    async def get_dataset_files(self, dataset_id: int) -> List[DatasetFileInfo]:
+        """Get all files in a dataset"""
+        try:
+            files = self.db.query(DatasetFile).filter(
+                DatasetFile.dataset_id == dataset_id,
+                DatasetFile.del_flag == 0
+            ).all()
+            
+            return [
+                DatasetFileInfo(
+                    filename=file.filename,
+                    file_path=file.file_path,
+                    file_type=file.file_type,
+                    file_size=file.file_size,
+                    created_at=file.created_at,
+                    description=file.description
+                )
+                for file in files
+            ]
+            
+        except Exception as e:
+            logger.error("Failed to get dataset files", error=str(e), dataset_id=dataset_id)
+            raise
     
     def _db_to_response(self, dataset: DatasetInfo) -> DatasetResponse:
         """Convert database model to response schema"""
