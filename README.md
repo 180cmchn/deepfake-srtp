@@ -9,6 +9,7 @@ A comprehensive deepfake detection platform built with FastAPI, featuring multip
 - **Video Analysis**: Frame-by-frame video analysis with aggregation
 - **Model Training**: Automated training pipeline with progress tracking
 - **Dataset Management**: Upload, process, and manage datasets
+- **Feature Engineering Pipeline**: Real image/video feature extraction with artifact output
 - **RESTful API**: Complete API with comprehensive endpoints
 - **Database Integration**: SQLAlchemy ORM with migration support
 - **Structured Logging**: Advanced logging with structured output
@@ -216,14 +217,7 @@ The platform supports multiple database backends:
 
 ### GPU Support
 
-For GPU acceleration, ensure you have CUDA installed and uncomment the following in `requirements.txt`:
-
-```bash
-# torch-audio==2.1.1
-# torchtext==0.16.1
-```
-
-Set `GPU_ENABLED=True` in your `.env` file.
+For GPU acceleration, ensure CUDA is available and set `GPU_ENABLED=True` in your `.env` file.
 
 ## 🤖 Supported Models
 
@@ -237,8 +231,8 @@ Set `GPU_ENABLED=True` in your `.env` file.
 
 ### Detection
 - `POST /api/v1/detection/detect` - Detect deepfake in single file
-- `POST /api/v1/detection/detect-batch` - Batch detection
-- `POST /api/v1/detection/detect-video` - Video detection
+- `POST /api/v1/detection/detect/batch` - Batch detection
+- `POST /api/v1/detection/detect/video` - Video detection
 - `GET /api/v1/detection/history` - Detection history
 - `GET /api/v1/detection/statistics` - Detection statistics
 
@@ -247,20 +241,31 @@ Set `GPU_ENABLED=True` in your `.env` file.
 - `GET /api/v1/training/jobs` - List training jobs
 - `GET /api/v1/training/jobs/{id}` - Get training job
 - `GET /api/v1/training/jobs/{id}/progress` - Training progress
+- `POST /api/v1/training/jobs/{id}/start` - Start a training job
+- `POST /api/v1/training/jobs/{id}/stop` - Stop a training job
+- `GET /api/v1/training/jobs/{id}/logs` - Training logs
 - `GET /api/v1/training/metrics` - Training metrics
+- `GET /api/v1/training/statistics` - Training job statistics
 
 ### Models
 - `GET /api/v1/models/` - List models
 - `POST /api/v1/models/` - Create model
 - `GET /api/v1/models/{id}` - Get model
 - `POST /api/v1/models/{id}/deploy` - Deploy model
-- `GET /api/v1/models/statistics` - Model statistics
+- `GET /api/v1/models/statistics/overview` - Model statistics
 
 ### Datasets
 - `GET /api/v1/datasets/` - List datasets
 - `POST /api/v1/datasets/upload` - Upload dataset
 - `GET /api/v1/datasets/{id}` - Get dataset
 - `POST /api/v1/datasets/{id}/process` - Process dataset
+
+Dataset processing writes engineered feature artifacts to `data/features/dataset_<id>_features.json`.
+
+Label inference and split rules used by processing pipeline:
+- Label inference is path-keyword based: fake -> `0`, real -> `1`; unknown/mixed paths are kept with `null` label.
+- Supported image keywords include `fake`, `deepfake`, `manipulated`, `forged`, `tampered`, `class1`; real keywords include `real`, `authentic`, `original`, `genuine`, `pristine`, `class0`.
+- Train/validation/test counts are computed from `validation_split` and `test_split` (defaults: `0.2` and `0.1`) with bounds checking to always keep at least one training sample when possible.
 
 ## 🧪 Testing
 
@@ -270,9 +275,6 @@ pytest
 
 # Run with coverage
 pytest --cov=app
-
-# Run specific test file
-pytest tests/test_detection.py
 ```
 
 ## 📝 Development
@@ -318,7 +320,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - Original deepfake detection research and models
 - FastAPI framework for the API backbone
-- PyTorch and TensorFlow for deep learning implementations
+- PyTorch for deep learning implementations
 - OpenCV for image and video processing
 
 ## 📞 Support

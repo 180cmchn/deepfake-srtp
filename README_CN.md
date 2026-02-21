@@ -9,10 +9,11 @@
 - **视频分析**：逐帧视频分析与结果聚合
 - **模型训练**：自动化训练管道，支持进度跟踪
 - **数据集管理**：上传、处理和管理数据集
+- **特征工程管线**：对图像/视频执行真实特征提取并输出结果文件
 - **RESTful API**：完整的API接口
 - **数据库集成**：SQLAlchemy ORM与Alembic迁移支持
 - **结构化日志**：高级日志记录功能
-- **后台处理**：支持Redis和Celery的异步任务处理
+- **后台处理**：使用FastAPI BackgroundTasks执行异步任务
 - **GPU加速**：自动检测和使用GPU进行推理和训练
 - **健康检查**：系统状态监控端点
 
@@ -162,7 +163,8 @@ docker run -p 8000:8000 -v $(pwd)/data:/app/data deepfake-detection
 
 ### 健康检查端点
 - **应用状态**: `http://localhost:8000/`
-- **健康检查**: `http://localhost:8000/health`
+- **基础健康检查**: `http://localhost:8000/health`
+- **详细健康检查**: `http://localhost:8000/api/v1/health/health`
 
 ## 🔧 配置说明
 
@@ -176,14 +178,14 @@ docker run -p 8000:8000 -v $(pwd)/data:/app/data deepfake-detection
 | `HOST` | 服务器主机 | `0.0.0.0` | - |
 | `PORT` | 服务器端口 | `8000` | - |
 | `DATABASE_URL` | 数据库连接字符串 | `sqlite:///./deepfake_detection.db` | 生产环境建议使用PostgreSQL/MySQL |
-| `SECRET_KEY` | JWT密钥 | 需要更改 | 生产环境必须更改 |
+| `SECRET_KEY` | 应用密钥 | 需要更改 | 生产环境必须更改 |
 | `DEFAULT_MODEL_TYPE` | 默认检测模型 | `vgg` | - |
 | `MODEL_INPUT_SIZE` | 模型输入图像尺寸 | `224` | - |
 | `MAX_CONCURRENT_TRAINING_JOBS` | 最大并发训练任务数 | `2` | 根据GPU内存调整 |
 | `GPU_ENABLED` | 启用GPU加速 | `True` | 根据硬件配置 |
 | `CUDA_VISIBLE_DEVICES` | 可见GPU设备 | `0` | 多GPU环境配置 |
 | `LOG_LEVEL` | 日志级别 | `INFO` | 生产环境建议`WARNING` |
-| `CORS_ORIGINS` | 允许的跨域源 | `localhost:3000,localhost:8080` | 根据前端地址配置 |
+| `BACKEND_CORS_ORIGINS` | 允许的跨域源 | `http://localhost:3000,http://localhost:8000` | 根据前端地址配置 |
 
 ### 数据库配置
 
@@ -202,12 +204,14 @@ DATABASE_URL=postgresql://username:password@localhost:5432/deepfake_detection
 DATABASE_URL=mysql+pymysql://username:password@localhost:3306/deepfake_detection
 ```
 
-### Redis配置（用于后台任务）
+### Redis配置（可选）
 ```bash
 REDIS_URL=redis://localhost:6379/0
 CELERY_BROKER_URL=redis://localhost:6379/0
 CELERY_RESULT_BACKEND=redis://localhost:6379/0
 ```
+
+说明：当前默认实现基于 FastAPI `BackgroundTasks`，不依赖 Redis/Celery 即可运行。
 
 ## 🤖 支持的模型
 
@@ -240,8 +244,8 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 
 ### 检测相关 (`/api/v1/detection`)
 - `POST /detect` - 单文件深度伪造检测
-- `POST /detect-batch` - 批量检测
-- `POST /detect-video` - 视频检测
+- `POST /detect/batch` - 批量检测
+- `POST /detect/video` - 视频检测
 - `GET /history` - 检测历史记录
 - `GET /statistics` - 检测统计信息
 
@@ -257,13 +261,20 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 - `POST /` - 创建新模型
 - `GET /{id}` - 获取特定模型
 - `POST /{id}/deploy` - 部署模型
-- `GET /statistics` - 模型统计信息
+- `GET /statistics/overview` - 模型统计信息
 
 ### 数据集管理 (`/api/v1/datasets`)
 - `GET /` - 获取数据集列表
 - `POST /upload` - 上传数据集
 - `GET /{id}` - 获取特定数据集
 - `POST /{id}/process` - 处理数据集
+
+数据集处理会将特征工程结果输出到 `data/features/dataset_<id>_features.json`。
+
+处理管线中的标签推断与数据切分规则：
+- 标签推断基于文件路径关键字：fake -> `0`，real -> `1`；若路径同时命中或未命中关键字，则标签记为 `null`。
+- fake 关键字包含 `fake`、`deepfake`、`manipulated`、`forged`、`tampered`、`class1`；real 关键字包含 `real`、`authentic`、`original`、`genuine`、`pristine`、`class0`。
+- 训练/验证/测试样本数由 `validation_split` 与 `test_split` 计算（默认 `0.2` 与 `0.1`），并做边界保护，尽量保证至少保留 1 条训练样本。
 
 ## 🧪 测试
 
@@ -276,10 +287,7 @@ pytest
 pytest --cov=app --cov-report=html
 
 # 运行特定测试文件
-pytest tests/test_detection.py
-
-# 运行特定测试函数
-pytest tests/test_detection.py::test_detect_image -v
+pytest -k detection -v
 ```
 
 ### 测试配置
@@ -355,8 +363,8 @@ with open('test_image.jpg', 'rb') as f:
 
 if response.status_code == 200:
     result = response.json()
-    print(f"检测结果: {result['is_fake']}")
-    print(f"置信度: {result['confidence']:.4f}")
+    print(f"检测结果: {result['result']['prediction']}")
+    print(f"置信度: {result['result']['confidence']:.4f}")
     print(f"处理时间: {result['processing_time']:.2f}s")
 else:
     print(f"检测失败: {response.text}")
@@ -370,8 +378,8 @@ import json
 training_data = {
     "name": "我的训练任务",
     "model_type": "vgg",
-    "dataset_id": "dataset_uuid_here",
-    "config": {
+    "dataset_path": "D:/datasets/deepfake_train",
+    "parameters": {
         "epochs": 50,
         "batch_size": 32,
         "learning_rate": 0.001,
@@ -381,11 +389,11 @@ training_data = {
 
 response = requests.post(
     'http://localhost:8000/api/v1/training/jobs',
-    json=training_data,
-    headers={'Content-Type': 'application/json'}
+    params={'auto_start': 'true'},
+    json=training_data
 )
 
-if response.status_code == 201:
+if response.status_code == 200:
     job = response.json()
     print(f"训练任务ID: {job['id']}")
     print(f"状态: {job['status']}")
@@ -406,20 +414,20 @@ import requests
 
 with open('test_video.mp4', 'rb') as f:
     response = requests.post(
-        'http://localhost:8000/api/v1/detection/detect-video',
+        'http://localhost:8000/api/v1/detection/detect/video',
         files={'file': f},
         data={
             'model_type': 'lrcn',
-            'frame_interval': '4',
+            'frame_extraction_interval': '4',
             'max_frames': '20'
         }
     )
 
 if response.status_code == 200:
     result = response.json()
-    print(f"视频检测结果: {result['overall_result']}")
-    print(f"处理帧数: {result['frames_processed']}")
-    print(f"平均置信度: {result['average_confidence']:.4f}")
+    print(f"视频检测结果: {result['aggregated_result']['prediction']}")
+    print(f"处理帧数: {result['summary']['frames_analyzed']}")
+    print(f"平均置信度: {result['aggregated_result']['confidence']:.4f}")
     print(f"处理时间: {result['processing_time']:.2f}s")
 else:
     print(f"视频检测失败: {response.text}")
@@ -437,7 +445,7 @@ for filename in ['image1.jpg', 'image2.jpg', 'image3.jpg']:
         files.append(('files', open(filename, 'rb')))
 
 response = requests.post(
-    'http://localhost:8000/api/v1/detection/detect-batch',
+    'http://localhost:8000/api/v1/detection/detect/batch',
     files=files,
     data={'model_type': 'vgg'}
 )
@@ -446,7 +454,10 @@ if response.status_code == 200:
     results = response.json()
     print(f"批量检测完成，处理了 {len(results['results'])} 个文件")
     for result in results['results']:
-        print(f"文件: {result['filename']}, 结果: {result['is_fake']}, 置信度: {result['confidence']:.4f}")
+        if result.get('result'):
+            print(f"文件: {result['file_info']['file_name']}, 结果: {result['result']['prediction']}, 置信度: {result['result']['confidence']:.4f}")
+        else:
+            print(f"文件: {result['file_info']['file_name']}, 检测失败: {result.get('error_message')}")
 else:
     print(f"批量检测失败: {response.text}")
 
@@ -481,13 +492,13 @@ for _, file_obj in files:
 
 ### GPU加速
 - 自动检测CUDA可用性
-- 支持多GPU并行处理
-- 内存优化和批处理
+- 支持在可用GPU上执行推理与训练
+- 支持按批处理参数控制显存占用
 
 ### 异步处理
 - FastAPI异步路由
 - 异步文件I/O操作
-- 后台任务队列（Celery + Redis）
+- 后台任务（BackgroundTasks）
 
 ### 缓存策略
 - 模型权重缓存
@@ -503,13 +514,11 @@ for _, file_obj in files:
 ## 🛡️ 安全特性
 
 - **输入验证**: Pydantic模型验证
-- **文件安全**: 类型检查、大小限制、病毒扫描
-- **访问控制**: JWT认证、权限管理
-- **数据加密**: 敏感数据加密存储
+- **文件安全**: 类型检查与大小限制
+- **访问控制**: `X-User-ID` 请求头（开发态默认用户）
 - **SQL注入防护**: ORM参数化查询
 - **CORS配置**: 跨域请求控制
-- **速率限制**: API调用频率限制
-- **日志脱敏**: 敏感信息过滤
+- **日志审计**: 结构化日志记录关键操作
 
 ## 🔧 监控和运维
 
@@ -517,6 +526,9 @@ for _, file_obj in files:
 ```bash
 # 应用健康状态
 curl http://localhost:8000/health
+
+# 详细健康状态
+curl http://localhost:8000/api/v1/health/health
 
 # 数据库连接状态
 python test_db_connection.py
@@ -575,7 +587,7 @@ chore: 构建过程或辅助工具的变动
 
 - 原始深度伪造检测研究和模型
 - FastAPI框架作为API骨干
-- PyTorch和TensorFlow的深度学习实现
+- PyTorch的深度学习实现
 - OpenCV的图像和视频处理
 - SQLAlchemy的数据库ORM
 - Alembic的数据库迁移工具
