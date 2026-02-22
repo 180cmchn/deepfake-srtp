@@ -17,7 +17,6 @@ from app.schemas.detection import (
     BatchDetectionResponse, VideoDetectionRequest, VideoDetectionResponse,
     DetectionHistory, DetectionHistoryList, DetectionStatistics
 )
-from app.services.detection_service import DetectionService
 
 router = APIRouter()
 
@@ -35,6 +34,8 @@ async def detect_deepfake(
     """
     file_path = None
     try:
+        from app.services.detection_service import DetectionService
+
         # Validate file
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
@@ -113,6 +114,8 @@ async def detect_deepfake_batch(
     Detect deepfake in multiple files
     """
     try:
+        from app.services.detection_service import DetectionService
+
         if len(files) > 100:
             raise HTTPException(status_code=400, detail="Maximum 100 files allowed")
         
@@ -167,6 +170,8 @@ async def detect_deepfake_video(
     Detect deepfake in video file
     """
     try:
+        from app.services.detection_service import DetectionService
+
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
         
@@ -225,6 +230,8 @@ async def get_detection_history(
     Get detection history with filtering, searching, and pagination
     """
     try:
+        from app.services.detection_service import DetectionService
+
         detection_service = DetectionService(db)
         history = await detection_service.get_history(
             skip=skip,
@@ -249,6 +256,8 @@ async def get_detection_statistics(db: Session = Depends(get_db)):
     Get detection statistics
     """
     try:
+        from app.services.detection_service import DetectionService
+
         detection_service = DetectionService(db)
         stats = await detection_service.get_statistics()
         return stats
@@ -282,6 +291,8 @@ async def delete_detection_record(
     Delete detection record
     """
     try:
+        from app.services.detection_service import DetectionService
+
         detection_service = DetectionService(db)
         success = await detection_service.delete_detection_record(detection_id)
         

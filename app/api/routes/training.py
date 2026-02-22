@@ -13,7 +13,6 @@ from app.schemas.training import (
     TrainingJobCreate, TrainingJobResponse, TrainingJobList,
     TrainingJobUpdate, TrainingProgress, TrainingMetrics
 )
-from app.services.training_service import TrainingService
 
 router = APIRouter()
 
@@ -28,6 +27,8 @@ async def create_training_job(
 ):
     """Create a new training job"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         result = await training_service.create_job(job, background_tasks, auto_start=auto_start)
         
@@ -58,6 +59,8 @@ async def get_training_jobs(
 ):
     """Get training jobs list with filtering, searching, and pagination"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         result = await training_service.get_jobs(
             skip=skip, 
@@ -79,6 +82,8 @@ async def get_training_jobs(
 async def get_training_job(job_id: int, db: Session = Depends(get_db)):
     """Get training job by ID"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         result = await training_service.get_job(job_id)
         if not result:
@@ -99,6 +104,8 @@ async def update_training_job(
 ):
     """Update training job"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         result = await training_service.update_job(job_id, job_update)
         if not result:
@@ -115,6 +122,8 @@ async def update_training_job(
 async def delete_training_job(job_id: int, db: Session = Depends(get_db)):
     """Delete training job"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         success = await training_service.delete_job(job_id)
         if not success:
@@ -131,6 +140,8 @@ async def delete_training_job(job_id: int, db: Session = Depends(get_db)):
 async def get_training_progress(job_id: int, db: Session = Depends(get_db)):
     """Get training job progress"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         progress = await training_service.get_progress(job_id)
         if not progress:
@@ -147,6 +158,8 @@ async def get_training_progress(job_id: int, db: Session = Depends(get_db)):
 async def get_training_metrics(db: Session = Depends(get_db)):
     """Get training metrics"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         metrics = await training_service.get_metrics()
         return metrics
@@ -164,6 +177,8 @@ async def start_training_job(
 ):
     """Start a training job manually"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         
         # Get the job first to check its current status
@@ -204,6 +219,8 @@ async def stop_training_job(
 ):
     """Stop a running training job"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         
         # Get the job first to check its current status
@@ -245,6 +262,8 @@ async def get_training_job_logs(
 ):
     """Get logs for a training job"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         job = await training_service.get_job(job_id)
         
@@ -274,6 +293,8 @@ async def get_training_job_statistics(
 ):
     """Get training job statistics"""
     try:
+        from app.services.training_service import TrainingService
+
         training_service = TrainingService(db)
         stats = await training_service.get_job_statistics()
         return stats

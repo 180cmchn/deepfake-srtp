@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import structlog
+import os
 from dotenv import load_dotenv
 
 # Load environment variables first
@@ -52,6 +53,11 @@ async def startup_event():
     for directory in [settings.UPLOAD_DIR, settings.MODEL_DIR, settings.LOG_DIR, settings.DATA_DIR]:
         os.makedirs(directory, exist_ok=True)
     
+    skip_db_check = os.getenv("SKIP_STARTUP_DB_CHECK", "0") == "1"
+    if skip_db_check:
+        logger.warning("Skipping startup database check due to SKIP_STARTUP_DB_CHECK=1")
+        return
+
     # Test database connection
     if test_connection():
         logger.info("Database connection verified")

@@ -7,16 +7,34 @@
 """
 
 import sqlite3
-import pymysql
 import os
 from datetime import datetime
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from app.core.config import settings
 from app.core.database import engine
 
+
+def mask_database_url(raw_url: str) -> str:
+    """Mask password in database URL for safe logging."""
+    try:
+        return make_url(raw_url).render_as_string(hide_password=True)
+    except Exception:
+        return raw_url
+
+
+def get_sqlite_db_path() -> str:
+    """Resolve sqlite file path from DATABASE_URL."""
+    db_url = settings.DATABASE_URL
+    prefix = "sqlite:///"
+    if not db_url.startswith(prefix):
+        return "deepfake_detection.db"
+    path_part = db_url[len(prefix):]
+    return os.path.abspath(path_part)
+
 def test_sqlite_connection():
     """测试 SQLite 数据库连接"""
-    db_path = "deepfake_detection.db"
+    db_path = get_sqlite_db_path()
     
     print("=" * 50)
     print("SQLite 数据库连接测试")
@@ -69,27 +87,19 @@ def test_mysql_connection():
                 with engine.connect() as conn:
                     # 获取 MySQL 版本
                     result = conn.execute(text("SELECT VERSION()"))
-                    version = result.fetchone()[0]
+                    row = result.fetchone()
+                    version = row[0] if row else "unknown"
                     print(f"🔧 MySQL 版本: {version}")
-                    
-                    # 检查数据库是否存在
-                    result = conn.execute(text("SHOW DATABASES LIKE :db_name"), {"db_name": settings.MYSQL_DATABASE})
-                    db_exists = result.fetchone()
-                    
-                    if db_exists:
-                        print(f"✅ 数据库 '{settings.MYSQL_DATABASE}' 存在")
-                        
-                        # 获取表信息
-                        conn.execute(text(f"USE {settings.MYSQL_DATABASE}"))
-                        result = conn.execute(text("SHOW TABLES"))
-                        tables = result.fetchall()
-                        print(f"\n📊 数据库包含 {len(tables)} 个表:")
-                        for table in tables:
-                            print(f"   - {table[0]}")
-                    else:
-                        print(f"⚠️  数据库 '{settings.MYSQL_DATABASE}' 不存在")
-                        print("📝 请先创建数据库:")
-                        print(f"   CREATE DATABASE {settings.MYSQL_DATABASE} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
+
+                    current_db = engine.url.database or settings.MYSQL_DATABASE
+                    print(f"✅ 当前数据库: '{current_db}'")
+
+                    # 获取表信息（连接 URL 已包含数据库，无需再次 USE）
+                    result = conn.execute(text("SHOW TABLES"))
+                    tables = result.fetchall()
+                    print(f"\n📊 数据库包含 {len(tables)} 个表:")
+                    for table in tables:
+                        print(f"   - {table[0]}")
                         
             except Exception as e:
                 print(f"⚠️  无法获取数据库详细信息: {e}")
@@ -115,7 +125,7 @@ def test_database_connection():
     print("当前数据库配置测试")
     print("=" * 50)
     
-    print(f"🔗 数据库 URL: {settings.DATABASE_URL}")
+    print(f"🔗 数据库 URL: {mask_database_url(settings.DATABASE_URL)}")
     
     if settings.DATABASE_URL.startswith("sqlite"):
         return test_sqlite_connection()
@@ -127,7 +137,11 @@ def test_database_connection():
 
 def get_database_info():
     """获取数据库详细信息"""
-    db_path = "deepfake_detection.db"
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        print("ℹ️ 当前为非 SQLite 数据库，跳过 SQLite 文件信息展示")
+        return
+
+    db_path = get_sqlite_db_path()
     
     try:
         conn = sqlite3.connect(db_path)
@@ -163,4 +177,9 @@ if __name__ == "__main__":
         print(f"\n⏰ 测试完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("\n📝 现在您可以在 VSCode 中安装数据库插件来可视化查看这些数据！")
     else:
-        print("\n❌ 请检查数据库文件是否存在且未损坏")
+        if settings.DATABASE_URL.startswith("sqlite"):
+            print("\n❌ 请检查 SQLite 数据库文件路径与权限是否正确")
+        elif settings.DATABASE_URL.startswith("mysql+pymysql"):
+            print("\n❌ 请检查 MySQL 服务、端口映射和连接参数")
+        else:
+            print("\n❌ 请检查数据库连接字符串和服务状态")

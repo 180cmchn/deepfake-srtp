@@ -15,7 +15,6 @@ from app.schemas.datasets import (
     DatasetCreate, DatasetResponse, DatasetList, DatasetUpdate,
     DatasetProcessingConfig, DatasetFileAddRequest, DatasetFileAddResponse
 )
-from app.services.dataset_service import DatasetService
 
 router = APIRouter()
 
@@ -75,6 +74,8 @@ async def create_dataset(
 ):
     """Create a new dataset registry entry"""
     try:
+        from app.services.dataset_service import DatasetService
+
         dataset_service = DatasetService(db)
         result = await dataset_service.create_dataset(dataset)
         return result
@@ -92,6 +93,8 @@ async def get_datasets(
 ):
     """Get datasets list"""
     try:
+        from app.services.dataset_service import DatasetService
+
         dataset_service = DatasetService(db)
         result = await dataset_service.get_datasets(skip, limit, is_processed)
         return result
@@ -104,6 +107,8 @@ async def get_datasets(
 async def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
     """Get dataset by ID"""
     try:
+        from app.services.dataset_service import DatasetService
+
         dataset_service = DatasetService(db)
         result = await dataset_service.get_dataset(dataset_id)
         if not result:
@@ -124,6 +129,8 @@ async def update_dataset(
 ):
     """Update dataset"""
     try:
+        from app.services.dataset_service import DatasetService
+
         dataset_service = DatasetService(db)
         result = await dataset_service.update_dataset(dataset_id, dataset_update)
         if not result:
@@ -140,6 +147,8 @@ async def update_dataset(
 async def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     """Delete dataset"""
     try:
+        from app.services.dataset_service import DatasetService
+
         dataset_service = DatasetService(db)
         success = await dataset_service.delete_dataset(dataset_id)
         if not success:
@@ -164,6 +173,8 @@ async def upload_dataset(
     """Upload and process dataset"""
     file_path = None
     try:
+        from app.services.dataset_service import DatasetService
+
         # Validate file type and size
         file_type, file_extension = validate_file(file)
         
@@ -262,6 +273,8 @@ async def process_dataset(
 ):
     """Process dataset"""
     try:
+        from app.services.dataset_service import DatasetService
+
         dataset_service = DatasetService(db)
         dataset = await dataset_service.get_dataset(dataset_id)
         
@@ -288,6 +301,8 @@ async def process_dataset(
 async def get_dataset_processing_status(dataset_id: int, db: Session = Depends(get_db)):
     """Get dataset processing status"""
     try:
+        from app.services.dataset_service import DatasetService
+
         dataset_service = DatasetService(db)
         status = await dataset_service.get_processing_status(dataset_id)
         
@@ -318,6 +333,8 @@ async def add_files_to_dataset(
     file_paths = []
     
     try:
+        from app.services.dataset_service import DatasetService
+
         # Validate dataset exists
         dataset_service = DatasetService(db)
         dataset = await dataset_service.get_dataset(dataset_id)
@@ -415,6 +432,8 @@ async def add_files_to_dataset(
 async def get_dataset_files(dataset_id: int, db: Session = Depends(get_db)):
     """Get all files in a dataset"""
     try:
+        from app.services.dataset_service import DatasetService
+
         dataset_service = DatasetService(db)
         
         # Check if dataset exists
