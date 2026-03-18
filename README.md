@@ -7,7 +7,7 @@ A comprehensive deepfake detection platform built with FastAPI, featuring multip
 - **Multiple Model Support**: VGG, LRCN, Swin Transformer, Vision Transformer, ResNet
 - **Real-time Detection**: Single file and batch processing capabilities
 - **Video Analysis**: Frame-by-frame video analysis with aggregation
-- **Model Training**: Automated training pipeline with progress tracking
+- **Model Training**: Automated training pipeline with progress tracking and human decision on whether to keep trained checkpoints
 - **Dataset Management**: Upload, process, and manage datasets
 - **Feature Engineering Pipeline**: Real image/video feature extraction with artifact output
 - **RESTful API**: Complete API with comprehensive endpoints
@@ -244,8 +244,12 @@ For GPU acceleration, ensure CUDA is available and set `GPU_ENABLED=True` in you
 - `POST /api/v1/training/jobs/{id}/start` - Start a training job
 - `POST /api/v1/training/jobs/{id}/stop` - Stop a training job
 - `GET /api/v1/training/jobs/{id}/logs` - Training logs
+- `POST /api/v1/training/jobs/{id}/model/retain` - Confirm keeping trained model file
+- `DELETE /api/v1/training/jobs/{id}/model` - Discard trained model file
 - `GET /api/v1/training/metrics` - Training metrics
 - `GET /api/v1/training/statistics` - Training job statistics
+
+Training jobs return metrics (accuracy/loss) and `model_path` for the best checkpoint. Whether to keep or discard the checkpoint is a manual decision.
 
 ### Models
 - `GET /api/v1/models/` - List models

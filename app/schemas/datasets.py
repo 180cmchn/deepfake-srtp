@@ -3,12 +3,17 @@ Dataset schemas for deepfake detection platform
 """
 
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel as PydanticBaseModel, Field, validator, ConfigDict
 from datetime import datetime
+
+
+class BaseModel(PydanticBaseModel):
+    model_config = ConfigDict(protected_namespaces=())
 
 
 class DatasetInfo(BaseModel):
     """Schema for dataset information"""
+
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = Field(None, max_length=1000)
     path: str = Field(..., description="Path to dataset")
@@ -19,11 +24,13 @@ class DatasetInfo(BaseModel):
 
 class DatasetCreate(DatasetInfo):
     """Schema for creating dataset"""
+
     pass
 
 
 class DatasetUpdate(BaseModel):
     """Schema for updating dataset"""
+
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = Field(None, max_length=1000)
     image_size: Optional[int] = Field(None, ge=32, le=1024)
@@ -33,6 +40,7 @@ class DatasetUpdate(BaseModel):
 
 class DatasetStats(BaseModel):
     """Schema for dataset statistics"""
+
     total_samples: Optional[int] = None
     real_samples: Optional[int] = None
     fake_samples: Optional[int] = None
@@ -45,6 +53,7 @@ class DatasetStats(BaseModel):
 
 class DatasetResponse(DatasetInfo):
     """Schema for dataset response"""
+
     id: int
     stats: Optional[DatasetStats] = None
     is_processed: bool
@@ -52,13 +61,14 @@ class DatasetResponse(DatasetInfo):
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime]
-    
+
     class Config:
         from_attributes = True
 
 
 class DatasetList(BaseModel):
     """Schema for dataset list response"""
+
     datasets: List[DatasetResponse]
     total: int
     page: int
@@ -68,6 +78,7 @@ class DatasetList(BaseModel):
 
 class DatasetProcessingConfig(BaseModel):
     """Schema for dataset processing configuration"""
+
     face_detection_confidence: float = Field(default=0.9, ge=0.5, le=1.0)
     min_face_size: int = Field(default=50, ge=10, le=500)
     max_face_size: int = Field(default=500, ge=50, le=2000)
@@ -84,12 +95,18 @@ class DatasetProcessingConfig(BaseModel):
 
 class DatasetFileAddRequest(BaseModel):
     """Schema for adding files to existing dataset"""
-    reprocess: bool = Field(default=True, description="Whether to reprocess the dataset after adding files")
-    description: Optional[str] = Field(None, max_length=500, description="Description for the added files")
+
+    reprocess: bool = Field(
+        default=True, description="Whether to reprocess the dataset after adding files"
+    )
+    description: Optional[str] = Field(
+        None, max_length=500, description="Description for the added files"
+    )
 
 
 class DatasetFileAddResponse(BaseModel):
     """Schema for response after adding files to dataset"""
+
     dataset_id: int
     files_added: List[str]
     total_files_added: int
@@ -99,6 +116,7 @@ class DatasetFileAddResponse(BaseModel):
 
 class DatasetFileInfo(BaseModel):
     """Schema for individual file information in dataset"""
+
     filename: str
     file_path: str
     file_type: str

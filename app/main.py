@@ -14,7 +14,7 @@ load_dotenv()
 
 from app.api.routes import api_router
 from app.core.config import settings
-from app.core.database import create_tables, test_connection
+from app.core.database import test_connection
 from app.core.logging import logger
 
 app = FastAPI(
@@ -22,7 +22,7 @@ app = FastAPI(
     description="A modular deepfake detection system",
     version="1.0.0",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    redirect_slashes=False
+    redirect_slashes=False,
 )
 
 # Set up CORS
@@ -41,18 +41,27 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 app.mount("/models", StaticFiles(directory=settings.MODEL_DIR), name="models")
 
+
 @app.on_event("startup")
 async def startup_event():
     """Application startup event"""
-    logger.info("Deepfake Detection Platform starting up", 
-                project_name=settings.PROJECT_NAME,
-                database_url=settings.DATABASE_URL.split('/')[-1])
-    
+    logger.info(
+        "Deepfake Detection Platform starting up",
+        project_name=settings.PROJECT_NAME,
+        database_url=settings.DATABASE_URL.split("/")[-1],
+    )
+
     # Create necessary directories
     import os
-    for directory in [settings.UPLOAD_DIR, settings.MODEL_DIR, settings.LOG_DIR, settings.DATA_DIR]:
+
+    for directory in [
+        settings.UPLOAD_DIR,
+        settings.MODEL_DIR,
+        settings.LOG_DIR,
+        settings.DATA_DIR,
+    ]:
         os.makedirs(directory, exist_ok=True)
-    
+
     skip_db_check = os.getenv("SKIP_STARTUP_DB_CHECK", "0") == "1"
     if skip_db_check:
         logger.warning("Skipping startup database check due to SKIP_STARTUP_DB_CHECK=1")
@@ -61,26 +70,26 @@ async def startup_event():
     # Test database connection
     if test_connection():
         logger.info("Database connection verified")
-        # Create database tables
-        create_tables()
-        logger.info("Database initialization completed")
     else:
         logger.error("Database connection failed - application may not work properly")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown event"""
     logger.info("Deepfake Detection Platform shutting down")
 
+
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "message": f"{settings.PROJECT_NAME} API", 
+        "message": f"{settings.PROJECT_NAME} API",
         "version": "1.0.0",
         "docs_url": f"{settings.API_V1_STR}/docs",
-        "supported_models": settings.SUPPORTED_MODELS
+        "supported_models": settings.SUPPORTED_MODELS,
     }
+
 
 @app.get("/health")
 async def health_check():
@@ -90,9 +99,11 @@ async def health_check():
         "status": "healthy",
         "database": db_status,
         "project": settings.PROJECT_NAME,
-        "version": "1.0.0"
+        "version": "1.0.0",
     }
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

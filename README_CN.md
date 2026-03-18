@@ -7,7 +7,7 @@
 - **多模型支持**：VGG、LRCN、Swin Transformer、Vision Transformer、ResNet
 - **实时检测**：单文件和批量处理能力
 - **视频分析**：逐帧视频分析与结果聚合
-- **模型训练**：自动化训练管道，支持进度跟踪
+- **模型训练**：自动化训练管道，支持进度跟踪，训练完成后由人工决定是否保留模型文件
 - **数据集管理**：上传、处理和管理数据集
 - **特征工程管线**：对图像/视频执行真实特征提取并输出结果文件
 - **RESTful API**：完整的API接口
@@ -254,7 +254,14 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 - `GET /jobs` - 获取训练任务列表
 - `GET /jobs/{id}` - 获取特定训练任务
 - `GET /jobs/{id}/progress` - 训练进度
+- `POST /jobs/{id}/start` - 手动启动训练任务
+- `POST /jobs/{id}/stop` - 停止训练任务
+- `GET /jobs/{id}/logs` - 查看训练日志
+- `POST /jobs/{id}/model/retain` - 确认保留训练模型文件
+- `DELETE /jobs/{id}/model` - 删除训练模型文件
 - `GET /metrics` - 训练指标
+
+训练任务会返回准确率/损失等指标以及最佳模型文件路径 `model_path`，是否保留模型文件由人工判断。
 
 ### 模型管理 (`/api/v1/models`)
 - `GET /` - 获取模型列表

@@ -12,6 +12,7 @@ from alembic import command
 from alembic.config import Config
 from dotenv import load_dotenv
 from sqlalchemy.engine import make_url
+from sqlalchemy import inspect, text
 
 # Load environment variables first
 load_dotenv()
@@ -45,6 +46,103 @@ def run_alembic_upgrade() -> bool:
         return False
 
 
+def try_stamp_existing_schema() -> bool:
+    """Mark an existing legacy schema as current Alembic head.
+
+    This handles databases where tables already exist but alembic_version
+    was never recorded (for example from previous create_all usage).
+    """
+    try:
+        with engine.connect() as connection:
+            inspector = inspect(connection)
+            table_names = set(inspector.get_table_names())
+
+            if not table_names:
+                return False
+
+            if "alembic_version" in table_names:
+                version_rows = connection.execute(
+                    text("SELECT version_num FROM alembic_version LIMIT 1")
+                ).fetchall()
+                if version_rows:
+                    logger.info(
+                        "Alembic version already present",
+                        version=version_rows[0][0],
+                    )
+                    return False
+
+            expected_tables = {
+                "training_jobs",
+                "detection_results",
+                "model_registry",
+                "dataset_info",
+                "system_config",
+                "audit_log",
+            }
+            if not expected_tables.intersection(table_names):
+                return False
+
+        alembic_cfg = Config("alembic.ini")
+        command.stamp(alembic_cfg, "head")
+        logger.warning(
+            "Existing schema stamped to Alembic head",
+            reason="legacy schema detected without alembic_version",
+        )
+        return True
+    except Exception as exc:
+        logger.error("Failed to stamp existing schema", error=str(exc))
+        return False
+
+
+def sync_legacy_sqlite_schema() -> bool:
+    """Patch known legacy SQLite schema gaps after migration/stamp.
+
+    Some historical databases were created outside Alembic and can miss
+    columns that newer code expects.
+    """
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        return True
+
+    try:
+        required_columns = {
+            "model_registry": [
+                ("description", "TEXT"),
+            ],
+        }
+
+        with engine.connect() as connection:
+            inspector = inspect(connection)
+            table_names = set(inspector.get_table_names())
+
+            for table_name, columns in required_columns.items():
+                if table_name not in table_names:
+                    continue
+
+                existing_columns = {
+                    col["name"] for col in inspector.get_columns(table_name)
+                }
+                for column_name, column_type in columns:
+                    if column_name in existing_columns:
+                        continue
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                        )
+                    )
+                    logger.warning(
+                        "Added missing legacy column",
+                        table=table_name,
+                        column=column_name,
+                    )
+
+            connection.commit()
+
+        return True
+    except Exception as exc:
+        logger.error("Failed to sync legacy sqlite schema", error=str(exc))
+        return False
+
+
 def fallback_create_all() -> bool:
     """Fallback path for emergency bootstrapping without Alembic.
 
@@ -55,7 +153,9 @@ def fallback_create_all() -> bool:
         import app.models.database_models  # noqa: F401
 
         Base.metadata.create_all(bind=engine)
-        logger.warning("Fallback create_all executed; consider using Alembic migrations")
+        logger.warning(
+            "Fallback create_all executed; consider using Alembic migrations"
+        )
         return True
     except Exception as exc:
         logger.error("Fallback create_all failed", error=str(exc))
@@ -74,10 +174,15 @@ def init_database(use_fallback: bool = False) -> bool:
     logger.info("Database connection successful")
 
     if run_alembic_upgrade():
-        return True
+        return sync_legacy_sqlite_schema()
+
+    if try_stamp_existing_schema():
+        return sync_legacy_sqlite_schema()
 
     if use_fallback:
-        logger.warning("Trying fallback create_all because --fallback-create-all is enabled")
+        logger.warning(
+            "Trying fallback create_all because --fallback-create-all is enabled"
+        )
         return fallback_create_all()
 
     return False
