@@ -127,6 +127,12 @@ class Settings(BaseSettings):
     TRAINING_TIMEOUT: int = 7200  # 2 hours
     DEFAULT_EPOCHS: int = 50
     DEFAULT_LEARNING_RATE: float = 0.001
+    TRAINING_DEVICE: str = "auto"
+    TRAINING_NUM_WORKERS: int = 4
+    TRAINING_PREFETCH_FACTOR: int = 2
+    TRAINING_PERSISTENT_WORKERS: bool = True
+    APPLE_SILICON_BATCH_SIZE_CAP: int = 16
+    APPLE_SILICON_SEQUENCE_BATCH_SIZE_CAP: int = 4
 
     # Detection Settings
     DETECTION_TIMEOUT: int = 30  # 30 seconds
@@ -163,6 +169,26 @@ class Settings(BaseSettings):
     def validate_learning_rate(cls, v):
         if v <= 0:
             raise ValueError("DEFAULT_LEARNING_RATE must be positive")
+        return v
+
+    @field_validator("TRAINING_DEVICE")
+    @classmethod
+    def validate_training_device(cls, v):
+        allowed = {"auto", "cpu", "cuda", "mps"}
+        if v not in allowed:
+            raise ValueError(f"TRAINING_DEVICE must be one of {sorted(allowed)}")
+        return v
+
+    @field_validator(
+        "TRAINING_NUM_WORKERS",
+        "TRAINING_PREFETCH_FACTOR",
+        "APPLE_SILICON_BATCH_SIZE_CAP",
+        "APPLE_SILICON_SEQUENCE_BATCH_SIZE_CAP",
+    )
+    @classmethod
+    def validate_positive_training_values(cls, v):
+        if v < 1:
+            raise ValueError("training tuning values must be at least 1")
         return v
 
     @field_validator("PORT", "WORKERS", mode="before")

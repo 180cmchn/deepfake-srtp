@@ -5,6 +5,7 @@ Detection service for deepfake detection platform
 import os
 import time
 import asyncio
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from fastapi import BackgroundTasks
@@ -57,10 +58,17 @@ class DetectionService:
             file_size = os.path.getsize(file_path)
 
             # Load model
-            model = await self._load_model(request.model_id, request.model_type)
+            loaded_model = await self._load_model(request.model_id, request.model_type)
+            model = loaded_model["model"]
+
+            if loaded_model["model_type"] == "lrcn":
+                raise ValueError("LRCN models only support video detection")
 
             # Preprocess image
-            image = self._preprocess_image(file_path)
+            image = self._preprocess_image(
+                file_path,
+                input_size=loaded_model.get("input_size", settings.MODEL_INPUT_SIZE),
+            )
 
             # Perform inference
             prediction, confidence = await self._inference(model, image)
@@ -79,8 +87,13 @@ class DetectionService:
                 probabilities=probabilities,
                 processing_time=processing_time,
                 model_info={
-                    "model_type": model.__class__.__name__,
-                    "input_size": settings.MODEL_INPUT_SIZE,
+                    "model_id": loaded_model.get("model_id"),
+                    "model_name": loaded_model.get("model_name"),
+                    "model_type": loaded_model["model_type"],
+                    "input_size": loaded_model.get(
+                        "input_size", settings.MODEL_INPUT_SIZE
+                    ),
+                    "source": loaded_model.get("source"),
                 },
             )
 
@@ -224,47 +237,69 @@ class DetectionService:
                 raise ValueError("No frames could be extracted from video")
 
             # Load model
-            model = await self._load_model(request.model_id, request.model_type)
+            loaded_model = await self._load_model(request.model_id, request.model_type)
+            model = loaded_model["model"]
 
-            # Process each frame
             frame_results = []
             predictions = []
             confidences = []
 
-            for i, (frame, timestamp) in enumerate(frames):
-                try:
-                    # Preprocess frame
-                    processed_frame = self._preprocess_frame(frame)
+            if loaded_model["model_type"] == "lrcn":
+                processed_clip = self._preprocess_video_clip(
+                    frames,
+                    sequence_length=loaded_model.get("sequence_length", 16),
+                    input_size=loaded_model.get(
+                        "input_size", settings.MODEL_INPUT_SIZE
+                    ),
+                )
+                aggregated_prediction, aggregated_confidence = await self._inference(
+                    model, processed_clip
+                )
+                predictions.append(aggregated_prediction)
+                confidences.append(aggregated_confidence)
+            else:
+                for i, (frame, timestamp) in enumerate(frames):
+                    try:
+                        processed_frame = self._preprocess_frame(
+                            frame,
+                            input_size=loaded_model.get(
+                                "input_size", settings.MODEL_INPUT_SIZE
+                            ),
+                        )
+                        prediction, confidence = await self._inference(
+                            model, processed_frame
+                        )
 
-                    # Perform inference
-                    prediction, confidence = await self._inference(
-                        model, processed_frame
-                    )
+                        predictions.append(prediction)
+                        confidences.append(confidence)
+                        frame_results.append(
+                            {
+                                "frame_number": i + 1,
+                                "timestamp": timestamp,
+                                "result": {
+                                    "prediction": prediction,
+                                    "confidence": confidence,
+                                    "processing_time": 0.0,
+                                    "model_info": {
+                                        "model_id": loaded_model.get("model_id"),
+                                        "model_name": loaded_model.get("model_name"),
+                                        "model_type": loaded_model["model_type"],
+                                    },
+                                },
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Frame processing failed", frame_number=i + 1, error=str(e)
+                        )
+                        continue
 
-                    predictions.append(prediction)
-                    confidences.append(confidence)
+                if not frame_results:
+                    raise ValueError("No frames could be processed successfully")
 
-                    frame_result = {
-                        "frame_number": i + 1,
-                        "timestamp": timestamp,
-                        "prediction": prediction,
-                        "confidence": confidence,
-                    }
-                    frame_results.append(frame_result)
-
-                except Exception as e:
-                    logger.warning(
-                        "Frame processing failed", frame_number=i + 1, error=str(e)
-                    )
-                    continue
-
-            if not frame_results:
-                raise ValueError("No frames could be processed successfully")
-
-            # Aggregate results
-            aggregated_prediction, aggregated_confidence = self._aggregate_results(
-                predictions, confidences, request.confidence_threshold
-            )
+                aggregated_prediction, aggregated_confidence = self._aggregate_results(
+                    predictions, confidences, request.confidence_threshold
+                )
 
             processing_time = time.time() - start_time
 
@@ -292,10 +327,21 @@ class DetectionService:
                     prediction=aggregated_prediction,
                     confidence=aggregated_confidence,
                     processing_time=processing_time,
+                    model_info={
+                        "model_id": loaded_model.get("model_id"),
+                        "model_name": loaded_model.get("model_name"),
+                        "model_type": loaded_model["model_type"],
+                        "input_size": loaded_model.get(
+                            "input_size", settings.MODEL_INPUT_SIZE
+                        ),
+                        "source": loaded_model.get("source"),
+                    },
                 )
                 if request.aggregate_results
                 else None,
-                frame_results=frame_results if request.return_frame_results else None,
+                frame_results=frame_results
+                if request.return_frame_results and frame_results
+                else None,
                 summary=summary,
                 processing_time=processing_time,
                 created_at=time.time(),
@@ -579,7 +625,6 @@ class DetectionService:
             return self._model_cache[cache_key]
 
         if model_id:
-            # Load specific model from database
             model_record = (
                 self.db.query(ModelRegistry)
                 .filter(ModelRegistry.id == model_id, ModelRegistry.del_flag == 0)
@@ -590,38 +635,86 @@ class DetectionService:
                 raise ValueError(f"Model with ID {model_id} not found")
 
             model_type = model_record.model_type
-            # TODO: Load actual model from file
-            model = create_model(model_type)
+            checkpoint = self._load_checkpoint(model_record.file_path)
+            model = self._build_model_from_checkpoint(
+                model_type, checkpoint, model_record
+            )
+            state_dict = checkpoint.get("model_state_dict")
+            if not state_dict:
+                raise ValueError("Checkpoint does not contain model_state_dict")
+            model.load_state_dict(state_dict)
+            loaded = {
+                "model": model,
+                "model_id": model_record.id,
+                "model_name": model_record.name,
+                "model_type": model_type,
+                "input_size": checkpoint.get(
+                    "input_size", model_record.input_size or settings.MODEL_INPUT_SIZE
+                ),
+                "sequence_length": checkpoint.get(
+                    "sequence_length",
+                    (model_record.parameters or {}).get("sequence_length", 16),
+                ),
+                "source": "registry",
+            }
         else:
-            # Load default model type
             model_type = model_type or settings.DEFAULT_MODEL_TYPE
             model = create_model(model_type)
+            loaded = {
+                "model": model,
+                "model_id": None,
+                "model_name": model_type,
+                "model_type": model_type,
+                "input_size": settings.MODEL_INPUT_SIZE,
+                "sequence_length": 16,
+                "source": "builtin",
+            }
 
-        # Set to evaluation mode
-        model.eval()
+        loaded["model"].eval()
 
-        # Cache the model
-        self._model_cache[cache_key] = model
+        self._model_cache[cache_key] = loaded
 
-        return model
+        return loaded
 
-    def _preprocess_image(self, image_path: str) -> np.ndarray:
+    def _preprocess_image(self, image_path: str, input_size: int = None) -> np.ndarray:
         """Preprocess image for inference"""
+        target_size = input_size or settings.MODEL_INPUT_SIZE
         image = Image.open(image_path).convert("RGB")
-        image = image.resize((settings.MODEL_INPUT_SIZE, settings.MODEL_INPUT_SIZE))
+        image = image.resize((target_size, target_size))
         image = np.array(image) / 255.0
         image = np.transpose(image, (2, 0, 1))  # HWC to CHW
         image = torch.FloatTensor(image).unsqueeze(0)  # Add batch dimension
         return image
 
-    def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
+    def _preprocess_frame(
+        self, frame: np.ndarray, input_size: int = None
+    ) -> np.ndarray:
         """Preprocess video frame for inference"""
+        target_size = input_size or settings.MODEL_INPUT_SIZE
         image = Image.fromarray(frame).convert("RGB")
-        image = image.resize((settings.MODEL_INPUT_SIZE, settings.MODEL_INPUT_SIZE))
+        image = image.resize((target_size, target_size))
         image = np.array(image) / 255.0
         image = np.transpose(image, (2, 0, 1))  # HWC to CHW
         image = torch.FloatTensor(image).unsqueeze(0)  # Add batch dimension
         return image
+
+    def _preprocess_video_clip(
+        self, frames: List[tuple], sequence_length: int, input_size: int = None
+    ) -> torch.Tensor:
+        """Preprocess extracted video frames into a fixed-length clip tensor."""
+        if not frames:
+            raise ValueError("No frames available for video clip preprocessing")
+
+        target_length = max(1, sequence_length)
+        selected_frames = [frame for frame, _ in frames[:target_length]]
+        while len(selected_frames) < target_length:
+            selected_frames.append(selected_frames[-1])
+
+        processed_frames = [
+            self._preprocess_frame(frame, input_size=input_size).squeeze(0)
+            for frame in selected_frames
+        ]
+        return torch.stack(processed_frames, dim=0).unsqueeze(0)
 
     async def _inference(self, model, input_tensor: torch.Tensor) -> tuple:
         """Perform model inference"""
@@ -778,3 +871,40 @@ class DetectionService:
                 counts[prediction] += 1
 
         return counts
+
+    def _load_checkpoint(self, file_path: str) -> Dict[str, Any]:
+        """Load a retained checkpoint file from disk."""
+        resolved_path = Path(file_path).expanduser()
+        if not resolved_path.is_absolute():
+            resolved_path = (Path.cwd() / resolved_path).resolve()
+        if not resolved_path.exists() or not resolved_path.is_file():
+            raise ValueError(f"Model checkpoint not found: {resolved_path}")
+        return torch.load(str(resolved_path), map_location="cpu")
+
+    def _build_model_from_checkpoint(
+        self,
+        model_type: str,
+        checkpoint: Dict[str, Any],
+        model_record: ModelRegistry,
+    ):
+        """Build a model instance that matches checkpoint metadata."""
+        parameters = model_record.parameters or {}
+        kwargs: Dict[str, Any] = {
+            "num_classes": checkpoint.get("num_classes", model_record.num_classes or 2)
+        }
+        if model_type == "lrcn":
+            kwargs.update(
+                {
+                    "input_size": checkpoint.get(
+                        "feature_input_size",
+                        parameters.get("feature_input_size", 25088),
+                    ),
+                    "hidden_size": checkpoint.get(
+                        "hidden_size", parameters.get("hidden_size", 512)
+                    ),
+                    "num_layers": checkpoint.get(
+                        "num_layers", parameters.get("num_layers", 2)
+                    ),
+                }
+            )
+        return create_model(model_type, **kwargs)

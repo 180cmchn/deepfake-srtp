@@ -4,6 +4,7 @@ Training service for deepfake detection platform
 
 import asyncio
 from datetime import datetime
+import os
 from pathlib import Path
 import re
 from typing import List, Optional, Dict, Any, Tuple
@@ -20,7 +21,8 @@ from fastapi import BackgroundTasks
 from app.core.database import get_db_session
 from app.core.logging import logger
 from app.core.config import settings
-from app.models.database_models import TrainingJob
+from app.models.database_models import ModelRegistry, TrainingJob
+from app.schemas.models import ModelStatus
 from app.schemas.training import (
     TrainingJobCreate,
     TrainingJobResponse,
@@ -110,6 +112,79 @@ class TrainingService:
     def __init__(self, db: Session):
         self.db = db
         self._active_jobs = self._shared_active_jobs
+
+    def _resolve_training_device(
+        self, requested_device: Optional[str] = None
+    ) -> torch.device:
+        """Resolve training device from explicit selection or config."""
+        configured = (requested_device or settings.TRAINING_DEVICE).lower()
+        mps_available = (
+            torch.backends.mps.is_available() and torch.backends.mps.is_built()
+        )
+        cuda_available = torch.cuda.is_available()
+
+        if configured == "cuda":
+            if cuda_available:
+                return torch.device("cuda")
+            raise ValueError("TRAINING_DEVICE is set to cuda but CUDA is not available")
+
+        if configured == "mps":
+            if mps_available:
+                return torch.device("mps")
+            raise ValueError("TRAINING_DEVICE is set to mps but MPS is not available")
+
+        if configured == "cpu":
+            return torch.device("cpu")
+
+        available_accelerators = []
+        if mps_available:
+            available_accelerators.append("mps")
+        if cuda_available:
+            available_accelerators.append("cuda")
+
+        if len(available_accelerators) > 1:
+            raise ValueError(
+                "Both MPS and CUDA are available; set training_device explicitly to 'mps' or 'cuda'"
+            )
+        if len(available_accelerators) == 1:
+            return torch.device(available_accelerators[0])
+        return torch.device("cpu")
+
+    def _using_mps(self, device: torch.device) -> bool:
+        return device.type == "mps"
+
+    def _is_apple_silicon(self) -> bool:
+        machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+        return machine == "arm64" and torch.backends.mps.is_built()
+
+    def _tune_batch_size(
+        self,
+        requested_batch_size: int,
+        device: torch.device,
+        sequence_mode: bool = False,
+    ) -> int:
+        """Clamp batch size for Apple Silicon unified memory machines."""
+        batch_size = max(1, requested_batch_size)
+        if self._is_apple_silicon() and self._using_mps(device):
+            cap = (
+                settings.APPLE_SILICON_SEQUENCE_BATCH_SIZE_CAP
+                if sequence_mode
+                else settings.APPLE_SILICON_BATCH_SIZE_CAP
+            )
+            batch_size = min(batch_size, cap)
+        return batch_size
+
+    def _dataloader_kwargs(self, dataset_size: int) -> Dict[str, Any]:
+        """Return DataLoader kwargs tuned for local hardware."""
+        workers = min(settings.TRAINING_NUM_WORKERS, max(1, dataset_size))
+        kwargs: Dict[str, Any] = {
+            "num_workers": workers,
+            "pin_memory": torch.cuda.is_available(),
+        }
+        if workers > 0:
+            kwargs["persistent_workers"] = settings.TRAINING_PERSISTENT_WORKERS
+            kwargs["prefetch_factor"] = settings.TRAINING_PREFETCH_FACTOR
+        return kwargs
 
     async def create_job(
         self,
@@ -621,11 +696,16 @@ class TrainingService:
             if not model_path.exists() or not model_path.is_file():
                 raise ValueError("Model file does not exist on disk")
 
+            registry_model = self._register_retained_model(
+                job, model_path, current_user
+            )
+
             logger.info(
                 "Model file retention confirmed",
                 job_id=job_id,
                 user=current_user,
                 model_path=str(model_path),
+                model_registry_id=registry_model.id,
             )
             return str(model_path)
         except Exception as e:
@@ -662,6 +742,17 @@ class TrainingService:
             if model_path.exists() and model_path.is_file():
                 model_path.unlink()
 
+            self.db.query(ModelRegistry).filter(
+                ModelRegistry.training_job_id == job.id,
+                ModelRegistry.del_flag == 0,
+            ).update(
+                {
+                    "del_flag": 1,
+                    "status": ModelStatus.ARCHIVED.value,
+                    "is_default": False,
+                },
+                synchronize_session=False,
+            )
             job.model_path = None
             self.db.commit()
 
@@ -816,10 +907,30 @@ class TrainingService:
             learning_rate = float(parameters.get("learning_rate", job.learning_rate))
             batch_size = int(parameters.get("batch_size", job.batch_size))
             validation_split = float(parameters.get("validation_split", 0.2))
+            training_device = str(
+                parameters.get("training_device", settings.TRAINING_DEVICE)
+            )
 
         self._set_active_job_metadata(job_id, {"total_epochs": epochs, "mode": "image"})
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = self._resolve_training_device(training_device)
+        batch_size = self._tune_batch_size(batch_size, device, sequence_mode=False)
+        self._set_active_job_metadata(
+            job_id,
+            {
+                "device": str(device),
+                "effective_batch_size": batch_size,
+                "requested_device": training_device,
+            },
+        )
+        logger.info(
+            "Using training device",
+            job_id=job_id,
+            device=str(device),
+            batch_size=batch_size,
+            apple_silicon=self._is_apple_silicon(),
+            requested_device=training_device,
+        )
         train_loader, val_loader = self._build_dataloaders(
             dataset_path, batch_size, validation_split
         )
@@ -884,6 +995,12 @@ class TrainingService:
                         "job_id": job_id,
                         "model_type": model_type,
                         "epoch": epoch,
+                        "epochs": epochs,
+                        "learning_rate": learning_rate,
+                        "batch_size": batch_size,
+                        "validation_split": validation_split,
+                        "training_device": training_device,
+                        "num_classes": 2,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "val_accuracy": val_accuracy,
@@ -918,6 +1035,9 @@ class TrainingService:
             frame_stride = int(parameters.get("frame_stride", 1))
             hidden_size = int(parameters.get("hidden_size", 512))
             num_layers = int(parameters.get("num_layers", 2))
+            training_device = str(
+                parameters.get("training_device", settings.TRAINING_DEVICE)
+            )
 
         if sequence_length <= 0:
             raise ValueError("sequence_length must be greater than 0")
@@ -933,7 +1053,24 @@ class TrainingService:
             },
         )
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = self._resolve_training_device(training_device)
+        batch_size = self._tune_batch_size(batch_size, device, sequence_mode=True)
+        self._set_active_job_metadata(
+            job_id,
+            {
+                "device": str(device),
+                "effective_batch_size": batch_size,
+                "requested_device": training_device,
+            },
+        )
+        logger.info(
+            "Using sequence training device",
+            job_id=job_id,
+            device=str(device),
+            batch_size=batch_size,
+            apple_silicon=self._is_apple_silicon(),
+            requested_device=training_device,
+        )
         train_loader, val_loader = self._build_sequence_dataloaders(
             dataset_path, batch_size, validation_split, sequence_length, frame_stride
         )
@@ -1006,6 +1143,15 @@ class TrainingService:
                         "job_id": job_id,
                         "model_type": model_type,
                         "epoch": epoch,
+                        "epochs": epochs,
+                        "learning_rate": learning_rate,
+                        "batch_size": batch_size,
+                        "validation_split": validation_split,
+                        "training_device": training_device,
+                        "num_classes": 2,
+                        "hidden_size": hidden_size,
+                        "num_layers": num_layers,
+                        "feature_input_size": 25088,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "val_accuracy": val_accuracy,
@@ -1128,20 +1274,19 @@ class TrainingService:
         )
         val_dataset = ImageClassificationDataset(val_samples, transform=val_transform)
 
-        pin_memory = torch.cuda.is_available()
+        loader_kwargs = self._dataloader_kwargs(len(train_dataset))
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,
-            pin_memory=pin_memory,
+            **loader_kwargs,
         )
+        val_loader_kwargs = self._dataloader_kwargs(len(val_dataset))
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=0,
-            pin_memory=pin_memory,
+            **val_loader_kwargs,
         )
 
         return train_loader, val_loader
@@ -1237,20 +1382,19 @@ class TrainingService:
             val_samples, transform=val_transform
         )
 
-        pin_memory = torch.cuda.is_available()
+        loader_kwargs = self._dataloader_kwargs(len(train_dataset))
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,
-            pin_memory=pin_memory,
+            **loader_kwargs,
         )
+        val_loader_kwargs = self._dataloader_kwargs(len(val_dataset))
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=0,
-            pin_memory=pin_memory,
+            **val_loader_kwargs,
         )
 
         return train_loader, val_loader
@@ -1551,6 +1695,9 @@ class TrainingService:
         """Convert database model to response schema"""
         from app.schemas.training import TrainingParameters, TrainingResults
 
+        active_meta = self._active_jobs.get(job.id, {})
+        training_device = active_meta.get("requested_device", settings.TRAINING_DEVICE)
+
         parameters = TrainingParameters(
             epochs=job.epochs if job.epochs is not None else settings.DEFAULT_EPOCHS,
             learning_rate=job.learning_rate
@@ -1559,6 +1706,10 @@ class TrainingService:
             batch_size=job.batch_size
             if job.batch_size is not None
             else settings.MODEL_BATCH_SIZE,
+            validation_split=0.2,
+            early_stopping=True,
+            patience=10,
+            training_device=training_device,
         )
 
         results = None
@@ -1591,3 +1742,100 @@ class TrainingService:
             return JobStatus(status_value)
         except Exception:
             return JobStatus.PENDING
+
+    def _register_retained_model(
+        self, job: TrainingJob, model_path: Path, current_user: str
+    ) -> ModelRegistry:
+        """Create or update a model registry record for a retained checkpoint."""
+        metadata = self._read_checkpoint_metadata(str(model_path))
+        parameters = metadata.get("parameters", {})
+        accuracy = metadata.get("val_accuracy", job.accuracy)
+        existing = (
+            self.db.query(ModelRegistry)
+            .filter(ModelRegistry.training_job_id == job.id)
+            .first()
+        )
+
+        payload = {
+            "name": existing.name if existing else self._build_model_name(job),
+            "model_type": metadata.get("model_type", job.model_type),
+            "version": self._build_model_version(job),
+            "file_path": str(model_path),
+            "description": job.description
+            or f"Retained model from training job {job.id}",
+            "input_size": metadata.get("input_size", settings.MODEL_INPUT_SIZE),
+            "num_classes": metadata.get("num_classes", 2),
+            "parameters": parameters,
+            "accuracy": accuracy,
+            "status": ModelStatus.READY.value,
+            "training_job_id": job.id,
+            "del_flag": 0,
+        }
+
+        if existing:
+            for field, value in payload.items():
+                setattr(existing, field, value)
+            registry_model = existing
+        else:
+            registry_model = ModelRegistry(**payload)
+            self.db.add(registry_model)
+
+        self.db.commit()
+        self.db.refresh(registry_model)
+        logger.info(
+            "Model registry synchronized for retained checkpoint",
+            job_id=job.id,
+            model_registry_id=registry_model.id,
+            user=current_user,
+        )
+        return registry_model
+
+    def _build_model_name(self, job: TrainingJob) -> str:
+        """Build a stable model name for a retained training job."""
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", (job.name or "model").strip()).strip("-")
+        if not slug:
+            slug = f"{job.model_type}-model"
+        return f"{slug}-job-{job.id}"
+
+    def _build_model_version(self, job: TrainingJob) -> str:
+        """Build a deterministic version string from completion timestamp."""
+        completed_at = job.completed_at or datetime.now()
+        return completed_at.strftime("%Y.%m.%d.%H%M%S")
+
+    def _read_checkpoint_metadata(self, model_path: Optional[str]) -> Dict[str, Any]:
+        """Read checkpoint metadata without loading tensors into accelerators."""
+        if not model_path:
+            return {}
+
+        resolved_path = Path(model_path).expanduser()
+        if not resolved_path.is_absolute():
+            resolved_path = (Path.cwd() / resolved_path).resolve()
+        if not resolved_path.exists() or not resolved_path.is_file():
+            return {}
+
+        try:
+            checkpoint = torch.load(str(resolved_path), map_location="cpu")
+        except Exception as exc:
+            logger.warning(
+                "Failed to read checkpoint metadata",
+                model_path=str(resolved_path),
+                error=str(exc),
+            )
+            return {}
+
+        parameters = {
+            "epochs": checkpoint.get("epochs"),
+            "learning_rate": checkpoint.get("learning_rate"),
+            "batch_size": checkpoint.get("batch_size"),
+            "validation_split": checkpoint.get("validation_split"),
+            "training_device": checkpoint.get("training_device"),
+            "sequence_length": checkpoint.get("sequence_length"),
+            "frame_stride": checkpoint.get("frame_stride"),
+            "hidden_size": checkpoint.get("hidden_size"),
+            "num_layers": checkpoint.get("num_layers"),
+        }
+        filtered_parameters = {
+            key: value for key, value in parameters.items() if value is not None
+        }
+        checkpoint["parameters"] = filtered_parameters
+        return checkpoint

@@ -12,6 +12,9 @@ alembic==1.13.1
 pymysql==1.1.0
 
 # Machine Learning
+# Apple Silicon / MPS training uses the standard torch + torchvision packages below.
+# No extra macOS-specific dependency is required, but install an arm64 Python/venv
+# so PyTorch can use MPS acceleration on Apple chips.
 torch==2.2.0
 torchvision==0.17.0
 tensorflow==2.16.1

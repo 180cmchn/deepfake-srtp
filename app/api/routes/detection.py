@@ -2,7 +2,16 @@
 Detection API routes for deepfake detection platform
 """
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks, Header, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    UploadFile,
+    File,
+    HTTPException,
+    BackgroundTasks,
+    Header,
+    Query,
+)
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
@@ -12,10 +21,18 @@ from datetime import datetime
 from app.core.database import get_db
 from app.core.logging import logger
 from app.core.auth import get_current_user, get_optional_user
+from app.models.database_models import ModelRegistry
+from app.schemas.models import ModelStatus
 from app.schemas.detection import (
-    DetectionRequest, DetectionResponse, BatchDetectionRequest, 
-    BatchDetectionResponse, VideoDetectionRequest, VideoDetectionResponse,
-    DetectionHistory, DetectionHistoryList, DetectionStatistics
+    DetectionRequest,
+    DetectionResponse,
+    BatchDetectionRequest,
+    BatchDetectionResponse,
+    VideoDetectionRequest,
+    VideoDetectionResponse,
+    DetectionHistory,
+    DetectionHistoryList,
+    DetectionStatistics,
 )
 
 router = APIRouter()
@@ -27,7 +44,7 @@ async def detect_deepfake(
     file: UploadFile = File(...),
     request: DetectionRequest = Depends(),
     db: Session = Depends(get_db),
-    current_user: str = Depends(get_current_user)
+    current_user: str = Depends(get_current_user),
 ):
     """
     Detect deepfake in uploaded file
@@ -39,43 +56,45 @@ async def detect_deepfake(
         # Validate file
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
-        
+
         # Generate unique filename
         file_extension = os.path.splitext(file.filename)[1].lower()
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         file_path = os.path.join("uploads", unique_filename)
-        
+
         # Save uploaded file
         os.makedirs("uploads", exist_ok=True)
         with open(file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
-        
+
         # Initialize detection service
         detection_service = DetectionService(db)
-        
+
         # Perform detection
         result = await detection_service.detect_file(
-            file_path=file_path,
-            request=request,
-            background_tasks=background_tasks
+            file_path=file_path, request=request, background_tasks=background_tasks
         )
-        
+
         if result.success and result.result:
-            logger.info("Detection completed", 
-                       file_name=file.filename, 
-                       result=result.result.prediction,
-                       confidence=result.result.confidence,
-                       user=current_user)
+            logger.info(
+                "Detection completed",
+                file_name=file.filename,
+                result=result.result.prediction,
+                confidence=result.result.confidence,
+                user=current_user,
+            )
         else:
-            logger.info("Detection completed", 
-                       file_name=file.filename, 
-                       success=result.success,
-                       error_message=result.error_message,
-                       user=current_user)
-        
+            logger.info(
+                "Detection completed",
+                file_name=file.filename,
+                success=result.success,
+                error_message=result.error_message,
+                user=current_user,
+            )
+
         return result
-        
+
     except HTTPException:
         # Clean up uploaded file if it exists
         if file_path and os.path.exists(file_path):
@@ -83,23 +102,29 @@ async def detect_deepfake(
                 os.remove(file_path)
                 logger.info("Cleaned up uploaded file", file_path=file_path)
             except Exception as cleanup_error:
-                logger.error("Failed to clean up file", 
-                           file_path=file_path, 
-                           error=str(cleanup_error))
+                logger.error(
+                    "Failed to clean up file",
+                    file_path=file_path,
+                    error=str(cleanup_error),
+                )
         raise
     except Exception as e:
-        logger.error("Detection failed", error=str(e), file_name=file.filename, user=current_user)
-        
+        logger.error(
+            "Detection failed", error=str(e), file_name=file.filename, user=current_user
+        )
+
         # Clean up uploaded file if it exists
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
                 logger.info("Cleaned up uploaded file after error", file_path=file_path)
             except Exception as cleanup_error:
-                logger.error("Failed to clean up file after error", 
-                           file_path=file_path, 
-                           error=str(cleanup_error))
-        
+                logger.error(
+                    "Failed to clean up file after error",
+                    file_path=file_path,
+                    error=str(cleanup_error),
+                )
+
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
 
 
@@ -108,7 +133,7 @@ async def detect_deepfake_batch(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     request: BatchDetectionRequest = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Detect deepfake in multiple files
@@ -118,40 +143,40 @@ async def detect_deepfake_batch(
 
         if len(files) > 100:
             raise HTTPException(status_code=400, detail="Maximum 100 files allowed")
-        
+
         # Save uploaded files
         file_paths = []
         for file in files:
             if not file.filename:
                 continue
-            
+
             file_extension = os.path.splitext(file.filename)[1].lower()
             unique_filename = f"{uuid.uuid4()}{file_extension}"
             file_path = os.path.join("uploads", unique_filename)
-            
+
             os.makedirs("uploads", exist_ok=True)
             with open(file_path, "wb") as buffer:
                 content = await file.read()
                 buffer.write(content)
-            
+
             file_paths.append(file_path)
-        
+
         # Initialize detection service
         detection_service = DetectionService(db)
-        
+
         # Perform batch detection
         result = await detection_service.detect_batch(
-            file_paths=file_paths,
-            request=request,
-            background_tasks=background_tasks
+            file_paths=file_paths, request=request, background_tasks=background_tasks
         )
-        
-        logger.info("Batch detection completed", 
-                   total_files=len(files),
-                   processed_files=result.processed_files)
-        
+
+        logger.info(
+            "Batch detection completed",
+            total_files=len(files),
+            processed_files=result.processed_files,
+        )
+
         return result
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -164,7 +189,7 @@ async def detect_deepfake_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     request: VideoDetectionRequest = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Detect deepfake in video file
@@ -174,38 +199,38 @@ async def detect_deepfake_video(
 
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
-        
+
         # Validate video file
         file_extension = os.path.splitext(file.filename)[1].lower()
-        if file_extension not in ['.mp4', '.avi', '.mov', '.mkv', '.wmv']:
+        if file_extension not in [".mp4", ".avi", ".mov", ".mkv", ".wmv"]:
             raise HTTPException(status_code=400, detail="Invalid video format")
-        
+
         # Generate unique filename
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         file_path = os.path.join("uploads", unique_filename)
-        
+
         # Save uploaded file
         os.makedirs("uploads", exist_ok=True)
         with open(file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
-        
+
         # Initialize detection service
         detection_service = DetectionService(db)
-        
+
         # Perform video detection
         result = await detection_service.detect_video(
-            video_path=file_path,
-            request=request,
-            background_tasks=background_tasks
+            video_path=file_path, request=request, background_tasks=background_tasks
         )
-        
-        logger.info("Video detection completed", 
-                   file_name=file.filename,
-                   frames_analyzed=len(result.frame_results) if result.frame_results else 0)
-        
+
+        logger.info(
+            "Video detection completed",
+            file_name=file.filename,
+            frames_analyzed=len(result.frame_results) if result.frame_results else 0,
+        )
+
         return result
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -216,7 +241,9 @@ async def detect_deepfake_video(
 @router.get("/history", response_model=DetectionHistoryList)
 async def get_detection_history(
     skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
+    limit: int = Query(
+        100, ge=1, le=1000, description="Maximum number of records to return"
+    ),
     prediction: Optional[str] = Query(None, description="Filter by prediction result"),
     model_type: Optional[str] = Query(None, description="Filter by model type"),
     user_id: Optional[str] = Query(None, description="Filter by user ID"),
@@ -224,7 +251,7 @@ async def get_detection_history(
     order_by: str = Query("created_at", description="Field to order by"),
     order_desc: bool = Query(True, description="Order in descending order"),
     db: Session = Depends(get_db),
-    current_user: str = Depends(get_current_user)
+    current_user: str = Depends(get_current_user),
 ):
     """
     Get detection history with filtering, searching, and pagination
@@ -241,10 +268,10 @@ async def get_detection_history(
             user_id=user_id,
             search=search,
             order_by=order_by,
-            order_desc=order_desc
+            order_desc=order_desc,
         )
         return history
-        
+
     except Exception as e:
         logger.error("Failed to get detection history", error=str(e), user=current_user)
         raise HTTPException(status_code=500, detail="Failed to get detection history")
@@ -261,32 +288,92 @@ async def get_detection_statistics(db: Session = Depends(get_db)):
         detection_service = DetectionService(db)
         stats = await detection_service.get_statistics()
         return stats
-        
+
     except Exception as e:
         logger.error("Failed to get detection statistics", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to get detection statistics")
+        raise HTTPException(
+            status_code=500, detail="Failed to get detection statistics"
+        )
 
 
 @router.get("/models")
-async def get_available_models():
+async def get_available_models(db: Session = Depends(get_db)):
     """
     Get available detection models
     """
     try:
-        from app.models.ml_models import ModelRegistry
-        models = ModelRegistry.list_models()
-        return {"models": models, "default": "vgg"}
-        
+        from app.models.ml_models import ModelRegistry as MLModelRegistry
+
+        registry_models = (
+            db.query(ModelRegistry)
+            .filter(
+                ModelRegistry.del_flag == 0,
+                ModelRegistry.status.in_(
+                    [ModelStatus.READY.value, ModelStatus.DEPLOYED.value]
+                ),
+            )
+            .order_by(ModelRegistry.is_default.desc(), ModelRegistry.created_at.desc())
+            .all()
+        )
+        builtin_types = MLModelRegistry.list_models()
+
+        saved_models = [
+            {
+                "id": model.id,
+                "name": model.name,
+                "label": f"{model.name} ({model.model_type.upper()})",
+                "model_type": model.model_type,
+                "source": "registry",
+                "status": model.status,
+                "is_default": bool(model.is_default),
+                "usable_for": ["video"]
+                if model.model_type == "lrcn"
+                else ["image", "video"],
+            }
+            for model in registry_models
+        ]
+
+        saved_model_types = {model.model_type for model in registry_models}
+        builtin_models = [
+            {
+                "id": None,
+                "name": model_type,
+                "label": f"Built-in {model_type.upper()}",
+                "model_type": model_type,
+                "source": "builtin",
+                "status": "builtin",
+                "is_default": False,
+                "usable_for": ["video"] if model_type == "lrcn" else ["image", "video"],
+            }
+            for model_type in builtin_types
+            if model_type not in saved_model_types
+        ]
+
+        default_model = next(
+            (model for model in saved_models if model["is_default"]), None
+        ) or (saved_models[0] if saved_models else None)
+        default_value = (
+            {"model_id": default_model["id"], "model_type": default_model["model_type"]}
+            if default_model and default_model["source"] == "registry"
+            else {
+                "model_id": None,
+                "model_type": (default_model or {"model_type": "vgg"})["model_type"],
+            }
+        )
+
+        return {
+            "models": saved_models + builtin_models,
+            "default": default_value,
+            "model_types": builtin_types,
+        }
+
     except Exception as e:
         logger.error("Failed to get available models", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to get available models")
 
 
 @router.delete("/history/{detection_id}")
-async def delete_detection_record(
-    detection_id: int,
-    db: Session = Depends(get_db)
-):
+async def delete_detection_record(detection_id: int, db: Session = Depends(get_db)):
     """
     Delete detection record
     """
@@ -295,14 +382,16 @@ async def delete_detection_record(
 
         detection_service = DetectionService(db)
         success = await detection_service.delete_detection_record(detection_id)
-        
+
         if not success:
             raise HTTPException(status_code=404, detail="Detection record not found")
-        
+
         return {"message": "Detection record deleted successfully"}
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Failed to delete detection record", error=str(e), detection_id=detection_id)
+        logger.error(
+            "Failed to delete detection record", error=str(e), detection_id=detection_id
+        )
         raise HTTPException(status_code=500, detail="Failed to delete detection record")

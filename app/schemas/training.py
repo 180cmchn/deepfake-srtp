@@ -37,11 +37,21 @@ class TrainingParameters(BaseModel):
     patience: int = Field(
         default=10, ge=1, le=100, description="Early stopping patience"
     )
+    training_device: str = Field(
+        default="auto", description="Training device: auto, mps, cuda, cpu"
+    )
 
     @validator("validation_split")
     def validate_validation_split(cls, v):
         if not 0.1 <= v <= 0.5:
             raise ValueError("Validation split must be between 0.1 and 0.5")
+        return v
+
+    @validator("training_device")
+    def validate_training_device(cls, v):
+        allowed = {"auto", "mps", "cuda", "cpu"}
+        if v not in allowed:
+            raise ValueError(f"training_device must be one of: {sorted(allowed)}")
         return v
 
 

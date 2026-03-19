@@ -7,14 +7,14 @@
 - **多模型支持**：VGG、LRCN、Swin Transformer、Vision Transformer、ResNet
 - **实时检测**：单文件和批量处理能力
 - **视频分析**：逐帧视频分析与结果聚合
-- **模型训练**：自动化训练管道，支持进度跟踪，训练完成后由人工决定是否保留模型文件
-- **数据集管理**：上传、处理和管理数据集
+- **模型训练**：自动化训练管道，支持进度跟踪，训练完成后由人工决定是否保留模型文件，保留后可直接进入检测模型列表
+- **数据集管理**：支持登记本地数据集路径、上传浏览器选择的整个数据集文件夹，并统一处理与管理
 - **特征工程管线**：对图像/视频执行真实特征提取并输出结果文件
 - **RESTful API**：完整的API接口
 - **数据库集成**：SQLAlchemy ORM与Alembic迁移支持
 - **结构化日志**：高级日志记录功能
 - **后台处理**：使用FastAPI BackgroundTasks执行异步任务
-- **GPU加速**：自动检测和使用GPU进行推理和训练
+- **训练设备选择**：支持按任务选择 `MPS`、`CUDA`、`CPU` 或 `auto`
 - **健康检查**：系统状态监控端点
 
 ## 📁 项目结构
@@ -71,7 +71,7 @@ deepfake-srtp/
 
 - Python 3.8+
 - pip 或 conda
-- 可选：CUDA支持的GPU（用于加速）
+- 可选：Apple Silicon（MPS）或 CUDA GPU（用于加速）
 
 ### 1. 克隆仓库
 ```bash
@@ -100,6 +100,8 @@ conda activate deepfake-env
 pip install -r requirements.txt
 ```
 
+如果你在 Apple Silicon Mac 上训练，建议使用 `arm64` 的 Python 和虚拟环境，这样 PyTorch 才能启用 `MPS`。
+
 ### 4. 环境配置
 ```bash
 # 复制环境变量模板
@@ -123,6 +125,13 @@ python init_db.py
 # 或使用Alembic进行迁移
 alembic upgrade head
 ```
+
+### 6. Apple Silicon / MPS 检查
+```bash
+python -c "import platform, torch; print(platform.machine(), torch.backends.mps.is_built(), torch.backends.mps.is_available())"
+```
+
+如果输出类似 `arm64 True True`，说明当前环境可以使用 `MPS` 训练。
 
 ## 🚀 运行应用
 
@@ -184,6 +193,7 @@ docker run -p 8000:8000 -v $(pwd)/data:/app/data deepfake-detection
 | `MAX_CONCURRENT_TRAINING_JOBS` | 最大并发训练任务数 | `2` | 根据GPU内存调整 |
 | `GPU_ENABLED` | 启用GPU加速 | `True` | 根据硬件配置 |
 | `CUDA_VISIBLE_DEVICES` | 可见GPU设备 | `0` | 多GPU环境配置 |
+| `TRAINING_DEVICE` | 训练设备默认值 | `auto` | `mps` / `cuda` / `cpu` / `auto` |
 | `LOG_LEVEL` | 日志级别 | `INFO` | 生产环境建议`WARNING` |
 | `BACKEND_CORS_ORIGINS` | 允许的跨域源 | `http://localhost:3000,http://localhost:8000` | 根据前端地址配置 |
 
@@ -263,6 +273,10 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 
 训练任务会返回准确率/损失等指标以及最佳模型文件路径 `model_path`，是否保留模型文件由人工判断。
 
+调用 `POST /jobs/{id}/model/retain` 后，后端会同步创建或更新模型注册记录；保留后的模型会出现在检测模型列表中，检测时可通过 `model_id` 加载真实 checkpoint 权重。
+
+创建训练任务时支持传入 `parameters.training_device`，可按任务选择 `mps`、`cuda`、`cpu` 或 `auto`。
+
 ### 模型管理 (`/api/v1/models`)
 - `GET /` - 获取模型列表
 - `POST /` - 创建新模型
@@ -272,7 +286,9 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 
 ### 数据集管理 (`/api/v1/datasets`)
 - `GET /` - 获取数据集列表
+- `POST /` - 通过本地/服务器路径登记数据集
 - `POST /upload` - 上传数据集
+- `POST /upload-folder` - 从浏览器上传整个数据集文件夹
 - `GET /{id}` - 获取特定数据集
 - `POST /{id}/process` - 处理数据集
 
@@ -282,6 +298,43 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 - 标签推断基于文件路径关键字：fake -> `0`，real -> `1`；若路径同时命中或未命中关键字，则标签记为 `null`。
 - fake 关键字包含 `fake`、`deepfake`、`manipulated`、`forged`、`tampered`、`class1`；real 关键字包含 `real`、`authentic`、`original`、`genuine`、`pristine`、`class0`。
 - 训练/验证/测试样本数由 `validation_split` 与 `test_split` 计算（默认 `0.2` 与 `0.1`），并做边界保护，尽量保证至少保留 1 条训练样本。
+
+推荐的数据集目录结构：
+
+```text
+dataset/
+  fake/
+  real/
+```
+
+或：
+
+```text
+dataset/
+  train/
+    fake/
+    real/
+  val/
+    fake/
+    real/
+```
+
+登记已存在的本地/服务器数据集路径示例：
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/datasets/" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "myset",
+    "description": "local fake/real dataset",
+    "path": "/data/datasets/myset",
+    "image_size": 224,
+    "frame_extraction_interval": 4,
+    "max_frames_per_video": 20
+  }'
+```
+
+如果数据集体量很大，更推荐先用 `rsync`、`scp`、共享挂载盘或 NAS 将数据同步到后端可访问目录，再调用 `POST /api/v1/datasets/` 登记路径；不要优先走浏览器整文件夹上传，以避免重复传输、超时和额外磁盘占用。
 
 ## 🧪 测试
 

@@ -9,6 +9,7 @@ from typing import List, Optional
 from app.core.database import get_db
 from app.core.logging import logger
 from app.core.auth import get_current_user, require_admin
+from app.models.database_models import ModelRegistry
 from app.schemas.training import (
     TrainingJobCreate,
     TrainingJobResponse,
@@ -349,10 +350,20 @@ async def retain_training_job_model(
         if model_path is None:
             raise HTTPException(status_code=404, detail="Training job not found")
 
+        model_record = (
+            db.query(ModelRegistry)
+            .filter(
+                ModelRegistry.training_job_id == job_id, ModelRegistry.del_flag == 0
+            )
+            .first()
+        )
+
         return {
             "message": "Model file retention confirmed",
             "job_id": job_id,
             "model_path": model_path,
+            "model_id": model_record.id if model_record else None,
+            "model_name": model_record.name if model_record else None,
             "decided_by": current_user,
         }
 

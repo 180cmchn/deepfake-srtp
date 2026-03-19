@@ -3,29 +3,37 @@ Dataset management API routes for deepfake detection platform
 """
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import Form
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
+import shutil
 import uuid
 from pathlib import Path
 
 from app.core.database import get_db
 from app.core.logging import logger
+from app.core.config import settings
 from app.schemas.datasets import (
-    DatasetCreate, DatasetResponse, DatasetList, DatasetUpdate,
-    DatasetProcessingConfig, DatasetFileAddRequest, DatasetFileAddResponse
+    DatasetCreate,
+    DatasetResponse,
+    DatasetList,
+    DatasetUpdate,
+    DatasetProcessingConfig,
+    DatasetFileAddRequest,
+    DatasetFileAddResponse,
 )
 
 router = APIRouter()
 
 # Supported file types
-ALLOWED_IMAGE_TYPES = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
-ALLOWED_VIDEO_TYPES = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm'}
+ALLOWED_IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+ALLOWED_VIDEO_TYPES = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
 ALLOWED_TYPES = ALLOWED_IMAGE_TYPES | ALLOWED_VIDEO_TYPES
 
 # File size limits (in bytes)
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
-MAX_IMAGE_SIZE = 50 * 1024 * 1024   # 50MB for images
+MAX_IMAGE_SIZE = 50 * 1024 * 1024  # 50MB for images
 MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500MB for videos
 
 
@@ -33,45 +41,79 @@ def validate_file(file: UploadFile) -> tuple[str, str]:
     """Validate file type and size"""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
-    
+
     # Check file extension
     file_extension = Path(file.filename).suffix.lower()
     if file_extension not in ALLOWED_TYPES:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Unsupported file type: {file_extension}. "
-                   f"Allowed types: {', '.join(sorted(ALLOWED_TYPES))}"
+            f"Allowed types: {', '.join(sorted(ALLOWED_TYPES))}",
         )
-    
+
     # Determine file type
     file_type = "image" if file_extension in ALLOWED_IMAGE_TYPES else "video"
-    
+
     # Check file size
-    if hasattr(file, 'size') and file.size:
+    if hasattr(file, "size") and file.size:
         if file_type == "image" and file.size > MAX_IMAGE_SIZE:
             raise HTTPException(
                 status_code=400,
-                detail=f"Image file too large. Maximum size: {MAX_IMAGE_SIZE // (1024*1024)}MB"
+                detail=f"Image file too large. Maximum size: {MAX_IMAGE_SIZE // (1024 * 1024)}MB",
             )
         elif file_type == "video" and file.size > MAX_VIDEO_SIZE:
             raise HTTPException(
                 status_code=400,
-                detail=f"Video file too large. Maximum size: {MAX_VIDEO_SIZE // (1024*1024)}MB"
+                detail=f"Video file too large. Maximum size: {MAX_VIDEO_SIZE // (1024 * 1024)}MB",
             )
         elif file.size > MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=400,
-                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB"
+                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)}MB",
             )
-    
+
     return file_type, file_extension
 
 
+def sanitize_relative_path(relative_path: str) -> Path:
+    """Validate and sanitize a browser-provided relative file path."""
+    normalized = (relative_path or "").replace("\\", "/").strip("/")
+    candidate = Path(normalized)
+
+    if not normalized or candidate.is_absolute():
+        raise HTTPException(status_code=400, detail="Invalid relative path")
+    if any(part in {"", ".", ".."} for part in candidate.parts):
+        raise HTTPException(
+            status_code=400, detail="Relative path contains invalid segments"
+        )
+
+    return candidate
+
+
+def strip_common_root(relative_paths: List[Path]) -> List[Path]:
+    """Strip the top-level folder selected in the browser when possible."""
+    if not relative_paths:
+        return relative_paths
+
+    first_parts = [path.parts[0] for path in relative_paths if len(path.parts) > 1]
+    if not first_parts:
+        return relative_paths
+
+    common_root = first_parts[0]
+    if not all(path.parts and path.parts[0] == common_root for path in relative_paths):
+        return relative_paths
+
+    stripped_paths: List[Path] = []
+    for path in relative_paths:
+        if len(path.parts) <= 1:
+            stripped_paths.append(Path(path.name))
+        else:
+            stripped_paths.append(Path(*path.parts[1:]))
+    return stripped_paths
+
+
 @router.post("/", response_model=DatasetResponse)
-async def create_dataset(
-    dataset: DatasetCreate,
-    db: Session = Depends(get_db)
-):
+async def create_dataset(dataset: DatasetCreate, db: Session = Depends(get_db)):
     """Create a new dataset registry entry"""
     try:
         from app.services.dataset_service import DatasetService
@@ -89,7 +131,7 @@ async def get_datasets(
     skip: int = 0,
     limit: int = 100,
     is_processed: Optional[bool] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Get datasets list"""
     try:
@@ -101,6 +143,108 @@ async def get_datasets(
     except Exception as e:
         logger.error("Failed to get datasets", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to get datasets")
+
+
+@router.post("/upload-folder", response_model=DatasetResponse)
+async def upload_dataset_folder(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    relative_paths: List[str] = Form(...),
+    name: str = Form(...),
+    description: Optional[str] = Form(None),
+    config: DatasetProcessingConfig = Depends(),
+    db: Session = Depends(get_db),
+):
+    """Upload a full dataset folder selected in the browser."""
+    dataset_root = None
+    safe_name = (name or "").strip()
+    try:
+        from app.services.dataset_service import DatasetService
+
+        if not files:
+            raise HTTPException(status_code=400, detail="No dataset files provided")
+        if not safe_name:
+            raise HTTPException(status_code=400, detail="Dataset name is required")
+        if len(files) != len(relative_paths):
+            raise HTTPException(
+                status_code=400,
+                detail="The number of files does not match the number of relative paths",
+            )
+
+        sanitized_paths = strip_common_root(
+            [sanitize_relative_path(path) for path in relative_paths]
+        )
+
+        dataset_root = (
+            Path(settings.DATA_DIR)
+            / "uploaded_datasets"
+            / f"dataset_{uuid.uuid4().hex}"
+        )
+        dataset_root.mkdir(parents=True, exist_ok=True)
+
+        total_files = 0
+        for upload_file, relative_path in zip(files, sanitized_paths):
+            validate_file(upload_file)
+
+            target_path = (dataset_root / relative_path).resolve()
+            if dataset_root.resolve() not in [target_path, *target_path.parents]:
+                raise HTTPException(
+                    status_code=400, detail="Invalid upload target path"
+                )
+
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            content = await upload_file.read()
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)}MB",
+                )
+
+            with open(target_path, "wb") as buffer:
+                buffer.write(content)
+            total_files += 1
+
+        dataset_data = DatasetCreate(
+            name=safe_name,
+            description=description or "Browser-uploaded dataset folder",
+            path=str(dataset_root),
+            image_size=config.image_size,
+            frame_extraction_interval=config.frame_extraction_interval,
+            max_frames_per_video=config.max_frames_per_video,
+        )
+
+        dataset_service = DatasetService(db)
+        result = await dataset_service.create_dataset(dataset_data)
+
+        background_tasks.add_task(
+            dataset_service.process_dataset,
+            result.id,
+            config.dict(),
+        )
+
+        logger.info(
+            "Dataset folder uploaded and processing started",
+            dataset_id=result.id,
+            dataset_name=result.name,
+            dataset_root=str(dataset_root),
+            files_count=total_files,
+        )
+        return result
+
+    except HTTPException:
+        if dataset_root and dataset_root.exists():
+            shutil.rmtree(dataset_root, ignore_errors=True)
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to upload dataset folder", error=str(e), dataset_name=safe_name
+        )
+        if dataset_root and dataset_root.exists():
+            shutil.rmtree(dataset_root, ignore_errors=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload dataset folder: {str(e)}",
+        )
 
 
 @router.get("/{dataset_id}", response_model=DatasetResponse)
@@ -123,9 +267,7 @@ async def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
 
 @router.put("/{dataset_id}", response_model=DatasetResponse)
 async def update_dataset(
-    dataset_id: int,
-    dataset_update: DatasetUpdate,
-    db: Session = Depends(get_db)
+    dataset_id: int, dataset_update: DatasetUpdate, db: Session = Depends(get_db)
 ):
     """Update dataset"""
     try:
@@ -168,7 +310,7 @@ async def upload_dataset(
     name: str = None,
     description: str = None,
     config: DatasetProcessingConfig = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Upload and process dataset"""
     file_path = None
@@ -177,35 +319,37 @@ async def upload_dataset(
 
         # Validate file type and size
         file_type, file_extension = validate_file(file)
-        
+
         # Generate unique filename with type prefix
         type_prefix = "img" if file_type == "image" else "vid"
         unique_filename = f"{type_prefix}_{uuid.uuid4()}{file_extension}"
         file_path = os.path.join("data", unique_filename)
-        
+
         # Ensure data directory exists
         os.makedirs("data", exist_ok=True)
-        
+
         # Read file content with size check
         content = await file.read()
-        
+
         # Additional size check for files without size attribute
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=400,
-                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB"
+                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)}MB",
             )
-        
+
         # Save uploaded file
         with open(file_path, "wb") as buffer:
             buffer.write(content)
-        
-        logger.info("File uploaded successfully", 
-                   filename=file.filename, 
-                   file_type=file_type, 
-                   size=len(content),
-                   saved_path=file_path)
-        
+
+        logger.info(
+            "File uploaded successfully",
+            filename=file.filename,
+            file_type=file_type,
+            size=len(content),
+            saved_path=file_path,
+        )
+
         # Create dataset entry
         dataset_data = DatasetCreate(
             name=name or file.filename,
@@ -213,25 +357,25 @@ async def upload_dataset(
             path=file_path,
             image_size=config.image_size,
             frame_extraction_interval=config.frame_extraction_interval,
-            max_frames_per_video=config.max_frames_per_video
+            max_frames_per_video=config.max_frames_per_video,
         )
-        
+
         dataset_service = DatasetService(db)
         result = await dataset_service.create_dataset(dataset_data)
-        
+
         # Start processing in background
         background_tasks.add_task(
-            dataset_service.process_dataset,
-            result.id,
-            config.dict()
+            dataset_service.process_dataset, result.id, config.dict()
         )
-        
-        logger.info("Dataset created and processing started", 
-                   dataset_id=result.id, 
-                   dataset_name=result.name)
-        
+
+        logger.info(
+            "Dataset created and processing started",
+            dataset_id=result.id,
+            dataset_name=result.name,
+        )
+
         return result
-        
+
     except HTTPException:
         # Clean up uploaded file if it exists
         if file_path and os.path.exists(file_path):
@@ -239,28 +383,33 @@ async def upload_dataset(
                 os.remove(file_path)
                 logger.info("Cleaned up uploaded file", file_path=file_path)
             except Exception as cleanup_error:
-                logger.error("Failed to clean up file", 
-                           file_path=file_path, 
-                           error=str(cleanup_error))
+                logger.error(
+                    "Failed to clean up file",
+                    file_path=file_path,
+                    error=str(cleanup_error),
+                )
         raise
     except Exception as e:
-        logger.error("Failed to upload dataset", 
-                   error=str(e), 
-                   filename=file.filename if file else "Unknown")
-        
+        logger.error(
+            "Failed to upload dataset",
+            error=str(e),
+            filename=file.filename if file else "Unknown",
+        )
+
         # Clean up uploaded file if it exists
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
                 logger.info("Cleaned up uploaded file after error", file_path=file_path)
             except Exception as cleanup_error:
-                logger.error("Failed to clean up file after error", 
-                           file_path=file_path, 
-                           error=str(cleanup_error))
-        
+                logger.error(
+                    "Failed to clean up file after error",
+                    file_path=file_path,
+                    error=str(cleanup_error),
+                )
+
         raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to upload dataset: {str(e)}"
+            status_code=500, detail=f"Failed to upload dataset: {str(e)}"
         )
 
 
@@ -269,7 +418,7 @@ async def process_dataset(
     dataset_id: int,
     background_tasks: BackgroundTasks,
     config: DatasetProcessingConfig,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Process dataset"""
     try:
@@ -277,19 +426,17 @@ async def process_dataset(
 
         dataset_service = DatasetService(db)
         dataset = await dataset_service.get_dataset(dataset_id)
-        
+
         if not dataset:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        
+
         # Start processing in background
         background_tasks.add_task(
-            dataset_service.process_dataset,
-            dataset_id,
-            config.dict()
+            dataset_service.process_dataset, dataset_id, config.dict()
         )
-        
+
         return {"message": "Dataset processing started"}
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -305,16 +452,18 @@ async def get_dataset_processing_status(dataset_id: int, db: Session = Depends(g
 
         dataset_service = DatasetService(db)
         status = await dataset_service.get_processing_status(dataset_id)
-        
+
         if not status:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        
+
         return status
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Failed to get dataset status", error=str(e), dataset_id=dataset_id)
+        logger.error(
+            "Failed to get dataset status", error=str(e), dataset_id=dataset_id
+        )
         raise HTTPException(status_code=500, detail="Failed to get dataset status")
 
 
@@ -326,74 +475,76 @@ async def add_files_to_dataset(
     reprocess: bool = True,
     description: str = None,
     config: DatasetProcessingConfig = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Add files to existing dataset"""
     uploaded_files = []
     file_paths = []
-    
+
     try:
         from app.services.dataset_service import DatasetService
 
         # Validate dataset exists
         dataset_service = DatasetService(db)
         dataset = await dataset_service.get_dataset(dataset_id)
-        
+
         if not dataset:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        
+
         # Process each file
         for file in files:
             # Validate file
             file_type, file_extension = validate_file(file)
-            
+
             # Generate unique filename with dataset prefix
             type_prefix = "img" if file_type == "image" else "vid"
-            unique_filename = f"dataset_{dataset_id}_{type_prefix}_{uuid.uuid4()}{file_extension}"
+            unique_filename = (
+                f"dataset_{dataset_id}_{type_prefix}_{uuid.uuid4()}{file_extension}"
+            )
             file_path = os.path.join("data", unique_filename)
-            
+
             # Ensure data directory exists
             os.makedirs("data", exist_ok=True)
-            
+
             # Read file content
             content = await file.read()
-            
+
             # Save uploaded file
             with open(file_path, "wb") as buffer:
                 buffer.write(content)
-            
+
             uploaded_files.append((file, file_path, file_type, len(content)))
             file_paths.append(file_path)
-            
-            logger.info("File uploaded for dataset", 
-                       dataset_id=dataset_id,
-                       filename=file.filename, 
-                       file_type=file_type, 
-                       size=len(content),
-                       saved_path=file_path)
-        
+
+            logger.info(
+                "File uploaded for dataset",
+                dataset_id=dataset_id,
+                filename=file.filename,
+                file_type=file_type,
+                size=len(content),
+                saved_path=file_path,
+            )
+
         # Create request object
-        request = DatasetFileAddRequest(
-            reprocess=reprocess,
-            description=description
-        )
-        
+        request = DatasetFileAddRequest(reprocess=reprocess, description=description)
+
         # Add files to dataset
-        result = await dataset_service.add_files_to_dataset(dataset_id, uploaded_files, request)
-        
+        result = await dataset_service.add_files_to_dataset(
+            dataset_id, uploaded_files, request
+        )
+
         # Start processing in background if requested
         if reprocess:
             background_tasks.add_task(
-                dataset_service.process_dataset,
-                dataset_id,
-                config.dict()
+                dataset_service.process_dataset, dataset_id, config.dict()
             )
-            
-            logger.info("Dataset processing started after adding files", 
-                       dataset_id=dataset_id)
-        
+
+            logger.info(
+                "Dataset processing started after adding files", dataset_id=dataset_id
+            )
+
         return result
-        
+
     except HTTPException:
         # Clean up uploaded files on error
         for file_path in file_paths:
@@ -402,29 +553,34 @@ async def add_files_to_dataset(
                     os.remove(file_path)
                     logger.info("Cleaned up uploaded file", file_path=file_path)
                 except Exception as cleanup_error:
-                    logger.error("Failed to clean up file", 
-                               file_path=file_path, 
-                               error=str(cleanup_error))
+                    logger.error(
+                        "Failed to clean up file",
+                        file_path=file_path,
+                        error=str(cleanup_error),
+                    )
         raise
     except Exception as e:
-        logger.error("Failed to add files to dataset", 
-                   error=str(e), 
-                   dataset_id=dataset_id)
-        
+        logger.error(
+            "Failed to add files to dataset", error=str(e), dataset_id=dataset_id
+        )
+
         # Clean up uploaded files on error
         for file_path in file_paths:
             if os.path.exists(file_path):
                 try:
                     os.remove(file_path)
-                    logger.info("Cleaned up uploaded file after error", file_path=file_path)
+                    logger.info(
+                        "Cleaned up uploaded file after error", file_path=file_path
+                    )
                 except Exception as cleanup_error:
-                    logger.error("Failed to clean up file after error", 
-                               file_path=file_path, 
-                               error=str(cleanup_error))
-        
+                    logger.error(
+                        "Failed to clean up file after error",
+                        file_path=file_path,
+                        error=str(cleanup_error),
+                    )
+
         raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to add files to dataset: {str(e)}"
+            status_code=500, detail=f"Failed to add files to dataset: {str(e)}"
         )
 
 
@@ -435,22 +591,22 @@ async def get_dataset_files(dataset_id: int, db: Session = Depends(get_db)):
         from app.services.dataset_service import DatasetService
 
         dataset_service = DatasetService(db)
-        
+
         # Check if dataset exists
         dataset = await dataset_service.get_dataset(dataset_id)
         if not dataset:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        
+
         # Get files
         files = await dataset_service.get_dataset_files(dataset_id)
-        
+
         return {
             "dataset_id": dataset_id,
             "dataset_name": dataset.name,
             "files": files,
-            "total_files": len(files)
+            "total_files": len(files),
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:

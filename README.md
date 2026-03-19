@@ -7,8 +7,8 @@ A comprehensive deepfake detection platform built with FastAPI, featuring multip
 - **Multiple Model Support**: VGG, LRCN, Swin Transformer, Vision Transformer, ResNet
 - **Real-time Detection**: Single file and batch processing capabilities
 - **Video Analysis**: Frame-by-frame video analysis with aggregation
-- **Model Training**: Automated training pipeline with progress tracking and human decision on whether to keep trained checkpoints
-- **Dataset Management**: Upload, process, and manage datasets
+- **Model Training**: Automated training pipeline with progress tracking, manual keep/delete decisions, and retained checkpoints becoming selectable detection models
+- **Dataset Management**: Register local dataset paths, upload browser-selected dataset folders, process, and manage datasets
 - **Feature Engineering Pipeline**: Real image/video feature extraction with artifact output
 - **RESTful API**: Complete API with comprehensive endpoints
 - **Database Integration**: SQLAlchemy ORM with migration support
@@ -60,13 +60,13 @@ deepfake-srtp/
 - **Python**: 3.8 or higher
 - **RAM**: 8GB (16GB recommended for training)
 - **Storage**: 10GB free space (more for datasets and models)
-- **GPU**: Optional, but recommended for training (NVIDIA CUDA-compatible)
+- **Accelerator**: Optional, but recommended for training (Apple Silicon MPS or NVIDIA CUDA)
 
 ### Recommended Requirements
 - **Python**: 3.9 or 3.10
 - **RAM**: 16GB or more
 - **Storage**: 50GB+ SSD
-- **GPU**: NVIDIA GPU with 8GB+ VRAM (RTX 3060 or better)
+- **Accelerator**: Apple Silicon (M-series) or NVIDIA GPU with 8GB+ VRAM
 
 ### Supported Operating Systems
 - Windows 10/11
@@ -96,6 +96,8 @@ deepfake-srtp/
    ```bash
    pip install -r requirements.txt
    ```
+
+   On Apple Silicon, use an `arm64` Python/virtualenv so PyTorch can use `MPS`.
 
 4. **Set up environment variables**
    ```bash
@@ -144,10 +146,16 @@ deepfake-srtp/
    - Close other applications
 
 4. **Import Errors**
+    ```bash
+    # Reinstall dependencies
+    pip install -r requirements.txt --force-reinstall
+    ```
+
+5. **Apple Silicon / MPS**
    ```bash
-   # Reinstall dependencies
-   pip install -r requirements.txt --force-reinstall
+   python -c "import platform, torch; print(platform.machine(), torch.backends.mps.is_built(), torch.backends.mps.is_available())"
    ```
+   If the output is `arm64 True True`, your environment can train with `MPS`.
 
 ### Performance Optimization
 
@@ -217,7 +225,38 @@ The platform supports multiple database backends:
 
 ### GPU Support
 
-For GPU acceleration, ensure CUDA is available and set `GPU_ENABLED=True` in your `.env` file.
+Training supports explicit device selection with `training_device`: `mps`, `cuda`, `cpu`, or `auto`.
+
+- On Apple Silicon, prefer `mps`
+- On NVIDIA machines, use `cuda`
+- `auto` selects the only available accelerator, otherwise falls back to `cpu`
+
+### Dataset Import Options
+
+- `POST /api/v1/datasets/` registers an existing local or mounted dataset directory by path
+- `POST /api/v1/datasets/upload-folder` uploads a browser-selected folder while preserving relative `fake/` and `real/` structure on the server
+- `POST /api/v1/datasets/upload` remains available for single-file dataset ingestion/testing
+- For large datasets, prefer registering a server-accessible path instead of browser upload to avoid duplicate transfer, timeouts, and extra storage usage
+
+Recommended training directory layouts:
+
+```text
+dataset/
+  fake/
+  real/
+```
+
+or:
+
+```text
+dataset/
+  train/
+    fake/
+    real/
+  val/
+    fake/
+    real/
+```
 
 ## 🤖 Supported Models
 
@@ -251,6 +290,10 @@ For GPU acceleration, ensure CUDA is available and set `GPU_ENABLED=True` in you
 
 Training jobs return metrics (accuracy/loss) and `model_path` for the best checkpoint. Whether to keep or discard the checkpoint is a manual decision.
 
+When `POST /api/v1/training/jobs/{id}/model/retain` is called, the backend now creates or updates a real model registry entry. The retained model then appears in detection model lists and detection requests can load the retained checkpoint weights by `model_id`.
+
+`POST /api/v1/training/jobs` accepts `parameters.training_device` so the client can choose `mps`, `cuda`, `cpu`, or `auto` per job.
+
 ### Models
 - `GET /api/v1/models/` - List models
 - `POST /api/v1/models/` - Create model
@@ -260,7 +303,9 @@ Training jobs return metrics (accuracy/loss) and `model_path` for the best check
 
 ### Datasets
 - `GET /api/v1/datasets/` - List datasets
+- `POST /api/v1/datasets/` - Register dataset by local/server path
 - `POST /api/v1/datasets/upload` - Upload dataset
+- `POST /api/v1/datasets/upload-folder` - Upload a whole dataset folder from the browser
 - `GET /api/v1/datasets/{id}` - Get dataset
 - `POST /api/v1/datasets/{id}/process` - Process dataset
 
@@ -270,6 +315,23 @@ Label inference and split rules used by processing pipeline:
 - Label inference is path-keyword based: fake -> `0`, real -> `1`; unknown/mixed paths are kept with `null` label.
 - Supported image keywords include `fake`, `deepfake`, `manipulated`, `forged`, `tampered`, `class1`; real keywords include `real`, `authentic`, `original`, `genuine`, `pristine`, `class0`.
 - Train/validation/test counts are computed from `validation_split` and `test_split` (defaults: `0.2` and `0.1`) with bounds checking to always keep at least one training sample when possible.
+
+Example: register an existing local dataset path
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/datasets/" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "myset",
+    "description": "local fake/real dataset",
+    "path": "/data/datasets/myset",
+    "image_size": 224,
+    "frame_extraction_interval": 4,
+    "max_frames_per_video": 20
+  }'
+```
+
+For very large datasets, copy/sync the folder to the server first (`rsync`, `scp`, mounted volume, NAS, etc.), then register the server-side path with the endpoint above.
 
 ## 🧪 Testing
 
