@@ -120,6 +120,9 @@ class TrainingJobResponse(TrainingJobBase):
     id: int
     status: JobStatus
     progress: float
+    current_epoch: Optional[int] = None
+    total_epochs: Optional[int] = None
+    progress_message: Optional[str] = None
     parameters: TrainingParameters
     results: Optional[TrainingResults]
     created_at: datetime

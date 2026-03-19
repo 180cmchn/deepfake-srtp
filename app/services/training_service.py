@@ -3,12 +3,14 @@ Training service for deepfake detection platform
 """
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path
 import re
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Callable
 
+import cv2
 import torch
 from PIL import Image, UnidentifiedImageError
 from torch import nn
@@ -54,6 +56,16 @@ REAL_LABEL_KEYWORDS = {
     "0",
 }
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
+
+
+@dataclass(frozen=True)
+class MediaClassificationSample:
+    """A single image sample or a sampled frame from a raw video."""
+
+    path: str
+    label: int
+    frame_index: Optional[int] = None
 
 
 class TrainingCancelledError(Exception):
@@ -63,7 +75,7 @@ class TrainingCancelledError(Exception):
 class ImageClassificationDataset(Dataset):
     """Simple image classification dataset for real/fake labels."""
 
-    def __init__(self, samples: List[Tuple[str, int]], transform=None):
+    def __init__(self, samples: List[MediaClassificationSample], transform=None):
         self.samples = samples
         self.transform = transform
 
@@ -71,12 +83,85 @@ class ImageClassificationDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        image_path, label = self.samples[idx]
-        with Image.open(image_path) as img:
-            image = img.convert("RGB")
+        sample = self.samples[idx]
+        label = sample.label
+
+        if sample.frame_index is None:
+            with Image.open(sample.path) as img:
+                image = img.convert("RGB")
+        else:
+            image = self._load_video_frame(sample.path, sample.frame_index)
+
         if self.transform:
             image = self.transform(image)
         return image, label
+
+    @staticmethod
+    def _load_video_frame(video_path: str, frame_index: int) -> Image.Image:
+        """Load a single RGB frame from a raw video file."""
+        frame = ImageClassificationDataset._read_frame_direct(video_path, frame_index)
+
+        if frame is None and frame_index > 0:
+            fallback_candidates = [
+                max(0, frame_index - 1),
+                max(0, frame_index - 4),
+                max(0, frame_index - 12),
+                0,
+            ]
+            for fallback_index in fallback_candidates:
+                frame = ImageClassificationDataset._read_frame_direct(
+                    video_path, fallback_index
+                )
+                if frame is not None:
+                    break
+
+        if frame is None and frame_index > 0:
+            frame = ImageClassificationDataset._read_frame_sequential(
+                video_path, frame_index
+            )
+
+        if frame is None:
+            raise ValueError(
+                f"Cannot read frame {frame_index} from video file: {video_path}"
+            )
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(frame_rgb)
+
+    @staticmethod
+    def _read_frame_direct(video_path: str, frame_index: int):
+        """Attempt to read a specific frame by random access."""
+        capture = cv2.VideoCapture(video_path)
+        if not capture.isOpened():
+            return None
+
+        try:
+            if frame_index > 0:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            success, frame = capture.read()
+            return frame if success and frame is not None else None
+        finally:
+            capture.release()
+
+    @staticmethod
+    def _read_frame_sequential(video_path: str, frame_index: int):
+        """Sequential fallback for codecs where random seek is unreliable."""
+        capture = cv2.VideoCapture(video_path)
+        if not capture.isOpened():
+            return None
+
+        current_index = 0
+        last_valid_frame = None
+        try:
+            while current_index <= frame_index:
+                success, frame = capture.read()
+                if not success or frame is None:
+                    break
+                last_valid_frame = frame
+                current_index += 1
+            return last_valid_frame
+        finally:
+            capture.release()
 
 
 class SequenceClassificationDataset(Dataset):
@@ -185,6 +270,20 @@ class TrainingService:
             kwargs["persistent_workers"] = settings.TRAINING_PERSISTENT_WORKERS
             kwargs["prefetch_factor"] = settings.TRAINING_PREFETCH_FACTOR
         return kwargs
+
+    def _uses_video_backed_samples(
+        self, samples: List[MediaClassificationSample]
+    ) -> bool:
+        """Return True when image-model training pulls frames directly from videos."""
+        return any(sample.frame_index is not None for sample in samples)
+
+    def _tune_loader_kwargs_for_media_samples(
+        self, dataset_size: int, samples: List[MediaClassificationSample]
+    ) -> Dict[str, Any]:
+        """Avoid multiprocessing instability when OpenCV reads raw videos."""
+        if self._uses_video_backed_samples(samples):
+            return {"num_workers": 0, "pin_memory": False}
+        return self._dataloader_kwargs(dataset_size)
 
     async def create_job(
         self,
@@ -847,7 +946,7 @@ class TrainingService:
                     "current_epoch": 0,
                     "current_loss": None,
                     "current_accuracy": None,
-                    "message": f"Starting {mode} training",
+                    "message": f"开始{'时序' if mode == 'sequence' else '图像'}训练",
                 },
             )
 
@@ -872,7 +971,7 @@ class TrainingService:
                 job_id,
                 {
                     "status": JobStatus.CANCELLED.value,
-                    "message": "Training cancelled",
+                    "message": "训练已取消",
                 },
             )
 
@@ -890,7 +989,7 @@ class TrainingService:
                 job_id,
                 {
                     "status": JobStatus.FAILED.value,
-                    "message": f"Training failed: {str(e)}",
+                    "message": f"训练失败：{str(e)}",
                 },
             )
 
@@ -957,8 +1056,40 @@ class TrainingService:
                     f"Training job {job_id} cancelled at epoch {epoch}"
                 )
 
+            total_batches = max(1, len(train_loader))
+
+            def image_progress_callback(
+                batch_index: int,
+                batch_total: int,
+                _running_loss: float,
+                _running_accuracy: float,
+            ):
+                incremental_progress = (
+                    ((epoch - 1) + (batch_index / max(batch_total, 1))) / epochs
+                ) * 100.0
+                self._update_running_progress(
+                    job_id,
+                    incremental_progress,
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    message=f"Epoch {epoch}/{epochs} 训练中（批次 {batch_index}/{batch_total}）",
+                )
+
             train_loss, train_accuracy = self._run_train_epoch(
-                model, train_loader, criterion, optimizer, device
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+                progress_callback=image_progress_callback,
+            )
+            self._set_active_job_metadata(
+                job_id,
+                {
+                    "message": f"Epoch {epoch}/{epochs} 验证中",
+                    "current_epoch": epoch,
+                    "total_epochs": epochs,
+                },
             )
             val_loss, val_accuracy = self._run_eval_epoch(
                 model, val_loader, criterion, device
@@ -990,6 +1121,14 @@ class TrainingService:
             if val_accuracy > best_val_accuracy:
                 best_val_accuracy = val_accuracy
                 best_val_loss = val_loss
+                self._set_active_job_metadata(
+                    job_id,
+                    {
+                        "message": f"Epoch {epoch}/{epochs} 正在保存最佳模型",
+                        "current_epoch": epoch,
+                        "total_epochs": epochs,
+                    },
+                )
                 torch.save(
                     {
                         "job_id": job_id,
@@ -1049,7 +1188,7 @@ class TrainingService:
             {
                 "total_epochs": epochs,
                 "mode": "sequence",
-                "message": f"Preparing clips (sequence_length={sequence_length}, frame_stride={frame_stride})",
+                "message": f"正在准备视频片段（长度 {sequence_length}，步长 {frame_stride}）",
             },
         )
 
@@ -1103,8 +1242,40 @@ class TrainingService:
                     f"Training job {job_id} cancelled at epoch {epoch}"
                 )
 
+            total_batches = max(1, len(train_loader))
+
+            def sequence_progress_callback(
+                batch_index: int,
+                batch_total: int,
+                _running_loss: float,
+                _running_accuracy: float,
+            ):
+                incremental_progress = (
+                    ((epoch - 1) + (batch_index / max(batch_total, 1))) / epochs
+                ) * 100.0
+                self._update_running_progress(
+                    job_id,
+                    incremental_progress,
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    message=f"Sequence epoch {epoch}/{epochs} 训练中（批次 {batch_index}/{batch_total}）",
+                )
+
             train_loss, train_accuracy = self._run_train_epoch(
-                model, train_loader, criterion, optimizer, device
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+                progress_callback=sequence_progress_callback,
+            )
+            self._set_active_job_metadata(
+                job_id,
+                {
+                    "message": f"Sequence epoch {epoch}/{epochs} 验证中",
+                    "current_epoch": epoch,
+                    "total_epochs": epochs,
+                },
             )
             val_loss, val_accuracy = self._run_eval_epoch(
                 model, val_loader, criterion, device
@@ -1138,6 +1309,14 @@ class TrainingService:
             if val_accuracy > best_val_accuracy:
                 best_val_accuracy = val_accuracy
                 best_val_loss = val_loss
+                self._set_active_job_metadata(
+                    job_id,
+                    {
+                        "message": f"Sequence epoch {epoch}/{epochs} 正在保存最佳模型",
+                        "current_epoch": epoch,
+                        "total_epochs": epochs,
+                    },
+                )
                 torch.save(
                     {
                         "job_id": job_id,
@@ -1198,12 +1377,14 @@ class TrainingService:
             job_id,
             {
                 "status": JobStatus.COMPLETED.value,
+                "progress": 100.0,
                 "current_epoch": None,
+                "total_epochs": None,
                 "current_loss": best_val_loss,
                 "current_accuracy": best_val_accuracy
                 if best_val_accuracy >= 0
                 else None,
-                "message": "Training completed",
+                "message": "训练完成，可决定是否保留模型文件",
             },
         )
 
@@ -1240,48 +1421,71 @@ class TrainingService:
 
         split_dirs = self._find_split_dirs(root_path)
         if split_dirs:
-            train_samples = self._collect_labeled_images(split_dirs["train"], root_path)
-            val_samples = self._collect_labeled_images(split_dirs["val"], root_path)
+            train_samples = self._collect_labeled_media_samples(
+                split_dirs["train"], split_dirs["train"]
+            )
+            val_samples = self._collect_labeled_media_samples(
+                split_dirs["val"], split_dirs["val"]
+            )
         else:
-            all_samples = self._collect_labeled_images(root_path, root_path)
-            if len(all_samples) < 2:
+            image_sources = self._collect_labeled_images(root_path, root_path)
+            video_sources = self._collect_labeled_videos(root_path, root_path)
+            total_sources = len(image_sources) + len(video_sources)
+            if total_sources < 2:
                 raise ValueError(
-                    "Dataset must contain at least 2 labeled images for train/validation split"
+                    "Dataset must contain at least 2 labeled image/video sources for train/validation split"
                 )
 
             validation_split = max(0.0, min(0.9, validation_split))
-            val_size = max(1, int(len(all_samples) * validation_split))
-            train_size = len(all_samples) - val_size
+            val_size = max(1, int(total_sources * validation_split))
+            train_size = total_sources - val_size
             if train_size <= 0:
-                train_size = len(all_samples) - 1
+                train_size = total_sources - 1
                 val_size = 1
 
-            shuffled = all_samples[:]
-            generator = torch.Generator().manual_seed(42)
-            indices = torch.randperm(len(shuffled), generator=generator).tolist()
-            shuffled = [shuffled[idx] for idx in indices]
+            source_entries: List[Dict[str, Any]] = [
+                {"kind": "image", "sample": sample} for sample in image_sources
+            ]
+            source_entries.extend(
+                {
+                    "kind": "video",
+                    "path": video_path,
+                    "label": label,
+                }
+                for video_path, label in video_sources
+            )
 
-            train_samples = shuffled[:train_size]
-            val_samples = shuffled[train_size:]
+            generator = torch.Generator().manual_seed(42)
+            indices = torch.randperm(len(source_entries), generator=generator).tolist()
+            shuffled = [source_entries[idx] for idx in indices]
+
+            train_entries = shuffled[:train_size]
+            val_entries = shuffled[train_size:]
+            train_samples = self._expand_media_sources(train_entries)
+            val_samples = self._expand_media_sources(val_entries)
 
         if not train_samples:
-            raise ValueError("No labeled training images found")
+            raise ValueError("No labeled training samples found")
         if not val_samples:
-            raise ValueError("No labeled validation images found")
+            raise ValueError("No labeled validation samples found")
 
         train_dataset = ImageClassificationDataset(
             train_samples, transform=train_transform
         )
         val_dataset = ImageClassificationDataset(val_samples, transform=val_transform)
 
-        loader_kwargs = self._dataloader_kwargs(len(train_dataset))
+        loader_kwargs = self._tune_loader_kwargs_for_media_samples(
+            len(train_dataset), train_samples
+        )
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
             **loader_kwargs,
         )
-        val_loader_kwargs = self._dataloader_kwargs(len(val_dataset))
+        val_loader_kwargs = self._tune_loader_kwargs_for_media_samples(
+            len(val_dataset), val_samples
+        )
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
@@ -1498,11 +1702,39 @@ class TrainingService:
             return {"train": train_dir, "val": val_dir}
         return None
 
+    def _collect_labeled_media_samples(
+        self, root_path: Path, label_root: Path
+    ) -> List[MediaClassificationSample]:
+        """Collect labeled image samples and sampled raw-video frames."""
+        samples = self._collect_labeled_images(root_path, label_root)
+        video_sources = self._collect_labeled_videos(root_path, label_root)
+        samples.extend(self._expand_video_sources(video_sources))
+        return samples
+
+    def _expand_media_sources(
+        self, sources: List[Dict[str, Any]]
+    ) -> List[MediaClassificationSample]:
+        """Expand mixed image/video sources into trainable frame samples."""
+        samples: List[MediaClassificationSample] = []
+        for source in sources:
+            if source.get("kind") == "image":
+                sample = source.get("sample")
+                if sample is not None:
+                    samples.append(sample)
+            elif source.get("kind") == "video":
+                video_path = source.get("path")
+                label = source.get("label")
+                if video_path is not None and label is not None:
+                    samples.extend(
+                        self._expand_video_sources([(str(video_path), int(label))])
+                    )
+        return samples
+
     def _collect_labeled_images(
         self, root_path: Path, label_root: Path
-    ) -> List[Tuple[str, int]]:
+    ) -> List[MediaClassificationSample]:
         """Collect valid image files and infer labels from directory names."""
-        samples: List[Tuple[str, int]] = []
+        samples: List[MediaClassificationSample] = []
 
         for file_path in root_path.rglob("*"):
             if not file_path.is_file():
@@ -1518,9 +1750,94 @@ class TrainingService:
                 logger.warning("Skipping invalid image file", path=str(file_path))
                 continue
 
-            samples.append((str(file_path), label))
+            samples.append(MediaClassificationSample(path=str(file_path), label=label))
 
         return samples
+
+    def _collect_labeled_videos(
+        self, root_path: Path, label_root: Path
+    ) -> List[Tuple[str, int]]:
+        """Collect labeled raw video files for frame sampling."""
+        videos: List[Tuple[str, int]] = []
+
+        for file_path in root_path.rglob("*"):
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+                continue
+
+            label = self._infer_label_from_path(file_path, label_root)
+            if label is None:
+                continue
+
+            if not self._is_valid_video(file_path):
+                logger.warning("Skipping invalid video file", path=str(file_path))
+                continue
+
+            videos.append((str(file_path), label))
+
+        return videos
+
+    def _expand_video_sources(
+        self, video_sources: List[Tuple[str, int]]
+    ) -> List[MediaClassificationSample]:
+        """Expand raw videos into sampled frame-level training items."""
+        samples: List[MediaClassificationSample] = []
+        max_frames = max(1, int(settings.MAX_FRAMES_PER_VIDEO))
+
+        for video_path, label in video_sources:
+            capture = cv2.VideoCapture(video_path)
+            if not capture.isOpened():
+                logger.warning("Skipping unreadable video file", path=video_path)
+                continue
+
+            try:
+                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                if frame_count <= 0:
+                    success, frame = capture.read()
+                    if not success or frame is None:
+                        logger.warning(
+                            "Skipping video without readable frames", path=video_path
+                        )
+                        continue
+                    frame_indices = [0]
+                else:
+                    frame_indices = self._sample_video_frame_indices(
+                        frame_count, max_frames
+                    )
+            finally:
+                capture.release()
+
+            for frame_index in frame_indices:
+                samples.append(
+                    MediaClassificationSample(
+                        path=video_path,
+                        label=label,
+                        frame_index=frame_index,
+                    )
+                )
+
+        return samples
+
+    def _sample_video_frame_indices(
+        self, frame_count: int, max_samples: int
+    ) -> List[int]:
+        """Evenly sample frame indices across a video."""
+        if frame_count <= 1:
+            return [0]
+
+        sample_count = max(1, min(frame_count, max_samples))
+        if sample_count == 1:
+            return [frame_count // 2]
+
+        step = (frame_count - 1) / float(sample_count - 1)
+        indices = sorted(
+            {
+                min(frame_count - 1, max(0, int(round(step * idx))))
+                for idx in range(sample_count)
+            }
+        )
+        return indices or [0]
 
     def _infer_label_from_path(self, file_path: Path, root_path: Path) -> Optional[int]:
         """Infer class label from parent directory keywords."""
@@ -1565,6 +1882,18 @@ class TrainingService:
         except (UnidentifiedImageError, OSError, ValueError):
             return False
 
+    def _is_valid_video(self, path: Path) -> bool:
+        """Return True if OpenCV can open the video and read at least one frame."""
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            return False
+
+        try:
+            success, frame = capture.read()
+            return bool(success and frame is not None)
+        finally:
+            capture.release()
+
     def _run_train_epoch(
         self,
         model: nn.Module,
@@ -1572,6 +1901,7 @@ class TrainingService:
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        progress_callback: Optional[Callable[[int, int, float, float], None]] = None,
     ) -> Tuple[float, float]:
         """Run one training epoch."""
         model.train()
@@ -1579,7 +1909,10 @@ class TrainingService:
         total_correct = 0
         total_samples = 0
 
-        for images, labels in dataloader:
+        total_batches = max(1, len(dataloader))
+        progress_interval = max(1, total_batches // 20)
+
+        for batch_index, (images, labels) in enumerate(dataloader, start=1):
             images = images.to(device)
             labels = labels.to(device)
 
@@ -1594,9 +1927,58 @@ class TrainingService:
             total_correct += (outputs.argmax(dim=1) == labels).sum().item()
             total_samples += current_batch_size
 
+            if progress_callback and (
+                batch_index == 1
+                or batch_index % progress_interval == 0
+                or batch_index == total_batches
+            ):
+                running_loss = total_loss / max(total_samples, 1)
+                running_accuracy = total_correct / max(total_samples, 1)
+                progress_callback(
+                    batch_index,
+                    total_batches,
+                    running_loss,
+                    running_accuracy,
+                )
+
         average_loss = total_loss / max(total_samples, 1)
         accuracy = total_correct / max(total_samples, 1)
         return average_loss, accuracy
+
+    def _update_running_progress(
+        self,
+        job_id: int,
+        progress: float,
+        epoch: Optional[int] = None,
+        total_epochs: Optional[int] = None,
+        message: Optional[str] = None,
+    ):
+        """Persist in-epoch progress updates so UI does not stay at 0%."""
+        clamped_progress = self._clamp_incomplete_progress(progress)
+        with get_db_session() as db:
+            job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+            if not job:
+                return
+
+            if job.status == JobStatus.CANCELLED.value:
+                raise TrainingCancelledError(f"Training job {job_id} cancelled")
+
+            current_progress = float(job.progress or 0.0)
+            if clamped_progress > current_progress:
+                job.progress = clamped_progress
+
+        active_update: Dict[str, Any] = {"progress": clamped_progress}
+        if epoch is not None:
+            active_update["current_epoch"] = epoch
+        if total_epochs is not None:
+            active_update["total_epochs"] = total_epochs
+        if message is not None:
+            active_update["message"] = message
+        self._set_active_job_metadata(job_id, active_update)
+
+    def _clamp_incomplete_progress(self, progress: float) -> float:
+        """Reserve 100% for jobs that are fully finalized."""
+        return min(max(progress, 0.0), 99.0)
 
     def _run_eval_epoch(
         self,
@@ -1639,7 +2021,7 @@ class TrainingService:
         message: Optional[str] = None,
     ):
         """Persist epoch metrics to database and active metadata."""
-        clamped_progress = min(max(progress, 0.0), 100.0)
+        clamped_progress = self._clamp_incomplete_progress(progress)
         with get_db_session() as db:
             job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
             if not job:
@@ -1697,6 +2079,22 @@ class TrainingService:
 
         active_meta = self._active_jobs.get(job.id, {})
         training_device = active_meta.get("requested_device", settings.TRAINING_DEVICE)
+        current_epoch = active_meta.get("current_epoch")
+        total_epochs = active_meta.get("total_epochs", job.epochs)
+        progress_message = active_meta.get("message")
+
+        if current_epoch is None and job.status == JobStatus.COMPLETED.value:
+            current_epoch = job.epochs
+
+        if progress_message is None:
+            if job.status == JobStatus.COMPLETED.value:
+                progress_message = "训练完成，可决定是否保留模型文件"
+            elif job.status == JobStatus.FAILED.value and job.error_message:
+                progress_message = f"训练失败：{job.error_message}"
+            elif job.status == JobStatus.CANCELLED.value:
+                progress_message = "训练已取消"
+            elif job.status == JobStatus.PENDING.value:
+                progress_message = "等待开始训练"
 
         parameters = TrainingParameters(
             epochs=job.epochs if job.epochs is not None else settings.DEFAULT_EPOCHS,
@@ -1724,6 +2122,9 @@ class TrainingService:
             description=job.description,
             model_type=job.model_type,
             dataset_path=job.dataset_path,
+            current_epoch=current_epoch,
+            total_epochs=total_epochs,
+            progress_message=progress_message,
             parameters=parameters,
             status=self._normalize_job_status(job.status),
             progress=job.progress if job.progress is not None else 0.0,
