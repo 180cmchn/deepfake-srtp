@@ -907,4 +907,5 @@ class DetectionService:
                     ),
                 }
             )
+        kwargs["pretrained"] = False
         return create_model(model_type, **kwargs)

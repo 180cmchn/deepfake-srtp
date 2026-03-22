@@ -1034,7 +1034,11 @@ class TrainingService:
             dataset_path, batch_size, validation_split
         )
 
-        model = create_model(model_type=model_type, num_classes=2).to(device)
+        model = create_model(
+            model_type=model_type,
+            num_classes=2,
+            pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
+        ).to(device)
         criterion = nn.CrossEntropyLoss()
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -1220,6 +1224,7 @@ class TrainingService:
             input_size=25088,
             hidden_size=hidden_size,
             num_layers=num_layers,
+            pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
         ).to(device)
         criterion = nn.CrossEntropyLoss()
 

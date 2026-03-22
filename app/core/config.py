@@ -105,6 +105,8 @@ class Settings(BaseSettings):
     _SUPPORTED_MODELS: str = "vgg,lrcn,swin,vit,resnet"
     MODEL_BATCH_SIZE: int = 32
     MODEL_INPUT_SIZE: int = 224
+    MODEL_USE_PRETRAINED_WEIGHTS: bool = True
+    MODEL_ALLOW_RANDOM_INIT_FALLBACK: bool = True
 
     @property
     def SUPPORTED_MODELS(self) -> List[str]:
@@ -202,7 +204,13 @@ class Settings(BaseSettings):
                 raise ValueError(f"Unable to convert {v} to integer")
         return v
 
-    @field_validator("RELOAD", "DEBUG", mode="before")
+    @field_validator(
+        "RELOAD",
+        "DEBUG",
+        "MODEL_USE_PRETRAINED_WEIGHTS",
+        "MODEL_ALLOW_RANDOM_INIT_FALLBACK",
+        mode="before",
+    )
     @classmethod
     def convert_str_to_bool(cls, v):
         """Convert string values to booleans for environment variables"""
