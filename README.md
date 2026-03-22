@@ -7,7 +7,7 @@ A comprehensive deepfake detection platform built with FastAPI, featuring multip
 - **Multiple Model Support**: VGG, LRCN, Swin Transformer, Vision Transformer, ResNet
 - **Real-time Detection**: Single file and batch processing capabilities
 - **Video Analysis**: Frame-by-frame video analysis with aggregation
-- **Model Training**: Automated training pipeline with progress tracking, manual keep/delete decisions, and retained checkpoints becoming selectable detection models
+- **Model Training**: Automated training pipeline with phase-aware progress tracking, manual keep/delete decisions, and retained checkpoints becoming selectable detection models
 - **Dataset Management**: Register local dataset paths, upload browser-selected dataset folders, process, and manage datasets
 - **Feature Engineering Pipeline**: Real image/video feature extraction with artifact output
 - **RESTful API**: Complete API with comprehensive endpoints
@@ -237,6 +237,7 @@ Training supports explicit device selection with `training_device`: `mps`, `cuda
 - `POST /api/v1/datasets/upload-folder` uploads a browser-selected folder while preserving relative `fake/` and `real/` structure on the server
 - `POST /api/v1/datasets/upload` remains available for single-file dataset ingestion/testing
 - For large datasets, prefer registering a server-accessible path instead of browser upload to avoid duplicate transfer, timeouts, and extra storage usage
+- Image-model training (`vgg`, `resnet`, `swin`, `vit`) can train from raw video datasets under `fake/` and `real/` by sampling frames during training
 
 Recommended training directory layouts:
 
@@ -272,6 +273,7 @@ dataset/
 - `POST /api/v1/detection/detect` - Detect deepfake in single file
 - `POST /api/v1/detection/detect/batch` - Batch detection
 - `POST /api/v1/detection/detect/video` - Video detection
+- `GET /api/v1/detection/models` - Get retained models plus builtin fallback models
 - `GET /api/v1/detection/history` - Detection history
 - `GET /api/v1/detection/statistics` - Detection statistics
 
@@ -289,6 +291,10 @@ dataset/
 - `GET /api/v1/training/statistics` - Training job statistics
 
 Training jobs return metrics (accuracy/loss) and `model_path` for the best checkpoint. Whether to keep or discard the checkpoint is a manual decision.
+
+Training job responses now also include `current_epoch`, `total_epochs`, and `progress_message` so the client can show whether a job is currently training, validating, saving the best checkpoint, completed, failed, or cancelled.
+
+`progress` reaches `100` only after the job is actually finalized as `completed`; in-progress jobs are capped below `100` so the UI does not show "complete" before validation/checkpoint saving finishes.
 
 When `POST /api/v1/training/jobs/{id}/model/retain` is called, the backend now creates or updates a real model registry entry. The retained model then appears in detection model lists and detection requests can load the retained checkpoint weights by `model_id`.
 

@@ -7,7 +7,7 @@
 - **多模型支持**：VGG、LRCN、Swin Transformer、Vision Transformer、ResNet
 - **实时检测**：单文件和批量处理能力
 - **视频分析**：逐帧视频分析与结果聚合
-- **模型训练**：自动化训练管道，支持进度跟踪，训练完成后由人工决定是否保留模型文件，保留后可直接进入检测模型列表
+- **模型训练**：自动化训练管道，支持带阶段信息的进度跟踪，训练完成后由人工决定是否保留模型文件，保留后可直接进入检测模型列表
 - **数据集管理**：支持登记本地数据集路径、上传浏览器选择的整个数据集文件夹，并统一处理与管理
 - **特征工程管线**：对图像/视频执行真实特征提取并输出结果文件
 - **RESTful API**：完整的API接口
@@ -256,6 +256,7 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 - `POST /detect` - 单文件深度伪造检测
 - `POST /detect/batch` - 批量检测
 - `POST /detect/video` - 视频检测
+- `GET /models` - 获取已保留模型和内置后备模型
 - `GET /history` - 检测历史记录
 - `GET /statistics` - 检测统计信息
 
@@ -272,6 +273,10 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 - `GET /metrics` - 训练指标
 
 训练任务会返回准确率/损失等指标以及最佳模型文件路径 `model_path`，是否保留模型文件由人工判断。
+
+训练任务响应现在还会返回 `current_epoch`、`total_epochs` 和 `progress_message`，前端可据此展示当前处于训练、验证、保存最佳模型、完成、失败或取消等阶段。
+
+`progress` 只有在任务真正进入 `completed` 后才会到 `100`；训练中任务会被限制在 `100` 以下，避免出现“进度满了但任务还没结束”的误导。
 
 调用 `POST /jobs/{id}/model/retain` 后，后端会同步创建或更新模型注册记录；保留后的模型会出现在检测模型列表中，检测时可通过 `model_id` 加载真实 checkpoint 权重。
 
@@ -298,6 +303,7 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 - 标签推断基于文件路径关键字：fake -> `0`，real -> `1`；若路径同时命中或未命中关键字，则标签记为 `null`。
 - fake 关键字包含 `fake`、`deepfake`、`manipulated`、`forged`、`tampered`、`class1`；real 关键字包含 `real`、`authentic`、`original`、`genuine`、`pristine`、`class0`。
 - 训练/验证/测试样本数由 `validation_split` 与 `test_split` 计算（默认 `0.2` 与 `0.1`），并做边界保护，尽量保证至少保留 1 条训练样本。
+- 图像模型（`vgg`、`resnet`、`swin`、`vit`）也可以直接使用 `fake/real` 下的原始视频数据集训练，后端会在训练时按需抽帧。
 
 推荐的数据集目录结构：
 
