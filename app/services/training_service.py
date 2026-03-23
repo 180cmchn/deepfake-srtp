@@ -604,6 +604,8 @@ class TrainingService:
                 job_id=job.id,
                 status=self._normalize_job_status(job.status),
                 progress=job.progress,
+                started_at=job.started_at,
+                completed_at=job.completed_at,
                 current_epoch=current_epoch,
                 total_epochs=job.epochs,
                 current_loss=current_loss,

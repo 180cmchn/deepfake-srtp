@@ -28,8 +28,8 @@ from app.schemas.detection import (
     DetectionResponse,
     BatchDetectionRequest,
     BatchDetectionResponse,
-    VideoDetectionRequest,
     VideoDetectionResponse,
+    VideoDetectionRequest,
     DetectionHistory,
     DetectionHistoryList,
     DetectionStatistics,
@@ -70,6 +70,48 @@ async def detect_deepfake(
 
         # Initialize detection service
         detection_service = DetectionService(db)
+
+        # Route video uploads through the dedicated video pipeline while
+        # preserving the generic /detect response shape for the frontend.
+        if file_extension in [".mp4", ".avi", ".mov", ".mkv", ".wmv"]:
+            video_request = VideoDetectionRequest(
+                video_path=file_path,
+                model_id=request.model_id,
+                model_type=request.model_type,
+                confidence_threshold=request.confidence_threshold,
+                preprocess=request.preprocess,
+            )
+            video_result = await detection_service.detect_video(
+                video_path=file_path,
+                request=video_request,
+                background_tasks=background_tasks,
+            )
+
+            detection_result = video_result.aggregated_result
+            if not detection_result and video_result.frame_results:
+                first_frame = video_result.frame_results[0]
+                detection_result = first_frame.result if first_frame else None
+
+            file_info = {
+                "name": file.filename,
+                "type": "video",
+                "size": os.path.getsize(file_path),
+                "resolution": None,
+                "total_frames": video_result.video_info.get("total_frames"),
+                "processed_frames": video_result.video_info.get("processed_frames"),
+                "duration": video_result.video_info.get("duration"),
+            }
+
+            return DetectionResponse(
+                success=video_result.success,
+                file_info=file_info,
+                result=detection_result,
+                error_message=None
+                if video_result.success
+                else "Video detection failed",
+                processing_time=video_result.processing_time,
+                created_at=video_result.created_at,
+            )
 
         # Perform detection
         result = await detection_service.detect_file(

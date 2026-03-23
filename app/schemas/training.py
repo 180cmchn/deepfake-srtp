@@ -151,6 +151,8 @@ class TrainingProgress(BaseModel):
     job_id: int
     status: JobStatus
     progress: float = Field(..., ge=0.0, le=100.0)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
     current_epoch: Optional[int] = Field(None, ge=0)
     total_epochs: Optional[int] = Field(None, ge=0)
     current_loss: Optional[float] = Field(None, ge=0.0)
