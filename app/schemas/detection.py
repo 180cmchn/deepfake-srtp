@@ -94,8 +94,11 @@ class DetectionResponse(BaseModel):
 class BatchDetectionRequest(BaseModel):
     """Schema for batch detection request"""
 
-    file_paths: List[str] = Field(
-        ..., min_items=1, max_items=100, description="List of file paths"
+    file_paths: Optional[List[str]] = Field(
+        default=None,
+        min_items=1,
+        max_items=100,
+        description="List of file paths",
     )
     model_id: Optional[int] = Field(None, description="Model ID to use for detection")
     model_type: Optional[str] = Field(
@@ -140,7 +143,7 @@ class BatchDetectionResponse(BaseModel):
 class VideoDetectionRequest(BaseModel):
     """Schema for video detection request"""
 
-    video_path: str = Field(..., description="Path to video file")
+    video_path: Optional[str] = Field(None, description="Path to video file")
     model_id: Optional[int] = Field(None, description="Model ID to use for detection")
     model_type: Optional[str] = Field(
         None, description="Model type (if model_id not provided)"
