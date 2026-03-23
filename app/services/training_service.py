@@ -3,6 +3,8 @@ Training service for deepfake detection platform
 """
 
 import asyncio
+import hashlib
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 import os
@@ -284,6 +286,88 @@ class TrainingService:
         if self._uses_video_backed_samples(samples):
             return {"num_workers": 0, "pin_memory": False}
         return self._dataloader_kwargs(dataset_size)
+
+    def _configure_acceleration_backend(self, device: torch.device):
+        """Enable safe CUDA runtime optimizations."""
+        if device.type != "cuda":
+            return
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
+    def _video_frame_cache_root(self, input_size: int) -> Path:
+        return Path(settings.DATA_DIR) / "frame_cache" / f"{input_size}px"
+
+    def _materialize_video_backed_samples(
+        self, samples: List[MediaClassificationSample], input_size: int
+    ) -> List[MediaClassificationSample]:
+        """Extract sampled raw-video frames once so later epochs can use image IO."""
+        if not self._uses_video_backed_samples(samples):
+            return samples
+
+        cache_root = self._video_frame_cache_root(input_size)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        materialized: List[MediaClassificationSample] = []
+        extracted_count = 0
+
+        for sample in samples:
+            if sample.frame_index is None:
+                materialized.append(sample)
+                continue
+
+            cached_frame_path = self._materialize_video_frame(
+                sample.path,
+                sample.frame_index,
+                cache_root,
+                input_size,
+            )
+            if cached_frame_path != sample.path:
+                extracted_count += 1
+            materialized.append(
+                MediaClassificationSample(path=cached_frame_path, label=sample.label)
+            )
+
+        logger.info(
+            "Materialized video-backed frame samples",
+            total_samples=len(samples),
+            cached_samples=len(materialized),
+            extracted_count=extracted_count,
+            cache_root=str(cache_root),
+        )
+        return materialized
+
+    def _materialize_video_frame(
+        self,
+        video_path: str,
+        frame_index: int,
+        cache_root: Path,
+        input_size: int,
+    ) -> str:
+        source_path = Path(video_path).expanduser().resolve()
+        source_stat = source_path.stat()
+        cache_key = hashlib.sha1(
+            f"{source_path}:{source_stat.st_mtime_ns}:{source_stat.st_size}:{frame_index}:{input_size}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        cache_dir = cache_root / cache_key[:2]
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cached_frame_path = cache_dir / f"{cache_key}.jpg"
+        if cached_frame_path.exists():
+            return str(cached_frame_path)
+
+        frame_image = ImageClassificationDataset._load_video_frame(
+            str(source_path), frame_index
+        )
+        resized_frame = frame_image.resize((input_size, input_size), Image.BILINEAR)
+        temp_path = cached_frame_path.with_suffix(".tmp")
+        resized_frame.save(temp_path, format="JPEG", quality=95)
+        os.replace(temp_path, cached_frame_path)
+        return str(cached_frame_path)
 
     async def create_job(
         self,
@@ -1013,6 +1097,7 @@ class TrainingService:
         self._set_active_job_metadata(job_id, {"total_epochs": epochs, "mode": "image"})
 
         device = self._resolve_training_device(training_device)
+        self._configure_acceleration_backend(device)
         batch_size = self._tune_batch_size(batch_size, device, sequence_mode=False)
         self._set_active_job_metadata(
             job_id,
@@ -1039,6 +1124,11 @@ class TrainingService:
             num_classes=2,
             pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
         ).to(device)
+        channels_last = device.type == "cuda" and model_type != "lrcn"
+        if channels_last:
+            model = model.to(memory_format=torch.channels_last)
+        amp_enabled = device.type == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
         criterion = nn.CrossEntropyLoss()
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -1085,6 +1175,9 @@ class TrainingService:
                 criterion,
                 optimizer,
                 device,
+                amp_enabled=amp_enabled,
+                scaler=scaler,
+                channels_last=channels_last,
                 progress_callback=image_progress_callback,
             )
             self._set_active_job_metadata(
@@ -1096,7 +1189,12 @@ class TrainingService:
                 },
             )
             val_loss, val_accuracy = self._run_eval_epoch(
-                model, val_loader, criterion, device
+                model,
+                val_loader,
+                criterion,
+                device,
+                amp_enabled=amp_enabled,
+                channels_last=channels_last,
             )
 
             progress = (epoch / epochs) * 100.0
@@ -1197,6 +1295,7 @@ class TrainingService:
         )
 
         device = self._resolve_training_device(training_device)
+        self._configure_acceleration_backend(device)
         batch_size = self._tune_batch_size(batch_size, device, sequence_mode=True)
         self._set_active_job_metadata(
             job_id,
@@ -1226,6 +1325,8 @@ class TrainingService:
             num_layers=num_layers,
             pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
         ).to(device)
+        amp_enabled = device.type == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
         criterion = nn.CrossEntropyLoss()
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -1272,6 +1373,8 @@ class TrainingService:
                 criterion,
                 optimizer,
                 device,
+                amp_enabled=amp_enabled,
+                scaler=scaler,
                 progress_callback=sequence_progress_callback,
             )
             self._set_active_job_metadata(
@@ -1283,7 +1386,11 @@ class TrainingService:
                 },
             )
             val_loss, val_accuracy = self._run_eval_epoch(
-                model, val_loader, criterion, device
+                model,
+                val_loader,
+                criterion,
+                device,
+                amp_enabled=amp_enabled,
             )
 
             progress = (epoch / epochs) * 100.0
@@ -1474,23 +1581,24 @@ class TrainingService:
         if not val_samples:
             raise ValueError("No labeled validation samples found")
 
+        train_samples = self._materialize_video_backed_samples(
+            train_samples, input_size
+        )
+        val_samples = self._materialize_video_backed_samples(val_samples, input_size)
+
         train_dataset = ImageClassificationDataset(
             train_samples, transform=train_transform
         )
         val_dataset = ImageClassificationDataset(val_samples, transform=val_transform)
 
-        loader_kwargs = self._tune_loader_kwargs_for_media_samples(
-            len(train_dataset), train_samples
-        )
+        loader_kwargs = self._dataloader_kwargs(len(train_dataset))
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
             **loader_kwargs,
         )
-        val_loader_kwargs = self._tune_loader_kwargs_for_media_samples(
-            len(val_dataset), val_samples
-        )
+        val_loader_kwargs = self._dataloader_kwargs(len(val_dataset))
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
@@ -1906,6 +2014,9 @@ class TrainingService:
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        amp_enabled: bool = False,
+        scaler: Optional[torch.amp.GradScaler] = None,
+        channels_last: bool = False,
         progress_callback: Optional[Callable[[int, int, float, float], None]] = None,
     ) -> Tuple[float, float]:
         """Run one training epoch."""
@@ -1918,14 +2029,28 @@ class TrainingService:
         progress_interval = max(1, total_batches // 20)
 
         for batch_index, (images, labels) in enumerate(dataloader, start=1):
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(device, non_blocking=device.type == "cuda")
+            if channels_last and images.ndim == 4:
+                images = images.contiguous(memory_format=torch.channels_last)
+            labels = labels.to(device, non_blocking=device.type == "cuda")
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            autocast_context = (
+                torch.autocast(device_type="cuda", dtype=torch.float16)
+                if amp_enabled
+                else nullcontext()
+            )
+            with autocast_context:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            if scaler is not None and amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             current_batch_size = labels.size(0)
             total_loss += loss.item() * current_batch_size
@@ -1991,6 +2116,8 @@ class TrainingService:
         dataloader: DataLoader,
         criterion: nn.Module,
         device: torch.device,
+        amp_enabled: bool = False,
+        channels_last: bool = False,
     ) -> Tuple[float, float]:
         """Run one validation epoch."""
         model.eval()
@@ -2000,11 +2127,19 @@ class TrainingService:
 
         with torch.no_grad():
             for images, labels in dataloader:
-                images = images.to(device)
-                labels = labels.to(device)
+                images = images.to(device, non_blocking=device.type == "cuda")
+                if channels_last and images.ndim == 4:
+                    images = images.contiguous(memory_format=torch.channels_last)
+                labels = labels.to(device, non_blocking=device.type == "cuda")
 
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                autocast_context = (
+                    torch.autocast(device_type="cuda", dtype=torch.float16)
+                    if amp_enabled
+                    else nullcontext()
+                )
+                with autocast_context:
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
 
                 current_batch_size = labels.size(0)
                 total_loss += loss.item() * current_batch_size
