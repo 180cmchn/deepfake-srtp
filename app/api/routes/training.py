@@ -2,7 +2,15 @@
 Training API routes for deepfake detection platform
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    BackgroundTasks,
+    Header,
+    Query,
+    Response,
+)
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
@@ -11,6 +19,7 @@ from app.core.logging import logger
 from app.core.auth import get_current_user, require_admin
 from app.models.database_models import ModelRegistry
 from app.schemas.training import (
+    TrainingEpochMetricsResponse,
     TrainingJobCreate,
     TrainingJobResponse,
     TrainingJobList,
@@ -331,6 +340,66 @@ async def get_training_job_logs(
         )
         raise HTTPException(
             status_code=500, detail=f"Failed to get training job logs: {str(e)}"
+        )
+
+
+@router.get("/jobs/{job_id}/epoch-metrics", response_model=TrainingEpochMetricsResponse)
+async def get_training_job_epoch_metrics(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user),
+):
+    """Get per-epoch training metrics for charting."""
+    try:
+        from app.services.training_service import TrainingService
+
+        training_service = TrainingService(db)
+        metrics = await training_service.get_epoch_metrics_history(job_id)
+        if metrics is None:
+            raise HTTPException(status_code=404, detail="Training job not found")
+        return metrics
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to get training job epoch metrics",
+            error=str(e),
+            job_id=job_id,
+            user=current_user,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get training job epoch metrics: {str(e)}",
+        )
+
+
+@router.get("/jobs/{job_id}/epoch-metrics/chart")
+async def get_training_job_epoch_metrics_chart(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user),
+):
+    """Render an SVG chart for per-epoch accuracy and loss."""
+    try:
+        from app.services.training_service import TrainingService
+
+        training_service = TrainingService(db)
+        svg_chart = await training_service.get_epoch_metrics_chart_svg(job_id)
+        if svg_chart is None:
+            raise HTTPException(status_code=404, detail="Training job not found")
+        return Response(content=svg_chart, media_type="image/svg+xml")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to render training job epoch metrics chart",
+            error=str(e),
+            job_id=job_id,
+            user=current_user,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to render training job epoch metrics chart: {str(e)}",
         )
 
 

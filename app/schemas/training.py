@@ -123,6 +123,11 @@ class TrainingJobResponse(TrainingJobBase):
     current_epoch: Optional[int] = None
     total_epochs: Optional[int] = None
     progress_message: Optional[str] = None
+    preprocessing_stage: Optional[str] = None
+    preprocessing_progress: Optional[float] = Field(None, ge=0.0, le=100.0)
+    preprocessing_current: Optional[int] = Field(None, ge=0)
+    preprocessing_total: Optional[int] = Field(None, ge=0)
+    preprocessing_unit: Optional[str] = None
     parameters: TrainingParameters
     results: Optional[TrainingResults]
     created_at: datetime
@@ -161,6 +166,11 @@ class TrainingProgress(BaseModel):
         None, ge=0, description="Estimated time remaining in seconds"
     )
     message: Optional[str] = None
+    preprocessing_stage: Optional[str] = None
+    preprocessing_progress: Optional[float] = Field(None, ge=0.0, le=100.0)
+    preprocessing_current: Optional[int] = Field(None, ge=0)
+    preprocessing_total: Optional[int] = Field(None, ge=0)
+    preprocessing_unit: Optional[str] = None
 
 
 class TrainingLog(BaseModel):
@@ -172,6 +182,30 @@ class TrainingLog(BaseModel):
     message: str
     epoch: Optional[int] = None
     metrics: Optional[Dict[str, Any]] = None
+
+
+class EpochMetricPoint(BaseModel):
+    """Per-epoch training and validation metrics."""
+
+    epoch: int = Field(..., ge=1)
+    train_loss: Optional[float] = Field(None, ge=0.0)
+    train_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
+    val_loss: Optional[float] = Field(None, ge=0.0)
+    val_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
+    learning_rate: Optional[float] = Field(None, ge=0.0)
+    recorded_at: Optional[datetime] = None
+
+
+class TrainingEpochMetricsResponse(BaseModel):
+    """Epoch metric history for charting training progress."""
+
+    job_id: int
+    job_name: Optional[str] = None
+    model_type: Optional[str] = None
+    total_epochs: Optional[int] = Field(None, ge=0)
+    completed_epochs: int = Field(default=0, ge=0)
+    available: bool = False
+    metrics: list[EpochMetricPoint] = Field(default_factory=list)
 
 
 class TrainingConfig(BaseModel):

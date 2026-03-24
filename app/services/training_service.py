@@ -3,7 +3,9 @@ Training service for deepfake detection platform
 """
 
 import asyncio
+import html
 import hashlib
+import json
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,10 +30,12 @@ from app.core.config import settings
 from app.models.database_models import ModelRegistry, TrainingJob
 from app.schemas.models import ModelStatus
 from app.schemas.training import (
+    EpochMetricPoint,
     TrainingJobCreate,
     TrainingJobResponse,
     TrainingJobList,
     TrainingJobUpdate,
+    TrainingEpochMetricsResponse,
     TrainingProgress,
     TrainingMetrics,
     JobStatus,
@@ -310,17 +314,466 @@ class TrainingService:
     def _video_frame_cache_root(self, input_size: int) -> Path:
         return Path(settings.DATA_DIR) / "frame_cache" / f"{input_size}px"
 
+    def _create_phase_progress_reporter(
+        self,
+        job_id: int,
+        start_progress: float,
+        end_progress: float,
+        total_epochs: int,
+        current_epoch: int = 0,
+    ) -> Callable[[float, str, Optional[Dict[str, Any]]], None]:
+        """Map a normalized phase progress value onto the job progress scale."""
+
+        progress_span = max(0.0, end_progress - start_progress)
+
+        def reporter(
+            ratio: float,
+            message: str,
+            detail: Optional[Dict[str, Any]] = None,
+        ):
+            normalized_ratio = min(max(ratio, 0.0), 1.0)
+            progress_value = start_progress + (progress_span * normalized_ratio)
+            self._update_running_progress(
+                job_id,
+                progress_value,
+                epoch=current_epoch,
+                total_epochs=total_epochs,
+                message=message,
+            )
+            self._update_preprocessing_metadata(
+                job_id,
+                normalized_ratio,
+                detail or {},
+            )
+
+        return reporter
+
+    def _chain_progress_reporter(
+        self,
+        parent_reporter: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ],
+        start_ratio: float,
+        end_ratio: float,
+    ) -> Optional[Callable[[float, str, Optional[Dict[str, Any]]], None]]:
+        """Create a nested reporter for a sub-range inside another phase."""
+        if parent_reporter is None:
+            return None
+
+        ratio_span = max(0.0, end_ratio - start_ratio)
+
+        def reporter(
+            ratio: float,
+            message: str,
+            detail: Optional[Dict[str, Any]] = None,
+        ):
+            normalized_ratio = min(max(ratio, 0.0), 1.0)
+            parent_reporter(
+                start_ratio + (ratio_span * normalized_ratio),
+                message,
+                detail,
+            )
+
+        return reporter
+
+    def _report_indexed_progress(
+        self,
+        progress_callback: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ],
+        index: int,
+        total: int,
+        message: str,
+        stage: Optional[str] = None,
+        unit: Optional[str] = None,
+    ) -> None:
+        """Report progress for an indexed loop without duplicating math."""
+        if progress_callback is None:
+            return
+        detail: Dict[str, Any] = {
+            "stage": stage,
+            "current": index,
+            "total": total,
+            "unit": unit,
+        }
+        progress_callback(index / max(total, 1), message, detail)
+
+    def _update_preprocessing_metadata(
+        self,
+        job_id: int,
+        ratio: float,
+        detail: Dict[str, Any],
+    ) -> None:
+        """Store structured preprocessing progress details for API responses."""
+        updates: Dict[str, Any] = {
+            "preprocessing_progress": round(min(max(ratio, 0.0), 1.0) * 100.0, 2),
+        }
+        if detail.get("stage") is not None:
+            updates["preprocessing_stage"] = detail.get("stage")
+        if detail.get("current") is not None:
+            updates["preprocessing_current"] = int(detail.get("current"))
+        if detail.get("total") is not None:
+            updates["preprocessing_total"] = int(detail.get("total"))
+        if detail.get("unit") is not None:
+            updates["preprocessing_unit"] = detail.get("unit")
+        self._set_active_job_metadata(job_id, updates)
+
+    def _epoch_metrics_root(self) -> Path:
+        """Directory for persisted per-epoch metric history files."""
+        return Path(settings.DATA_DIR) / "training_metrics"
+
+    def _epoch_metrics_history_path(self, job_id: int) -> Path:
+        """Sidecar JSON file used to persist epoch metrics for a job."""
+        return self._epoch_metrics_root() / f"job_{job_id}_epoch_metrics.json"
+
+    def _write_epoch_metrics_payload(
+        self, job_id: int, payload: Dict[str, Any]
+    ) -> None:
+        """Atomically write the epoch metric payload to disk."""
+        output_path = self._epoch_metrics_history_path(job_id)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = output_path.with_suffix(".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, output_path)
+
+    def _read_epoch_metrics_payload(self, job_id: int) -> Dict[str, Any]:
+        """Read a persisted epoch metric payload from disk if available."""
+        history_path = self._epoch_metrics_history_path(job_id)
+        if not history_path.exists() or not history_path.is_file():
+            return {"job_id": job_id, "metrics": []}
+
+        try:
+            with history_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (json.JSONDecodeError, OSError, ValueError):
+            logger.warning(
+                "Epoch metrics history is unreadable",
+                job_id=job_id,
+                path=str(history_path),
+            )
+            return {"job_id": job_id, "metrics": []}
+
+        payload.setdefault("job_id", job_id)
+        payload.setdefault("metrics", [])
+        return payload
+
+    def _reset_epoch_metrics_history(
+        self,
+        job: TrainingJob,
+        total_epochs: Optional[int] = None,
+    ) -> None:
+        """Initialize a fresh epoch metric history file for a training run."""
+        payload = {
+            "job_id": job.id,
+            "job_name": job.name,
+            "model_type": job.model_type,
+            "total_epochs": int(total_epochs or job.epochs or 0),
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "metrics": [],
+        }
+        self._write_epoch_metrics_payload(job.id, payload)
+
+    def _delete_epoch_metrics_history(self, job_id: int) -> None:
+        """Remove persisted epoch metric history for a deleted job."""
+        history_path = self._epoch_metrics_history_path(job_id)
+        if history_path.exists() and history_path.is_file():
+            history_path.unlink()
+
+    def _record_epoch_metrics(
+        self,
+        job_id: int,
+        epoch: int,
+        train_loss: float,
+        train_accuracy: float,
+        val_loss: float,
+        val_accuracy: float,
+        learning_rate: float,
+    ) -> None:
+        """Append or update one epoch of metric history for charting."""
+        payload = self._read_epoch_metrics_payload(job_id)
+        metrics = [
+            metric
+            for metric in payload.get("metrics", [])
+            if int(metric.get("epoch", 0)) != int(epoch)
+        ]
+        metrics.append(
+            {
+                "epoch": int(epoch),
+                "train_loss": float(train_loss),
+                "train_accuracy": float(train_accuracy),
+                "val_loss": float(val_loss),
+                "val_accuracy": float(val_accuracy),
+                "learning_rate": float(learning_rate),
+                "recorded_at": datetime.now().isoformat(),
+            }
+        )
+        metrics.sort(key=lambda metric: int(metric.get("epoch", 0)))
+        payload["metrics"] = metrics
+        payload["updated_at"] = datetime.now().isoformat()
+        self._write_epoch_metrics_payload(job_id, payload)
+
+    async def get_epoch_metrics_history(
+        self, job_id: int
+    ) -> Optional[TrainingEpochMetricsResponse]:
+        """Return persisted per-epoch metrics for a training job."""
+        job = (
+            self.db.query(TrainingJob)
+            .filter(TrainingJob.id == job_id, TrainingJob.del_flag == 0)
+            .first()
+        )
+        if not job:
+            return None
+
+        payload = self._read_epoch_metrics_payload(job_id)
+        metric_points = [
+            EpochMetricPoint(**metric)
+            for metric in sorted(
+                payload.get("metrics", []),
+                key=lambda metric: int(metric.get("epoch", 0)),
+            )
+        ]
+
+        return TrainingEpochMetricsResponse(
+            job_id=job.id,
+            job_name=job.name,
+            model_type=job.model_type,
+            total_epochs=job.epochs,
+            completed_epochs=len(metric_points),
+            available=bool(metric_points),
+            metrics=metric_points,
+        )
+
+    async def get_epoch_metrics_chart_svg(self, job_id: int) -> Optional[str]:
+        """Render an SVG chart for per-epoch loss and accuracy."""
+        history = await self.get_epoch_metrics_history(job_id)
+        if history is None:
+            return None
+        return self._build_epoch_metrics_svg(history)
+
+    def _build_epoch_metrics_svg(self, history: TrainingEpochMetricsResponse) -> str:
+        """Create a lightweight SVG chart with accuracy and loss curves."""
+        width = 980
+        height = 640
+        background = "#f8fafc"
+        panel_fill = "#ffffff"
+        grid = "#dbe4ee"
+        axis = "#334155"
+        text = "#0f172a"
+        muted = "#64748b"
+        train_color = "#0f766e"
+        val_color = "#dc2626"
+
+        escaped_name = html.escape(history.job_name or f"Training Job {history.job_id}")
+        metrics = list(history.metrics)
+
+        if not metrics:
+            return (
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="240" '
+                f'viewBox="0 0 {width} 240" role="img" aria-label="No epoch metrics available">'
+                f'<rect width="{width}" height="240" fill="{background}" />'
+                f'<rect x="24" y="24" width="{width - 48}" height="192" rx="18" fill="{panel_fill}" stroke="{grid}" />'
+                f'<text x="48" y="84" fill="{text}" font-size="24" font-family="Arial, sans-serif">{escaped_name}</text>'
+                f'<text x="48" y="124" fill="{muted}" font-size="16" font-family="Arial, sans-serif">No epoch metrics available yet.</text>'
+                f'<text x="48" y="152" fill="{muted}" font-size="16" font-family="Arial, sans-serif">Start or complete training first, then request this chart again.</text>'
+                "</svg>"
+            )
+
+        chart_left = 80
+        chart_right = width - 40
+        chart_width = chart_right - chart_left
+        top_panel_top = 120
+        panel_height = 180
+        panel_gap = 90
+        bottom_panel_top = top_panel_top + panel_height + panel_gap
+
+        epochs = [point.epoch for point in metrics]
+        min_epoch = min(epochs)
+        max_epoch = max(epochs)
+
+        def scale_x(epoch_value: int) -> float:
+            if max_epoch == min_epoch:
+                return chart_left + (chart_width / 2.0)
+            return chart_left + (
+                ((epoch_value - min_epoch) / float(max_epoch - min_epoch)) * chart_width
+            )
+
+        def build_line_points(
+            values: List[Optional[float]],
+            y_min: float,
+            y_max: float,
+            panel_top: float,
+        ) -> str:
+            points = []
+            panel_bottom = panel_top + panel_height
+            value_span = y_max - y_min if y_max > y_min else 1.0
+            for point, value in zip(metrics, values):
+                if value is None:
+                    continue
+                ratio = (float(value) - y_min) / value_span
+                y = panel_bottom - (ratio * panel_height)
+                points.append(f"{scale_x(point.epoch):.2f},{y:.2f}")
+            return " ".join(points)
+
+        def build_dot_marks(
+            values: List[Optional[float]],
+            y_min: float,
+            y_max: float,
+            panel_top: float,
+            color: str,
+        ) -> str:
+            circles = []
+            panel_bottom = panel_top + panel_height
+            value_span = y_max - y_min if y_max > y_min else 1.0
+            for point, value in zip(metrics, values):
+                if value is None:
+                    continue
+                ratio = (float(value) - y_min) / value_span
+                y = panel_bottom - (ratio * panel_height)
+                circles.append(
+                    f'<circle cx="{scale_x(point.epoch):.2f}" cy="{y:.2f}" r="3.5" fill="{color}" />'
+                )
+            return "".join(circles)
+
+        def build_y_grid(
+            ticks: List[float],
+            y_min: float,
+            y_max: float,
+            panel_top: float,
+        ) -> str:
+            panel_bottom = panel_top + panel_height
+            value_span = y_max - y_min if y_max > y_min else 1.0
+            grid_lines = []
+            for tick in ticks:
+                ratio = (tick - y_min) / value_span
+                y = panel_bottom - (ratio * panel_height)
+                grid_lines.append(
+                    f'<line x1="{chart_left}" y1="{y:.2f}" x2="{chart_right}" y2="{y:.2f}" stroke="{grid}" stroke-width="1" />'
+                )
+                grid_lines.append(
+                    f'<text x="{chart_left - 12}" y="{y + 5:.2f}" text-anchor="end" fill="{muted}" font-size="12" font-family="Arial, sans-serif">{tick:.2f}</text>'
+                )
+            return "".join(grid_lines)
+
+        def build_x_ticks(panel_top: float) -> str:
+            panel_bottom = panel_top + panel_height
+            tick_step = max(1, len(metrics) // 8)
+            ticks = []
+            for index, epoch_value in enumerate(epochs):
+                if index not in {0, len(epochs) - 1} and index % tick_step != 0:
+                    continue
+                x = scale_x(epoch_value)
+                ticks.append(
+                    f'<line x1="{x:.2f}" y1="{panel_bottom}" x2="{x:.2f}" y2="{panel_bottom + 6}" stroke="{axis}" stroke-width="1" />'
+                )
+                ticks.append(
+                    f'<text x="{x:.2f}" y="{panel_bottom + 24}" text-anchor="middle" fill="{muted}" font-size="12" font-family="Arial, sans-serif">{epoch_value}</text>'
+                )
+            return "".join(ticks)
+
+        train_accuracy_values = [point.train_accuracy for point in metrics]
+        val_accuracy_values = [point.val_accuracy for point in metrics]
+        train_loss_values = [point.train_loss for point in metrics]
+        val_loss_values = [point.val_loss for point in metrics]
+
+        loss_values = [
+            float(value)
+            for value in train_loss_values + val_loss_values
+            if value is not None
+        ]
+        loss_min = min(loss_values) if loss_values else 0.0
+        loss_max = max(loss_values) if loss_values else 1.0
+        if loss_max <= loss_min:
+            loss_min = max(0.0, loss_min - 0.1)
+            loss_max = loss_max + 0.1
+        else:
+            padding = max((loss_max - loss_min) * 0.1, 0.05)
+            loss_min = max(0.0, loss_min - padding)
+            loss_max = loss_max + padding
+
+        accuracy_grid = build_y_grid(
+            [0.0, 0.25, 0.5, 0.75, 1.0], 0.0, 1.0, top_panel_top
+        )
+        loss_tick_count = 5
+        loss_ticks = [
+            loss_min + ((loss_max - loss_min) * tick_index / float(loss_tick_count - 1))
+            for tick_index in range(loss_tick_count)
+        ]
+        loss_grid = build_y_grid(loss_ticks, loss_min, loss_max, bottom_panel_top)
+
+        legend = (
+            f'<line x1="600" y1="58" x2="628" y2="58" stroke="{train_color}" stroke-width="3" />'
+            f'<text x="636" y="62" fill="{text}" font-size="13" font-family="Arial, sans-serif">Train</text>'
+            f'<line x1="710" y1="58" x2="738" y2="58" stroke="{val_color}" stroke-width="3" />'
+            f'<text x="746" y="62" fill="{text}" font-size="13" font-family="Arial, sans-serif">Validation</text>'
+        )
+
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+            f'viewBox="0 0 {width} {height}" role="img" aria-label="Training accuracy and loss by epoch">'
+            f'<rect width="{width}" height="{height}" fill="{background}" />'
+            f'<text x="40" y="50" fill="{text}" font-size="28" font-family="Arial, sans-serif">{escaped_name}</text>'
+            f'<text x="40" y="78" fill="{muted}" font-size="15" font-family="Arial, sans-serif">Model: {html.escape(history.model_type or "unknown")} | Epochs recorded: {history.completed_epochs}/{history.total_epochs or history.completed_epochs}</text>'
+            f"{legend}"
+            f'<rect x="24" y="96" width="{width - 48}" height="{panel_height + 48}" rx="18" fill="{panel_fill}" stroke="{grid}" />'
+            f'<text x="40" y="116" fill="{text}" font-size="18" font-family="Arial, sans-serif">Accuracy</text>'
+            f"{accuracy_grid}"
+            f'<line x1="{chart_left}" y1="{top_panel_top + panel_height}" x2="{chart_right}" y2="{top_panel_top + panel_height}" stroke="{axis}" stroke-width="1.4" />'
+            f'<line x1="{chart_left}" y1="{top_panel_top}" x2="{chart_left}" y2="{top_panel_top + panel_height}" stroke="{axis}" stroke-width="1.4" />'
+            f'<polyline fill="none" stroke="{train_color}" stroke-width="3" points="{build_line_points(train_accuracy_values, 0.0, 1.0, top_panel_top)}" />'
+            f'<polyline fill="none" stroke="{val_color}" stroke-width="3" points="{build_line_points(val_accuracy_values, 0.0, 1.0, top_panel_top)}" />'
+            f"{build_dot_marks(train_accuracy_values, 0.0, 1.0, top_panel_top, train_color)}"
+            f"{build_dot_marks(val_accuracy_values, 0.0, 1.0, top_panel_top, val_color)}"
+            f"{build_x_ticks(top_panel_top)}"
+            f'<text x="{width / 2:.2f}" y="{top_panel_top + panel_height + 44}" text-anchor="middle" fill="{muted}" font-size="12" font-family="Arial, sans-serif">Epoch</text>'
+            f'<rect x="24" y="{bottom_panel_top - 24}" width="{width - 48}" height="{panel_height + 48}" rx="18" fill="{panel_fill}" stroke="{grid}" />'
+            f'<text x="40" y="{bottom_panel_top - 4}" fill="{text}" font-size="18" font-family="Arial, sans-serif">Loss</text>'
+            f"{loss_grid}"
+            f'<line x1="{chart_left}" y1="{bottom_panel_top + panel_height}" x2="{chart_right}" y2="{bottom_panel_top + panel_height}" stroke="{axis}" stroke-width="1.4" />'
+            f'<line x1="{chart_left}" y1="{bottom_panel_top}" x2="{chart_left}" y2="{bottom_panel_top + panel_height}" stroke="{axis}" stroke-width="1.4" />'
+            f'<polyline fill="none" stroke="{train_color}" stroke-width="3" points="{build_line_points(train_loss_values, loss_min, loss_max, bottom_panel_top)}" />'
+            f'<polyline fill="none" stroke="{val_color}" stroke-width="3" points="{build_line_points(val_loss_values, loss_min, loss_max, bottom_panel_top)}" />'
+            f"{build_dot_marks(train_loss_values, loss_min, loss_max, bottom_panel_top, train_color)}"
+            f"{build_dot_marks(val_loss_values, loss_min, loss_max, bottom_panel_top, val_color)}"
+            f"{build_x_ticks(bottom_panel_top)}"
+            f'<text x="{width / 2:.2f}" y="{bottom_panel_top + panel_height + 44}" text-anchor="middle" fill="{muted}" font-size="12" font-family="Arial, sans-serif">Epoch</text>'
+            "</svg>"
+        )
+
     def _materialize_video_backed_samples(
-        self, samples: List[MediaClassificationSample], input_size: int
+        self,
+        samples: List[MediaClassificationSample],
+        input_size: int,
+        progress_callback: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ] = None,
+        progress_label: str = "正在缓存视频帧",
     ) -> List[MediaClassificationSample]:
         """Extract sampled raw-video frames once so later epochs can use image IO."""
         if not self._uses_video_backed_samples(samples):
+            if progress_callback is not None:
+                progress_callback(
+                    1.0,
+                    f"{progress_label}：无需取帧缓存",
+                    {
+                        "stage": "cache_video_frames",
+                        "current": 0,
+                        "total": 0,
+                        "unit": "frames",
+                    },
+                )
             return samples
 
         cache_root = self._video_frame_cache_root(input_size)
         cache_root.mkdir(parents=True, exist_ok=True)
         materialized: List[MediaClassificationSample] = []
         extracted_count = 0
+        video_backed_total = sum(
+            1 for sample in samples if sample.frame_index is not None
+        )
+        processed_video_backed = 0
+        progress_interval = max(1, video_backed_total // 20)
 
         for sample in samples:
             if sample.frame_index is None:
@@ -338,6 +791,23 @@ class TrainingService:
             materialized.append(
                 MediaClassificationSample(path=cached_frame_path, label=sample.label)
             )
+            processed_video_backed += 1
+
+            if progress_callback and (
+                processed_video_backed == 1
+                or processed_video_backed % progress_interval == 0
+                or processed_video_backed == video_backed_total
+            ):
+                progress_callback(
+                    processed_video_backed / max(video_backed_total, 1),
+                    f"{progress_label}：{processed_video_backed}/{video_backed_total}",
+                    {
+                        "stage": "cache_video_frames",
+                        "current": processed_video_backed,
+                        "total": video_backed_total,
+                        "unit": "frames",
+                    },
+                )
 
         logger.info(
             "Materialized video-backed frame samples",
@@ -567,6 +1037,7 @@ class TrainingService:
 
             job.del_flag = 1
             self.db.commit()
+            self._delete_epoch_metrics_history(job_id)
 
             logger.info("Training job deleted", job_id=job_id)
             return True
@@ -594,6 +1065,11 @@ class TrainingService:
             current_loss = active_meta.get("current_loss")
             current_accuracy = active_meta.get("current_accuracy")
             message = active_meta.get("message")
+            preprocessing_stage = active_meta.get("preprocessing_stage")
+            preprocessing_progress = active_meta.get("preprocessing_progress")
+            preprocessing_current = active_meta.get("preprocessing_current")
+            preprocessing_total = active_meta.get("preprocessing_total")
+            preprocessing_unit = active_meta.get("preprocessing_unit")
 
             if current_epoch is None and job.status in [
                 JobStatus.COMPLETED.value,
@@ -620,6 +1096,11 @@ class TrainingService:
                 current_accuracy=current_accuracy,
                 estimated_time_remaining=None,  # TODO: Calculate ETA
                 message=message,
+                preprocessing_stage=preprocessing_stage,
+                preprocessing_progress=preprocessing_progress,
+                preprocessing_current=preprocessing_current,
+                preprocessing_total=preprocessing_total,
+                preprocessing_unit=preprocessing_unit,
             )
 
         except Exception as e:
@@ -1032,6 +1513,10 @@ class TrainingService:
                 job.started_at = datetime.now()
                 job.progress = 0.0
                 job.error_message = None
+                self._reset_epoch_metrics_history(
+                    job,
+                    total_epochs=int(parameters.get("epochs", job.epochs or 0)),
+                )
 
             if model_type == "lrcn":
                 run_mode = "sequence"
@@ -1132,6 +1617,15 @@ class TrainingService:
         feature_projection_size = max(32, feature_projection_size)
         uses_temporal_context = self._dataset_has_temporal_media(dataset_path)
         training_mode = "video_hybrid" if uses_temporal_context else "image"
+        preprocessing_progress_end = 25.0
+        training_progress_span = 99.0 - preprocessing_progress_end
+        preprocessing_reporter = self._create_phase_progress_reporter(
+            job_id,
+            0.0,
+            preprocessing_progress_end,
+            epochs,
+            current_epoch=0,
+        )
 
         self._set_active_job_metadata(
             job_id,
@@ -1167,12 +1661,10 @@ class TrainingService:
         )
 
         if uses_temporal_context:
-            self._set_active_job_metadata(
-                job_id,
-                {
-                    "message": f"正在准备视频时序样本（长度 {sequence_length}，步长 {frame_stride}）",
-                    "mode": training_mode,
-                },
+            preprocessing_reporter(
+                0.05,
+                f"正在准备视频时序样本（长度 {sequence_length}，步长 {frame_stride}）",
+                {"stage": "prepare_temporal_dataset", "unit": "phase"},
             )
             train_loader, val_loader = self._build_temporal_dataloaders(
                 dataset_path,
@@ -1180,6 +1672,7 @@ class TrainingService:
                 validation_split,
                 sequence_length,
                 frame_stride,
+                progress_callback=preprocessing_reporter,
             )
             model = create_model(
                 model_type=model_type,
@@ -1191,14 +1684,28 @@ class TrainingService:
                 feature_projection_size=feature_projection_size,
             ).to(device)
         else:
+            preprocessing_reporter(
+                0.05,
+                "正在扫描训练数据集并整理样本",
+                {"stage": "scan_dataset", "unit": "phase"},
+            )
             train_loader, val_loader = self._build_dataloaders(
-                dataset_path, batch_size, validation_split
+                dataset_path,
+                batch_size,
+                validation_split,
+                progress_callback=preprocessing_reporter,
             )
             model = create_model(
                 model_type=model_type,
                 num_classes=2,
                 pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
             ).to(device)
+
+        preprocessing_reporter(
+            1.0,
+            "数据集准备完成，开始训练",
+            {"stage": "dataset_ready", "current": 1, "total": 1, "unit": "phase"},
+        )
 
         channels_last = device.type == "cuda" and not uses_temporal_context
         if channels_last:
@@ -1236,8 +1743,10 @@ class TrainingService:
                 _running_accuracy: float,
             ):
                 incremental_progress = (
-                    ((epoch - 1) + (batch_index / max(batch_total, 1))) / epochs
-                ) * 100.0
+                    preprocessing_progress_end
+                    + (((epoch - 1) + (batch_index / max(batch_total, 1))) / epochs)
+                    * training_progress_span
+                )
                 self._update_running_progress(
                     job_id,
                     incremental_progress,
@@ -1274,7 +1783,9 @@ class TrainingService:
                 channels_last=channels_last,
             )
 
-            progress = (epoch / epochs) * 100.0
+            progress = preprocessing_progress_end + (
+                (epoch / epochs) * training_progress_span
+            )
             self._update_epoch_metrics(
                 job_id,
                 progress,
@@ -1283,6 +1794,15 @@ class TrainingService:
                 epoch=epoch,
                 total_epochs=epochs,
                 message=f"{epoch_prefix} {epoch}/{epochs} completed",
+            )
+            self._record_epoch_metrics(
+                job_id,
+                epoch,
+                train_loss,
+                train_accuracy,
+                val_loss,
+                val_accuracy,
+                learning_rate,
             )
 
             logger.info(
@@ -1373,14 +1893,27 @@ class TrainingService:
         if frame_stride <= 0:
             raise ValueError("frame_stride must be greater than 0")
         frame_projection_size = max(32, frame_projection_size)
+        preprocessing_progress_end = 25.0
+        training_progress_span = 99.0 - preprocessing_progress_end
+        preprocessing_reporter = self._create_phase_progress_reporter(
+            job_id,
+            0.0,
+            preprocessing_progress_end,
+            epochs,
+            current_epoch=0,
+        )
 
         self._set_active_job_metadata(
             job_id,
             {
                 "total_epochs": epochs,
                 "mode": "sequence",
-                "message": f"正在准备视频片段（长度 {sequence_length}，步长 {frame_stride}）",
             },
+        )
+        preprocessing_reporter(
+            0.05,
+            f"正在准备视频片段（长度 {sequence_length}，步长 {frame_stride}）",
+            {"stage": "prepare_sequence_dataset", "unit": "phase"},
         )
 
         device = self._resolve_training_device(training_device)
@@ -1403,7 +1936,22 @@ class TrainingService:
             requested_device=training_device,
         )
         train_loader, val_loader = self._build_sequence_dataloaders(
-            dataset_path, batch_size, validation_split, sequence_length, frame_stride
+            dataset_path,
+            batch_size,
+            validation_split,
+            sequence_length,
+            frame_stride,
+            progress_callback=preprocessing_reporter,
+        )
+        preprocessing_reporter(
+            1.0,
+            "视频片段准备完成，开始训练",
+            {
+                "stage": "sequence_dataset_ready",
+                "current": 1,
+                "total": 1,
+                "unit": "phase",
+            },
         )
 
         model = create_model(
@@ -1447,8 +1995,10 @@ class TrainingService:
                 _running_accuracy: float,
             ):
                 incremental_progress = (
-                    ((epoch - 1) + (batch_index / max(batch_total, 1))) / epochs
-                ) * 100.0
+                    preprocessing_progress_end
+                    + (((epoch - 1) + (batch_index / max(batch_total, 1))) / epochs)
+                    * training_progress_span
+                )
                 self._update_running_progress(
                     job_id,
                     incremental_progress,
@@ -1483,7 +2033,9 @@ class TrainingService:
                 amp_enabled=amp_enabled,
             )
 
-            progress = (epoch / epochs) * 100.0
+            progress = preprocessing_progress_end + (
+                (epoch / epochs) * training_progress_span
+            )
             self._update_epoch_metrics(
                 job_id,
                 progress,
@@ -1492,6 +2044,15 @@ class TrainingService:
                 epoch=epoch,
                 total_epochs=epochs,
                 message=f"Sequence epoch {epoch}/{epochs} completed",
+            )
+            self._record_epoch_metrics(
+                job_id,
+                epoch,
+                train_loss,
+                train_accuracy,
+                val_loss,
+                val_accuracy,
+                learning_rate,
             )
 
             logger.info(
@@ -1594,13 +2155,26 @@ class TrainingService:
         )
 
     def _build_dataloaders(
-        self, dataset_path: str, batch_size: int, validation_split: float
+        self,
+        dataset_path: str,
+        batch_size: int,
+        validation_split: float,
+        progress_callback: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ] = None,
     ) -> Tuple[DataLoader, DataLoader]:
         """Build train/validation dataloaders from image dataset path."""
         root_path = Path(dataset_path).expanduser()
         if not root_path.exists() or not root_path.is_dir():
             raise ValueError(
                 f"Dataset path does not exist or is not a directory: {dataset_path}"
+            )
+
+        if progress_callback is not None:
+            progress_callback(
+                0.05,
+                "正在扫描数据集目录",
+                {"stage": "scan_dataset", "unit": "phase"},
             )
 
         input_size = int(settings.MODEL_INPUT_SIZE)
@@ -1626,13 +2200,31 @@ class TrainingService:
 
         split_dirs = self._find_split_dirs(root_path)
         if split_dirs:
+            if progress_callback is not None:
+                progress_callback(
+                    0.15,
+                    "检测到 train/val 划分，正在收集训练样本",
+                    {"stage": "collect_train_samples", "unit": "phase"},
+                )
             train_samples = self._collect_labeled_media_samples(
                 split_dirs["train"], split_dirs["train"]
             )
+            if progress_callback is not None:
+                progress_callback(
+                    0.25,
+                    "正在收集验证样本",
+                    {"stage": "collect_val_samples", "unit": "phase"},
+                )
             val_samples = self._collect_labeled_media_samples(
                 split_dirs["val"], split_dirs["val"]
             )
         else:
+            if progress_callback is not None:
+                progress_callback(
+                    0.15,
+                    "正在收集图像与视频源",
+                    {"stage": "collect_media_sources", "unit": "phase"},
+                )
             image_sources = self._collect_labeled_images(root_path, root_path)
             video_sources = self._collect_labeled_videos(root_path, root_path)
             total_sources = len(image_sources) + len(video_sources)
@@ -1666,7 +2258,19 @@ class TrainingService:
 
             train_entries = shuffled[:train_size]
             val_entries = shuffled[train_size:]
+            if progress_callback is not None:
+                progress_callback(
+                    0.3,
+                    "正在展开训练集视频采样帧",
+                    {"stage": "expand_train_video_samples", "unit": "phase"},
+                )
             train_samples = self._expand_media_sources(train_entries)
+            if progress_callback is not None:
+                progress_callback(
+                    0.4,
+                    "正在展开验证集视频采样帧",
+                    {"stage": "expand_val_video_samples", "unit": "phase"},
+                )
             val_samples = self._expand_media_sources(val_entries)
 
         if not train_samples:
@@ -1674,10 +2278,31 @@ class TrainingService:
         if not val_samples:
             raise ValueError("No labeled validation samples found")
 
-        train_samples = self._materialize_video_backed_samples(
-            train_samples, input_size
+        train_cache_progress = self._chain_progress_reporter(
+            progress_callback, 0.45, 0.75
         )
-        val_samples = self._materialize_video_backed_samples(val_samples, input_size)
+        val_cache_progress = self._chain_progress_reporter(
+            progress_callback, 0.75, 0.92
+        )
+        train_samples = self._materialize_video_backed_samples(
+            train_samples,
+            input_size,
+            progress_callback=train_cache_progress,
+            progress_label="正在缓存训练集视频帧",
+        )
+        val_samples = self._materialize_video_backed_samples(
+            val_samples,
+            input_size,
+            progress_callback=val_cache_progress,
+            progress_label="正在缓存验证集视频帧",
+        )
+
+        if progress_callback is not None:
+            progress_callback(
+                0.96,
+                "正在构建 DataLoader",
+                {"stage": "build_dataloader", "unit": "phase"},
+            )
 
         train_dataset = ImageClassificationDataset(
             train_samples, transform=train_transform
@@ -1699,6 +2324,18 @@ class TrainingService:
             **val_loader_kwargs,
         )
 
+        if progress_callback is not None:
+            progress_callback(
+                1.0,
+                f"数据集准备完成：训练样本 {len(train_dataset)}，验证样本 {len(val_dataset)}",
+                {
+                    "stage": "dataset_ready",
+                    "current": len(train_dataset) + len(val_dataset),
+                    "total": len(train_dataset) + len(val_dataset),
+                    "unit": "samples",
+                },
+            )
+
         return train_loader, val_loader
 
     def _build_sequence_dataloaders(
@@ -1708,6 +2345,9 @@ class TrainingService:
         validation_split: float,
         sequence_length: int,
         frame_stride: int,
+        progress_callback: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ] = None,
     ) -> Tuple[DataLoader, DataLoader]:
         """Build train/validation dataloaders for frame sequence clips."""
         return self._build_temporal_dataloaders(
@@ -1716,6 +2356,7 @@ class TrainingService:
             validation_split,
             sequence_length,
             frame_stride,
+            progress_callback=progress_callback,
         )
 
     def _build_temporal_dataloaders(
@@ -1725,12 +2366,22 @@ class TrainingService:
         validation_split: float,
         sequence_length: int,
         frame_stride: int,
+        progress_callback: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ] = None,
     ) -> Tuple[DataLoader, DataLoader]:
         """Build temporal dataloaders from mixed image/video datasets."""
         root_path = Path(dataset_path).expanduser()
         if not root_path.exists() or not root_path.is_dir():
             raise ValueError(
                 f"Dataset path does not exist or is not a directory: {dataset_path}"
+            )
+
+        if progress_callback is not None:
+            progress_callback(
+                0.05,
+                "正在扫描时序数据集目录",
+                {"stage": "scan_temporal_dataset", "unit": "phase"},
             )
 
         input_size = int(settings.MODEL_INPUT_SIZE)
@@ -1755,13 +2406,31 @@ class TrainingService:
 
         split_dirs = self._find_split_dirs(root_path)
         if split_dirs:
+            if progress_callback is not None:
+                progress_callback(
+                    0.15,
+                    "检测到 train/val 划分，正在收集视频源",
+                    {"stage": "collect_train_temporal_sources", "unit": "phase"},
+                )
             train_sources = self._collect_temporal_training_sources(
                 split_dirs["train"], split_dirs["train"]
             )
+            if progress_callback is not None:
+                progress_callback(
+                    0.28,
+                    "正在收集验证视频源",
+                    {"stage": "collect_val_temporal_sources", "unit": "phase"},
+                )
             val_sources = self._collect_temporal_training_sources(
                 split_dirs["val"], split_dirs["val"]
             )
         else:
+            if progress_callback is not None:
+                progress_callback(
+                    0.15,
+                    "正在收集图像/视频时序源",
+                    {"stage": "collect_temporal_sources", "unit": "phase"},
+                )
             all_sources = self._collect_temporal_training_sources(root_path, root_path)
             if len(all_sources) < 2:
                 raise ValueError(
@@ -1781,17 +2450,25 @@ class TrainingService:
             train_sources = shuffled[:train_size]
             val_sources = shuffled[train_size:]
 
+        train_clip_progress = self._chain_progress_reporter(
+            progress_callback, 0.35, 0.72
+        )
+        val_clip_progress = self._chain_progress_reporter(progress_callback, 0.72, 0.93)
         train_samples = self._expand_temporal_sources_to_clips(
             train_sources,
             sequence_length,
             frame_stride,
             input_size,
+            progress_callback=train_clip_progress,
+            progress_label="正在生成训练集时序片段",
         )
         val_samples = self._expand_temporal_sources_to_clips(
             val_sources,
             sequence_length,
             frame_stride,
             input_size,
+            progress_callback=val_clip_progress,
+            progress_label="正在生成验证集时序片段",
         )
 
         if not train_samples:
@@ -1805,6 +2482,13 @@ class TrainingService:
         val_dataset = SequenceClassificationDataset(
             val_samples, transform=val_transform
         )
+
+        if progress_callback is not None:
+            progress_callback(
+                0.96,
+                "正在构建时序 DataLoader",
+                {"stage": "build_temporal_dataloader", "unit": "phase"},
+            )
 
         loader_kwargs = self._dataloader_kwargs(len(train_dataset))
         train_loader = DataLoader(
@@ -1820,6 +2504,18 @@ class TrainingService:
             shuffle=False,
             **val_loader_kwargs,
         )
+
+        if progress_callback is not None:
+            progress_callback(
+                1.0,
+                f"时序数据准备完成：训练片段 {len(train_dataset)}，验证片段 {len(val_dataset)}",
+                {
+                    "stage": "temporal_dataset_ready",
+                    "current": len(train_dataset) + len(val_dataset),
+                    "total": len(train_dataset) + len(val_dataset),
+                    "unit": "clips",
+                },
+            )
 
         return train_loader, val_loader
 
@@ -1877,10 +2573,21 @@ class TrainingService:
         sequence_length: int,
         frame_stride: int,
         input_size: int,
+        progress_callback: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ] = None,
+        progress_label: str = "正在生成时序片段",
     ) -> List[Tuple[List[str], int]]:
         """Expand mixed temporal sources into fixed-length clips."""
         clips: List[Tuple[List[str], int]] = []
-        for source in sources:
+        total_sources = len(sources)
+        progress_interval = max(1, total_sources // 20) if total_sources else 1
+
+        for index, source in enumerate(sources, start=1):
+            source_path = source.path or (
+                source.frame_paths[0] if source.frame_paths else ""
+            )
+            source_name = Path(source_path).name if source_path else f"source-{index}"
             if source.kind == "image" and source.path:
                 clips.append(([source.path] * sequence_length, source.label))
             elif source.kind == "frame_group" and source.frame_paths:
@@ -1893,6 +2600,11 @@ class TrainingService:
                     )
                 )
             elif source.kind == "video" and source.path:
+                source_progress = self._chain_progress_reporter(
+                    progress_callback,
+                    (index - 1) / max(total_sources, 1),
+                    index / max(total_sources, 1),
+                )
                 clips.extend(
                     self._build_clips_from_raw_video(
                         source.path,
@@ -1900,7 +2612,22 @@ class TrainingService:
                         sequence_length,
                         frame_stride,
                         input_size,
+                        progress_callback=source_progress,
+                        progress_label=f"{progress_label}：{source_name}",
                     )
+                )
+                continue
+
+            if progress_callback and (
+                index == 1 or index % progress_interval == 0 or index == total_sources
+            ):
+                self._report_indexed_progress(
+                    progress_callback,
+                    index,
+                    total_sources,
+                    f"{progress_label}：{index}/{total_sources}（当前 {source_name}）",
+                    stage="expand_temporal_sources",
+                    unit="sources",
                 )
         return clips
 
@@ -1952,6 +2679,10 @@ class TrainingService:
         sequence_length: int,
         frame_stride: int,
         input_size: int,
+        progress_callback: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ] = None,
+        progress_label: str = "正在从原始视频取帧",
     ) -> List[Tuple[List[str], int]]:
         """Build cached clip samples directly from a raw video file."""
         capture = cv2.VideoCapture(video_path)
@@ -1969,11 +2700,15 @@ class TrainingService:
         cache_root = self._video_frame_cache_root(input_size)
         cache_root.mkdir(parents=True, exist_ok=True)
         clips: List[Tuple[List[str], int]] = []
-        for clip_indices in self._sample_video_clip_indices(
+        sampled_clips = self._sample_video_clip_indices(
             frame_count,
             sequence_length,
             frame_stride,
-        ):
+        )
+        total_clips = len(sampled_clips)
+        progress_interval = max(1, total_clips // 20) if total_clips else 1
+
+        for clip_index, clip_indices in enumerate(sampled_clips, start=1):
             frame_paths: List[str] = []
             for frame_index in clip_indices:
                 try:
@@ -1997,6 +2732,20 @@ class TrainingService:
 
             if frame_paths:
                 clips.append((frame_paths, label))
+
+            if progress_callback and (
+                clip_index == 1
+                or clip_index % progress_interval == 0
+                or clip_index == total_clips
+            ):
+                self._report_indexed_progress(
+                    progress_callback,
+                    clip_index,
+                    total_clips,
+                    f"{progress_label}：片段 {clip_index}/{total_clips}",
+                    stage="extract_video_clips",
+                    unit="clips",
+                )
 
         return clips
 
@@ -2511,6 +3260,11 @@ class TrainingService:
         current_epoch = active_meta.get("current_epoch")
         total_epochs = active_meta.get("total_epochs", job.epochs)
         progress_message = active_meta.get("message")
+        preprocessing_stage = active_meta.get("preprocessing_stage")
+        preprocessing_progress = active_meta.get("preprocessing_progress")
+        preprocessing_current = active_meta.get("preprocessing_current")
+        preprocessing_total = active_meta.get("preprocessing_total")
+        preprocessing_unit = active_meta.get("preprocessing_unit")
 
         if current_epoch is None and job.status == JobStatus.COMPLETED.value:
             current_epoch = job.epochs
@@ -2554,6 +3308,11 @@ class TrainingService:
             current_epoch=current_epoch,
             total_epochs=total_epochs,
             progress_message=progress_message,
+            preprocessing_stage=preprocessing_stage,
+            preprocessing_progress=preprocessing_progress,
+            preprocessing_current=preprocessing_current,
+            preprocessing_total=preprocessing_total,
+            preprocessing_unit=preprocessing_unit,
             parameters=parameters,
             status=self._normalize_job_status(job.status),
             progress=job.progress if job.progress is not None else 0.0,
