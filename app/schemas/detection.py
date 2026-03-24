@@ -81,6 +81,7 @@ class DetectionResponse(BaseModel):
     """Schema for detection response"""
 
     success: bool
+    record_id: Optional[int] = None
     file_info: Dict[str, Any]
     result: Optional[DetectionResult] = None
     error_message: Optional[str] = None
@@ -184,6 +185,7 @@ class VideoDetectionResponse(BaseModel):
     """Schema for video detection response"""
 
     success: bool
+    record_id: Optional[int] = None
     video_info: Dict[str, Any]
     aggregated_result: Optional[DetectionResult] = None
     frame_results: Optional[List[FrameDetectionResult]] = None

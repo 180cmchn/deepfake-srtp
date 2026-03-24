@@ -111,6 +111,7 @@ class DetectionService:
 
             return DetectionResponse(
                 success=True,
+                record_id=db_result.id,
                 file_info={
                     "name": file_name,
                     "type": file_type,
@@ -130,6 +131,7 @@ class DetectionService:
 
             return DetectionResponse(
                 success=False,
+                record_id=None,
                 file_info={"name": os.path.basename(file_path)},
                 error_message=str(e),
                 processing_time=processing_time,
@@ -154,15 +156,8 @@ class DetectionService:
 
             async def process_file(file_path):
                 async with semaphore:
-                    detection_request = DetectionRequest(
-                        model_id=request.model_id,
-                        model_type=request.model_type,
-                        confidence_threshold=request.confidence_threshold,
-                        return_probabilities=request.return_probabilities,
-                        preprocess=request.preprocess,
-                    )
-                    return await self.detect_file(
-                        file_path, detection_request, background_tasks
+                    return await self._detect_batch_file(
+                        file_path, request, background_tasks
                     )
 
             tasks = [process_file(path) for path in file_paths]
@@ -170,15 +165,8 @@ class DetectionService:
         else:
             # Process sequentially
             for file_path in file_paths:
-                detection_request = DetectionRequest(
-                    model_id=request.model_id,
-                    model_type=request.model_type,
-                    confidence_threshold=request.confidence_threshold,
-                    return_probabilities=request.return_probabilities,
-                    preprocess=request.preprocess,
-                )
-                result = await self.detect_file(
-                    file_path, detection_request, background_tasks
+                result = await self._detect_batch_file(
+                    file_path, request, background_tasks
                 )
                 results.append(result)
 
@@ -213,6 +201,36 @@ class DetectionService:
             processing_time=processing_time,
             created_at=time.time(),
         )
+
+    async def _detect_batch_file(
+        self,
+        file_path: str,
+        request: BatchDetectionRequest,
+        background_tasks: BackgroundTasks,
+    ) -> DetectionResponse:
+        """Detect a single file inside batch mode, including videos."""
+        file_type = self._get_file_type(file_path)
+        if file_type == "video":
+            video_request = VideoDetectionRequest(
+                video_path=file_path,
+                model_id=request.model_id,
+                model_type=request.model_type,
+                confidence_threshold=request.confidence_threshold,
+                preprocess=request.preprocess,
+            )
+            video_response = await self.detect_video(
+                file_path, video_request, background_tasks
+            )
+            return self._video_response_to_detection_response(video_response)
+
+        detection_request = DetectionRequest(
+            model_id=request.model_id,
+            model_type=request.model_type,
+            confidence_threshold=request.confidence_threshold,
+            return_probabilities=request.return_probabilities,
+            preprocess=request.preprocess,
+        )
+        return await self.detect_file(file_path, detection_request, background_tasks)
 
     async def detect_video(
         self,
@@ -320,23 +338,34 @@ class DetectionService:
                 "prediction_distribution": self._count_predictions_list(predictions),
             }
 
+            detection_result = DetectionResultSchema(
+                prediction=aggregated_prediction,
+                confidence=aggregated_confidence,
+                processing_time=processing_time,
+                model_info={
+                    "model_id": loaded_model.get("model_id"),
+                    "model_name": loaded_model.get("model_name"),
+                    "model_type": loaded_model["model_type"],
+                    "input_size": loaded_model.get(
+                        "input_size", settings.MODEL_INPUT_SIZE
+                    ),
+                    "source": loaded_model.get("source"),
+                },
+            )
+
+            db_result = await self._save_detection_result(
+                file_path=video_path,
+                file_name=file_name,
+                file_type="video",
+                result=detection_result,
+                model_id=request.model_id,
+            )
+
             return VideoDetectionResponse(
                 success=True,
+                record_id=db_result.id,
                 video_info=video_info,
-                aggregated_result=DetectionResultSchema(
-                    prediction=aggregated_prediction,
-                    confidence=aggregated_confidence,
-                    processing_time=processing_time,
-                    model_info={
-                        "model_id": loaded_model.get("model_id"),
-                        "model_name": loaded_model.get("model_name"),
-                        "model_type": loaded_model["model_type"],
-                        "input_size": loaded_model.get(
-                            "input_size", settings.MODEL_INPUT_SIZE
-                        ),
-                        "source": loaded_model.get("source"),
-                    },
-                )
+                aggregated_result=detection_result
                 if request.aggregate_results
                 else None,
                 frame_results=frame_results
@@ -344,7 +373,7 @@ class DetectionService:
                 else None,
                 summary=summary,
                 processing_time=processing_time,
-                created_at=time.time(),
+                created_at=db_result.created_at,
             )
 
         except Exception as e:
@@ -353,6 +382,7 @@ class DetectionService:
 
             return VideoDetectionResponse(
                 success=False,
+                record_id=None,
                 video_info={"name": os.path.basename(video_path)},
                 summary={},
                 processing_time=processing_time,
@@ -831,6 +861,32 @@ class DetectionService:
         self.db.refresh(db_result)
 
         return db_result
+
+    def _video_response_to_detection_response(
+        self, response: VideoDetectionResponse
+    ) -> DetectionResponse:
+        """Convert video detection responses to the generic detection shape."""
+        detection_result = response.aggregated_result
+        if detection_result is None and response.frame_results:
+            detection_result = response.frame_results[0].result
+
+        return DetectionResponse(
+            success=response.success,
+            record_id=response.record_id,
+            file_info={
+                "name": response.video_info.get("name"),
+                "type": "video",
+                "size": response.video_info.get("size"),
+                "resolution": None,
+                "total_frames": response.video_info.get("total_frames"),
+                "processed_frames": response.video_info.get("processed_frames"),
+                "duration": response.video_info.get("duration"),
+            },
+            result=detection_result,
+            error_message=None if response.success else "Video detection failed",
+            processing_time=response.processing_time,
+            created_at=response.created_at,
+        )
 
     async def _cleanup_file(self, file_path: str):
         """Clean up temporary file"""
