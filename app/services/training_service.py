@@ -70,6 +70,14 @@ class MediaClassificationSample:
     frame_index: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class TemporalMediaSource:
+    kind: str
+    label: int
+    path: Optional[str] = None
+    frame_paths: Optional[List[str]] = None
+
+
 class TrainingCancelledError(Exception):
     """Raised when a training job is cancelled during execution."""
 
@@ -1006,6 +1014,8 @@ class TrainingService:
     async def _run_training(self, job_id: int, parameters: Dict[str, Any]):
         """Run training job in background."""
         model_type = None
+        dataset_path = None
+        run_mode = "image"
         try:
             with get_db_session() as db:
                 job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
@@ -1017,22 +1027,34 @@ class TrainingService:
                     return
 
                 model_type = job.model_type
+                dataset_path = job.dataset_path
                 job.status = JobStatus.RUNNING.value
                 job.started_at = datetime.now()
                 job.progress = 0.0
                 job.error_message = None
 
-            mode = "sequence" if model_type == "lrcn" else "image"
+            if model_type == "lrcn":
+                run_mode = "sequence"
+            elif dataset_path and self._dataset_has_temporal_media(dataset_path):
+                run_mode = "video_hybrid"
+            else:
+                run_mode = "image"
             self._set_active_job_metadata(
                 job_id,
                 {
                     "status": JobStatus.RUNNING.value,
-                    "mode": mode,
+                    "mode": run_mode,
                     "total_epochs": int(parameters.get("epochs", 0)),
                     "current_epoch": 0,
                     "current_loss": None,
                     "current_accuracy": None,
-                    "message": f"开始{'时序' if mode == 'sequence' else '图像'}训练",
+                    "message": "开始时序训练"
+                    if run_mode == "sequence"
+                    else (
+                        "开始视频时序融合训练"
+                        if run_mode == "video_hybrid"
+                        else "开始图像训练"
+                    ),
                 },
             )
 
@@ -1092,21 +1114,46 @@ class TrainingService:
             learning_rate = float(parameters.get("learning_rate", job.learning_rate))
             batch_size = int(parameters.get("batch_size", job.batch_size))
             validation_split = float(parameters.get("validation_split", 0.2))
+            sequence_length = int(parameters.get("sequence_length", 8))
+            frame_stride = int(parameters.get("frame_stride", 2))
+            temporal_hidden_size = int(parameters.get("temporal_hidden_size", 256))
+            temporal_num_layers = int(parameters.get("temporal_num_layers", 2))
+            feature_projection_size = int(
+                parameters.get("feature_projection_size", 256)
+            )
             training_device = str(
                 parameters.get("training_device", settings.TRAINING_DEVICE)
             )
 
-        self._set_active_job_metadata(job_id, {"total_epochs": epochs, "mode": "image"})
+        sequence_length = max(2, sequence_length)
+        frame_stride = max(1, frame_stride)
+        temporal_hidden_size = max(32, temporal_hidden_size)
+        temporal_num_layers = max(1, temporal_num_layers)
+        feature_projection_size = max(32, feature_projection_size)
+        uses_temporal_context = self._dataset_has_temporal_media(dataset_path)
+        training_mode = "video_hybrid" if uses_temporal_context else "image"
+
+        self._set_active_job_metadata(
+            job_id,
+            {
+                "total_epochs": epochs,
+                "mode": training_mode,
+            },
+        )
 
         device = self._resolve_training_device(training_device)
         self._configure_acceleration_backend(device)
-        batch_size = self._tune_batch_size(batch_size, device, sequence_mode=False)
+        batch_size = self._tune_batch_size(
+            batch_size, device, sequence_mode=uses_temporal_context
+        )
         self._set_active_job_metadata(
             job_id,
             {
                 "device": str(device),
                 "effective_batch_size": batch_size,
                 "requested_device": training_device,
+                "sequence_length": sequence_length if uses_temporal_context else None,
+                "frame_stride": frame_stride if uses_temporal_context else None,
             },
         )
         logger.info(
@@ -1116,17 +1163,44 @@ class TrainingService:
             batch_size=batch_size,
             apple_silicon=self._is_apple_silicon(),
             requested_device=training_device,
-        )
-        train_loader, val_loader = self._build_dataloaders(
-            dataset_path, batch_size, validation_split
+            uses_temporal_context=uses_temporal_context,
         )
 
-        model = create_model(
-            model_type=model_type,
-            num_classes=2,
-            pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
-        ).to(device)
-        channels_last = device.type == "cuda" and model_type != "lrcn"
+        if uses_temporal_context:
+            self._set_active_job_metadata(
+                job_id,
+                {
+                    "message": f"正在准备视频时序样本（长度 {sequence_length}，步长 {frame_stride}）",
+                    "mode": training_mode,
+                },
+            )
+            train_loader, val_loader = self._build_temporal_dataloaders(
+                dataset_path,
+                batch_size,
+                validation_split,
+                sequence_length,
+                frame_stride,
+            )
+            model = create_model(
+                model_type=model_type,
+                num_classes=2,
+                pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
+                video_temporal_enabled=True,
+                temporal_hidden_size=temporal_hidden_size,
+                temporal_num_layers=temporal_num_layers,
+                feature_projection_size=feature_projection_size,
+            ).to(device)
+        else:
+            train_loader, val_loader = self._build_dataloaders(
+                dataset_path, batch_size, validation_split
+            )
+            model = create_model(
+                model_type=model_type,
+                num_classes=2,
+                pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
+            ).to(device)
+
+        channels_last = device.type == "cuda" and not uses_temporal_context
         if channels_last:
             model = model.to(memory_format=torch.channels_last)
         amp_enabled = device.type == "cuda"
@@ -1145,6 +1219,7 @@ class TrainingService:
 
         best_val_accuracy = -1.0
         best_val_loss = None
+        epoch_prefix = "视频时序融合" if uses_temporal_context else "Epoch"
 
         for epoch in range(1, epochs + 1):
             if self._is_job_cancelled(job_id):
@@ -1168,7 +1243,7 @@ class TrainingService:
                     incremental_progress,
                     epoch=epoch,
                     total_epochs=epochs,
-                    message=f"Epoch {epoch}/{epochs} 训练中（批次 {batch_index}/{batch_total}）",
+                    message=f"{epoch_prefix} {epoch}/{epochs} 训练中（批次 {batch_index}/{batch_total}）",
                 )
 
             train_loss, train_accuracy = self._run_train_epoch(
@@ -1185,7 +1260,7 @@ class TrainingService:
             self._set_active_job_metadata(
                 job_id,
                 {
-                    "message": f"Epoch {epoch}/{epochs} 验证中",
+                    "message": f"{epoch_prefix} {epoch}/{epochs} 验证中",
                     "current_epoch": epoch,
                     "total_epochs": epochs,
                 },
@@ -1207,7 +1282,7 @@ class TrainingService:
                 val_loss,
                 epoch=epoch,
                 total_epochs=epochs,
-                message=f"Epoch {epoch}/{epochs} completed",
+                message=f"{epoch_prefix} {epoch}/{epochs} completed",
             )
 
             logger.info(
@@ -1228,31 +1303,41 @@ class TrainingService:
                 self._set_active_job_metadata(
                     job_id,
                     {
-                        "message": f"Epoch {epoch}/{epochs} 正在保存最佳模型",
+                        "message": f"{epoch_prefix} {epoch}/{epochs} 正在保存最佳模型",
                         "current_epoch": epoch,
                         "total_epochs": epochs,
                     },
                 )
-                torch.save(
-                    {
-                        "job_id": job_id,
-                        "model_type": model_type,
-                        "epoch": epoch,
-                        "epochs": epochs,
-                        "learning_rate": learning_rate,
-                        "batch_size": batch_size,
-                        "validation_split": validation_split,
-                        "training_device": training_device,
-                        "num_classes": 2,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "val_accuracy": val_accuracy,
-                        "val_loss": val_loss,
-                        "input_size": settings.MODEL_INPUT_SIZE,
-                        "saved_at": datetime.now().isoformat(),
-                    },
-                    str(best_checkpoint_path),
-                )
+                checkpoint_payload = {
+                    "job_id": job_id,
+                    "model_type": model_type,
+                    "epoch": epoch,
+                    "epochs": epochs,
+                    "learning_rate": learning_rate,
+                    "batch_size": batch_size,
+                    "validation_split": validation_split,
+                    "training_device": training_device,
+                    "num_classes": 2,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_accuracy": val_accuracy,
+                    "val_loss": val_loss,
+                    "input_size": settings.MODEL_INPUT_SIZE,
+                    "video_temporal_enabled": uses_temporal_context,
+                    "training_mode": training_mode,
+                    "saved_at": datetime.now().isoformat(),
+                }
+                if uses_temporal_context:
+                    checkpoint_payload.update(
+                        {
+                            "sequence_length": sequence_length,
+                            "frame_stride": frame_stride,
+                            "temporal_hidden_size": temporal_hidden_size,
+                            "temporal_num_layers": temporal_num_layers,
+                            "feature_projection_size": feature_projection_size,
+                        }
+                    )
+                torch.save(checkpoint_payload, str(best_checkpoint_path))
 
         self._finalize_successful_training(
             job_id,
@@ -1278,6 +1363,7 @@ class TrainingService:
             frame_stride = int(parameters.get("frame_stride", 1))
             hidden_size = int(parameters.get("hidden_size", 512))
             num_layers = int(parameters.get("num_layers", 2))
+            frame_projection_size = int(parameters.get("frame_projection_size", 256))
             training_device = str(
                 parameters.get("training_device", settings.TRAINING_DEVICE)
             )
@@ -1286,6 +1372,7 @@ class TrainingService:
             raise ValueError("sequence_length must be greater than 0")
         if frame_stride <= 0:
             raise ValueError("frame_stride must be greater than 0")
+        frame_projection_size = max(32, frame_projection_size)
 
         self._set_active_job_metadata(
             job_id,
@@ -1325,6 +1412,7 @@ class TrainingService:
             input_size=25088,
             hidden_size=hidden_size,
             num_layers=num_layers,
+            frame_projection_size=frame_projection_size,
             pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
         ).to(device)
         amp_enabled = device.type == "cuda"
@@ -1445,6 +1533,7 @@ class TrainingService:
                         "hidden_size": hidden_size,
                         "num_layers": num_layers,
                         "feature_input_size": 25088,
+                        "frame_projection_size": frame_projection_size,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "val_accuracy": val_accuracy,
@@ -1452,6 +1541,8 @@ class TrainingService:
                         "input_size": settings.MODEL_INPUT_SIZE,
                         "sequence_length": sequence_length,
                         "frame_stride": frame_stride,
+                        "video_temporal_enabled": True,
+                        "training_mode": "sequence_temporal",
                         "saved_at": datetime.now().isoformat(),
                     },
                     str(best_checkpoint_path),
@@ -1619,6 +1710,23 @@ class TrainingService:
         frame_stride: int,
     ) -> Tuple[DataLoader, DataLoader]:
         """Build train/validation dataloaders for frame sequence clips."""
+        return self._build_temporal_dataloaders(
+            dataset_path,
+            batch_size,
+            validation_split,
+            sequence_length,
+            frame_stride,
+        )
+
+    def _build_temporal_dataloaders(
+        self,
+        dataset_path: str,
+        batch_size: int,
+        validation_split: float,
+        sequence_length: int,
+        frame_stride: int,
+    ) -> Tuple[DataLoader, DataLoader]:
+        """Build temporal dataloaders from mixed image/video datasets."""
         root_path = Path(dataset_path).expanduser()
         if not root_path.exists() or not root_path.is_dir():
             raise ValueError(
@@ -1647,47 +1755,44 @@ class TrainingService:
 
         split_dirs = self._find_split_dirs(root_path)
         if split_dirs:
-            train_videos = self._collect_labeled_video_groups(
+            train_sources = self._collect_temporal_training_sources(
                 split_dirs["train"], split_dirs["train"]
             )
-            val_videos = self._collect_labeled_video_groups(
+            val_sources = self._collect_temporal_training_sources(
                 split_dirs["val"], split_dirs["val"]
             )
         else:
-            all_videos = self._collect_labeled_video_groups(root_path, root_path)
-            if len(all_videos) < 2:
+            all_sources = self._collect_temporal_training_sources(root_path, root_path)
+            if len(all_sources) < 2:
                 raise ValueError(
-                    "Dataset must contain at least 2 labeled video groups for train/validation split"
+                    "Dataset must contain at least 2 labeled image/video sources for train/validation split"
                 )
 
             validation_split = max(0.0, min(0.9, validation_split))
-            val_size = max(1, int(len(all_videos) * validation_split))
-            train_size = len(all_videos) - val_size
+            val_size = max(1, int(len(all_sources) * validation_split))
+            train_size = len(all_sources) - val_size
             if train_size <= 0:
-                train_size = len(all_videos) - 1
+                train_size = len(all_sources) - 1
                 val_size = 1
 
             generator = torch.Generator().manual_seed(42)
-            indices = torch.randperm(len(all_videos), generator=generator).tolist()
-            shuffled = [all_videos[idx] for idx in indices]
-            train_videos = shuffled[:train_size]
-            val_videos = shuffled[train_size:]
+            indices = torch.randperm(len(all_sources), generator=generator).tolist()
+            shuffled = [all_sources[idx] for idx in indices]
+            train_sources = shuffled[:train_size]
+            val_sources = shuffled[train_size:]
 
-        train_samples: List[Tuple[List[str], int]] = []
-        for frame_paths, label in train_videos:
-            train_samples.extend(
-                self._build_clips_from_video_frames(
-                    frame_paths, label, sequence_length, frame_stride
-                )
-            )
-
-        val_samples: List[Tuple[List[str], int]] = []
-        for frame_paths, label in val_videos:
-            val_samples.extend(
-                self._build_clips_from_video_frames(
-                    frame_paths, label, sequence_length, frame_stride
-                )
-            )
+        train_samples = self._expand_temporal_sources_to_clips(
+            train_sources,
+            sequence_length,
+            frame_stride,
+            input_size,
+        )
+        val_samples = self._expand_temporal_sources_to_clips(
+            val_sources,
+            sequence_length,
+            frame_stride,
+            input_size,
+        )
 
         if not train_samples:
             raise ValueError("No labeled training clips found")
@@ -1718,6 +1823,87 @@ class TrainingService:
 
         return train_loader, val_loader
 
+    def _dataset_has_temporal_media(self, dataset_path: str) -> bool:
+        """Return True when the dataset contains video files or frame-group videos."""
+        root_path = Path(dataset_path).expanduser()
+        if not root_path.exists() or not root_path.is_dir():
+            return False
+
+        split_dirs = self._find_split_dirs(root_path)
+        candidate_roots = list(split_dirs.values()) if split_dirs else [root_path]
+        for candidate_root in candidate_roots:
+            if self._collect_labeled_videos(candidate_root, candidate_root):
+                return True
+            if self._collect_labeled_video_groups(candidate_root, candidate_root):
+                return True
+        return False
+
+    def _collect_temporal_training_sources(
+        self, root_path: Path, label_root: Path
+    ) -> List[TemporalMediaSource]:
+        """Collect temporal training units without splitting a single video across sets."""
+        grouped_videos = self._collect_labeled_video_groups(root_path, label_root)
+        grouped_frame_paths = {
+            frame_path
+            for frame_paths, _label in grouped_videos
+            for frame_path in frame_paths
+        }
+
+        sources: List[TemporalMediaSource] = [
+            TemporalMediaSource(
+                kind="frame_group", label=label, frame_paths=frame_paths
+            )
+            for frame_paths, label in grouped_videos
+        ]
+
+        standalone_images = [
+            sample
+            for sample in self._collect_labeled_images(root_path, label_root)
+            if sample.path not in grouped_frame_paths
+        ]
+        sources.extend(
+            TemporalMediaSource(kind="image", label=sample.label, path=sample.path)
+            for sample in standalone_images
+        )
+        sources.extend(
+            TemporalMediaSource(kind="video", label=label, path=video_path)
+            for video_path, label in self._collect_labeled_videos(root_path, label_root)
+        )
+        return sources
+
+    def _expand_temporal_sources_to_clips(
+        self,
+        sources: List[TemporalMediaSource],
+        sequence_length: int,
+        frame_stride: int,
+        input_size: int,
+    ) -> List[Tuple[List[str], int]]:
+        """Expand mixed temporal sources into fixed-length clips."""
+        clips: List[Tuple[List[str], int]] = []
+        for source in sources:
+            if source.kind == "image" and source.path:
+                clips.append(([source.path] * sequence_length, source.label))
+            elif source.kind == "frame_group" and source.frame_paths:
+                clips.extend(
+                    self._build_clips_from_video_frames(
+                        source.frame_paths,
+                        source.label,
+                        sequence_length,
+                        frame_stride,
+                    )
+                )
+            elif source.kind == "video" and source.path:
+                clips.extend(
+                    self._build_clips_from_raw_video(
+                        source.path,
+                        source.label,
+                        sequence_length,
+                        frame_stride,
+                        input_size,
+                    )
+                )
+        return clips
+
     def _collect_labeled_video_groups(
         self, root_path: Path, label_root: Path
     ) -> List[Tuple[List[str], int]]:
@@ -1738,7 +1924,15 @@ class TrainingService:
                 logger.warning("Skipping invalid image file", path=str(file_path))
                 continue
 
-            group_key = str(file_path.parent)
+            try:
+                relative_parent = file_path.parent.relative_to(label_root)
+            except ValueError:
+                relative_parent = file_path.parent
+
+            if len(relative_parent.parts) < 2:
+                continue
+
+            group_key = str(file_path.parent.resolve())
             if group_key not in grouped_frames:
                 grouped_frames[group_key] = {"label": label, "frames": []}
             grouped_frames[group_key]["frames"].append(str(file_path))
@@ -1750,6 +1944,99 @@ class TrainingService:
                 videos.append((sorted_frames, group_data["label"]))
 
         return videos
+
+    def _build_clips_from_raw_video(
+        self,
+        video_path: str,
+        label: int,
+        sequence_length: int,
+        frame_stride: int,
+        input_size: int,
+    ) -> List[Tuple[List[str], int]]:
+        """Build cached clip samples directly from a raw video file."""
+        capture = cv2.VideoCapture(video_path)
+        if not capture.isOpened():
+            logger.warning(
+                "Skipping unreadable video file for temporal clips", path=video_path
+            )
+            return []
+
+        try:
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        finally:
+            capture.release()
+
+        cache_root = self._video_frame_cache_root(input_size)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        clips: List[Tuple[List[str], int]] = []
+        for clip_indices in self._sample_video_clip_indices(
+            frame_count,
+            sequence_length,
+            frame_stride,
+        ):
+            frame_paths: List[str] = []
+            for frame_index in clip_indices:
+                try:
+                    frame_paths.append(
+                        self._materialize_video_frame(
+                            video_path,
+                            frame_index,
+                            cache_root,
+                            input_size,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping broken temporal clip frame",
+                        video_path=video_path,
+                        frame_index=frame_index,
+                        error=str(exc),
+                    )
+                    frame_paths = []
+                    break
+
+            if frame_paths:
+                clips.append((frame_paths, label))
+
+        return clips
+
+    def _sample_video_clip_indices(
+        self,
+        frame_count: int,
+        sequence_length: int,
+        frame_stride: int,
+    ) -> List[List[int]]:
+        """Sample temporally ordered frame index clips from a raw video."""
+        target_length = max(1, sequence_length)
+        target_stride = max(1, frame_stride)
+        clip_span = ((target_length - 1) * target_stride) + 1
+
+        def build_clip(start_index: int) -> List[int]:
+            max_index = max(frame_count - 1, 0)
+            return [
+                min(max_index, max(0, start_index + (idx * target_stride)))
+                for idx in range(target_length)
+            ]
+
+        if frame_count <= 0:
+            return [[0] * target_length]
+
+        if frame_count <= clip_span:
+            return [build_clip(0)]
+
+        max_reference_frames = max(target_length, int(settings.MAX_FRAMES_PER_VIDEO))
+        max_clips = max(1, (max_reference_frames + target_length - 1) // target_length)
+        available_span = max(0, frame_count - clip_span)
+
+        if max_clips == 1 or available_span == 0:
+            start_positions = [available_span // 2]
+        else:
+            step = available_span / float(max_clips - 1)
+            start_positions = sorted(
+                {int(round(step * clip_idx)) for clip_idx in range(max_clips)}
+            )
+
+        return [build_clip(start_index) for start_index in start_positions]
 
     def _build_clips_from_video_frames(
         self,
@@ -1778,7 +2065,7 @@ class TrainingService:
             ]
             return [(clip, label)]
 
-        step = max(1, clip_span)
+        step = max(1, clip_span // 2)
         for start in range(0, len(frame_paths), step):
             clip = []
             for i in range(sequence_length):
@@ -2017,7 +2304,7 @@ class TrainingService:
         optimizer: torch.optim.Optimizer,
         device: torch.device,
         amp_enabled: bool = False,
-        scaler: Optional[torch.amp.GradScaler] = None,
+        scaler: Optional[Any] = None,
         channels_last: bool = False,
         progress_callback: Optional[Callable[[int, int, float, float], None]] = None,
     ) -> Tuple[float, float]:
@@ -2376,6 +2663,12 @@ class TrainingService:
             "frame_stride": checkpoint.get("frame_stride"),
             "hidden_size": checkpoint.get("hidden_size"),
             "num_layers": checkpoint.get("num_layers"),
+            "video_temporal_enabled": checkpoint.get("video_temporal_enabled"),
+            "training_mode": checkpoint.get("training_mode"),
+            "temporal_hidden_size": checkpoint.get("temporal_hidden_size"),
+            "temporal_num_layers": checkpoint.get("temporal_num_layers"),
+            "feature_projection_size": checkpoint.get("feature_projection_size"),
+            "frame_projection_size": checkpoint.get("frame_projection_size"),
         }
         filtered_parameters = {
             key: value for key, value in parameters.items() if value is not None

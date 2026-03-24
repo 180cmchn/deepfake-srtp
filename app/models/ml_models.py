@@ -6,6 +6,7 @@ import os
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+import torch
 import torch.nn as nn
 import timm
 from torchvision.models import (
@@ -19,6 +20,9 @@ from torchvision.models import (
 
 from app.core.config import settings
 from app.core.logging import logger
+
+
+FRAME_BACKBONE_TYPES = {"vgg", "swin", "vit", "resnet"}
 
 
 def _load_torchvision_model(factory, weights, model_name: str, pretrained: bool):
@@ -68,6 +72,7 @@ class CustomVGG(nn.Module):
             param.requires_grad = False
 
         num_features = self.img_model.classifier[0].in_features
+        self.feature_dim = num_features
         self.img_model.classifier = nn.Sequential(
             nn.Linear(num_features, 512),
             nn.ReLU(),
@@ -80,8 +85,14 @@ class CustomVGG(nn.Module):
         for param in self.img_model.classifier.parameters():
             param.requires_grad = True
 
+    def extract_features(self, x):
+        x = self.img_model.features(x)
+        x = self.img_model.avgpool(x)
+        return x.view(x.size(0), -1)
+
     def forward(self, x):
-        return self.img_model(x)
+        features = self.extract_features(x)
+        return self.img_model.classifier(features)
 
 
 class PretrainedVGG(nn.Module):
@@ -93,6 +104,8 @@ class PretrainedVGG(nn.Module):
             vgg16, VGG16_Weights.IMAGENET1K_V1, "vgg16_features", pretrained
         )
         self.features = pretrained_cnn.features
+        self.avgpool = pretrained_cnn.avgpool
+        self.feature_dim = pretrained_cnn.classifier[0].in_features
 
         # Freeze feature extraction parameters
         for param in self.features.parameters():
@@ -100,6 +113,7 @@ class PretrainedVGG(nn.Module):
 
     def forward(self, x):
         x = self.features(x)
+        x = self.avgpool(x)
         x = x.view(x.size(0), -1)  # Flatten features
         return x
 
@@ -108,28 +122,168 @@ class LRCN(nn.Module):
     """LRCN (Long-term Recurrent Convolutional Network) for video deepfake detection"""
 
     def __init__(
-        self, input_size, hidden_size, num_layers, num_classes=2, pretrained=True
+        self,
+        input_size,
+        hidden_size,
+        num_layers,
+        num_classes=2,
+        pretrained=True,
+        frame_projection_size=256,
     ):
         super(LRCN, self).__init__()
         self.pretrained_cnn = PretrainedVGG(pretrained=pretrained)
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.feature_dim = input_size
+        self.frame_projection_size = max(32, min(frame_projection_size, input_size))
+        self.frame_projection = nn.Sequential(
+            nn.Linear(input_size, self.frame_projection_size),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+        )
+        self.lstm = nn.LSTM(
+            self.frame_projection_size, hidden_size, num_layers, batch_first=True
+        )
         self.fc = nn.Linear(hidden_size, num_classes)
+        frame_hidden = max(64, min(hidden_size, self.frame_projection_size * 2))
+        self.frame_classifier = nn.Sequential(
+            nn.Linear(self.frame_projection_size * 2, frame_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(frame_hidden, num_classes),
+        )
+        fusion_hidden = max(hidden_size, self.frame_projection_size)
+        fusion_input_size = (
+            (self.frame_projection_size * 2) + hidden_size + (num_classes * 2)
+        )
+        self.fusion_head = nn.Sequential(
+            nn.Linear(fusion_input_size, fusion_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(fusion_hidden, num_classes),
+        )
 
     def forward(self, x):
         batch_size, seq_length, channels, height, width = x.size()
         x = x.view(batch_size * seq_length, channels, height, width)
-        frame_features = self.pretrained_cnn(x)
+        self.pretrained_cnn.eval()
+        with torch.no_grad():
+            frame_features = self.pretrained_cnn(x)
+        frame_features = frame_features.view(batch_size, seq_length, -1)
+        projected_features = self.frame_projection(
+            frame_features.reshape(batch_size * seq_length, -1)
+        )
+        projected_features = projected_features.view(batch_size, seq_length, -1)
+
+        center_index = seq_length // 2
+        center_features = projected_features[:, center_index, :]
+        pooled_features = projected_features.mean(dim=1)
+        frame_summary = torch.cat([center_features, pooled_features], dim=1)
+        frame_logits = self.frame_classifier(frame_summary)
+
+        lstm_out, _ = self.lstm(projected_features)
+
+        temporal_features = lstm_out[:, -1, :]
+        temporal_logits = self.fc(temporal_features)
+
+        fusion_input = torch.cat(
+            [frame_summary, temporal_features, frame_logits, temporal_logits], dim=1
+        )
+        return self.fusion_head(fusion_input)
+
+
+class VideoTemporalHybridModel(nn.Module):
+    def __init__(
+        self,
+        backbone_type: str,
+        temporal_hidden_size: int = 256,
+        temporal_num_layers: int = 2,
+        num_classes: int = 2,
+        pretrained: bool = True,
+        feature_projection_size: int = 256,
+    ):
+        super(VideoTemporalHybridModel, self).__init__()
+        if backbone_type not in FRAME_BACKBONE_TYPES:
+            raise ValueError(
+                f"Temporal hybrid model requires an image backbone, got: {backbone_type}"
+            )
+
+        self.backbone_type = backbone_type
+        self.frame_encoder = ModelRegistry.get_model(
+            backbone_type, num_classes=num_classes, pretrained=pretrained
+        )
+        for param in self.frame_encoder.parameters():
+            param.requires_grad = False
+
+        feature_dim = getattr(self.frame_encoder, "feature_dim", None)
+        if not feature_dim or not hasattr(self.frame_encoder, "extract_features"):
+            raise ValueError(
+                f"Backbone {backbone_type} does not expose extract_features/feature_dim"
+            )
+
+        self.feature_dim = feature_dim
+        self.feature_projection_size = max(
+            32, min(feature_projection_size, feature_dim)
+        )
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_dim, self.feature_projection_size),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+        )
+        self.lstm = nn.LSTM(
+            self.feature_projection_size,
+            temporal_hidden_size,
+            temporal_num_layers,
+            batch_first=True,
+        )
+        frame_hidden = max(
+            64, min(temporal_hidden_size, self.feature_projection_size * 2)
+        )
+        self.frame_classifier = nn.Sequential(
+            nn.Linear(self.feature_projection_size * 2, frame_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(frame_hidden, num_classes),
+        )
+        self.temporal_classifier = nn.Linear(temporal_hidden_size, num_classes)
+        fusion_hidden = max(temporal_hidden_size, self.feature_projection_size)
+        fusion_input_size = (
+            (self.feature_projection_size * 2)
+            + temporal_hidden_size
+            + (num_classes * 2)
+        )
+        self.fusion_head = nn.Sequential(
+            nn.Linear(fusion_input_size, fusion_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(fusion_hidden, num_classes),
+        )
+
+    def forward(self, x):
+        batch_size, seq_length, channels, height, width = x.size()
+        x = x.view(batch_size * seq_length, channels, height, width)
+        self.frame_encoder.eval()
+        with torch.no_grad():
+            frame_features = self.frame_encoder.extract_features(x)
         frame_features = frame_features.view(batch_size, seq_length, -1)
 
-        # Pass frame features through LSTM
-        lstm_out, _ = self.lstm(frame_features)
+        projected_features = self.feature_projection(
+            frame_features.reshape(batch_size * seq_length, -1)
+        )
+        projected_features = projected_features.view(batch_size, seq_length, -1)
 
-        # Use the last time step output
-        lstm_out = lstm_out[:, -1, :]
+        center_index = seq_length // 2
+        center_features = projected_features[:, center_index, :]
+        pooled_features = projected_features.mean(dim=1)
+        frame_summary = torch.cat([center_features, pooled_features], dim=1)
+        frame_logits = self.frame_classifier(frame_summary)
 
-        # Classification
-        output = self.fc(lstm_out)
-        return output
+        temporal_output, _ = self.lstm(projected_features)
+        temporal_features = temporal_output[:, -1, :]
+        temporal_logits = self.temporal_classifier(temporal_features)
+
+        fusion_input = torch.cat(
+            [frame_summary, temporal_features, frame_logits, temporal_logits], dim=1
+        )
+        return self.fusion_head(fusion_input)
 
 
 class SwinModel(nn.Module):
@@ -148,10 +302,19 @@ class SwinModel(nn.Module):
 
         # Replace classification head
         num_features = self.swin.head.in_features
+        self.feature_dim = num_features
         self.swin.head = nn.Linear(num_features, num_classes)
 
+    def extract_features(self, x):
+        x = self.swin.features(x)
+        x = self.swin.norm(x)
+        x = self.swin.permute(x)
+        x = self.swin.avgpool(x)
+        return torch.flatten(x, 1)
+
     def forward(self, x):
-        return self.swin(x)
+        features = self.extract_features(x)
+        return self.swin.head(features)
 
 
 class ViTModel(nn.Module):
@@ -161,6 +324,7 @@ class ViTModel(nn.Module):
         super(ViTModel, self).__init__()
         # Load pre-trained ViT model
         self.vit = _load_timm_model("vit_base_patch16_224", num_classes, pretrained)
+        self.feature_dim = self.vit.head.in_features
 
         # Freeze all parameters
         for param in self.vit.parameters():
@@ -169,8 +333,13 @@ class ViTModel(nn.Module):
         # Replace classification head
         self.vit.head = nn.Linear(self.vit.head.in_features, num_classes)
 
+    def extract_features(self, x):
+        features = self.vit.forward_features(x)
+        return self.vit.forward_head(features, pre_logits=True)
+
     def forward(self, x):
-        return self.vit(x)
+        features = self.extract_features(x)
+        return self.vit.head(features)
 
 
 class ResNet(nn.Module):
@@ -188,6 +357,7 @@ class ResNet(nn.Module):
 
         # Replace final layer
         num_features = self.img_model.fc.in_features
+        self.feature_dim = num_features
         self.img_model.fc = nn.Sequential(  # type: ignore[assignment]
             nn.Linear(num_features, 512),
             nn.ReLU(),
@@ -200,8 +370,21 @@ class ResNet(nn.Module):
         for param in self.img_model.fc.parameters():
             param.requires_grad = True
 
+    def extract_features(self, x):
+        x = self.img_model.conv1(x)
+        x = self.img_model.bn1(x)
+        x = self.img_model.relu(x)
+        x = self.img_model.maxpool(x)
+        x = self.img_model.layer1(x)
+        x = self.img_model.layer2(x)
+        x = self.img_model.layer3(x)
+        x = self.img_model.layer4(x)
+        x = self.img_model.avgpool(x)
+        return torch.flatten(x, 1)
+
     def forward(self, x):
-        return self.img_model(x)
+        features = self.extract_features(x)
+        return self.img_model.fc(features)
 
 
 class ModelRegistry:
@@ -223,8 +406,19 @@ class ModelRegistry:
                 f"Unsupported model type: {model_type}. Supported types: {list(cls._models.keys())}"
             )
 
-        model_class = cls._models[model_type]
         pretrained = kwargs.get("pretrained", settings.MODEL_USE_PRETRAINED_WEIGHTS)
+
+        if kwargs.get("video_temporal_enabled") and model_type in FRAME_BACKBONE_TYPES:
+            return VideoTemporalHybridModel(
+                backbone_type=model_type,
+                temporal_hidden_size=kwargs.get("temporal_hidden_size", 256),
+                temporal_num_layers=kwargs.get("temporal_num_layers", 2),
+                num_classes=kwargs.get("num_classes", 2),
+                pretrained=pretrained,
+                feature_projection_size=kwargs.get("feature_projection_size", 256),
+            )
+
+        model_class = cls._models[model_type]
 
         # Handle special cases for model initialization
         if model_type == "lrcn":
@@ -233,12 +427,14 @@ class ModelRegistry:
             hidden_size = kwargs.get("hidden_size", 512)
             num_layers = kwargs.get("num_layers", 2)
             num_classes = kwargs.get("num_classes", 2)
+            frame_projection_size = kwargs.get("frame_projection_size", 256)
             return model_class(
                 input_size,
                 hidden_size,
                 num_layers,
                 num_classes,
                 pretrained=pretrained,
+                frame_projection_size=frame_projection_size,
             )
         else:
             # Other models use standard initialization

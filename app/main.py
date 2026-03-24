@@ -14,7 +14,11 @@ load_dotenv()
 
 from app.api.routes import api_router
 from app.core.config import settings
-from app.core.database import test_connection
+from app.core.database import (
+    create_tables_with_retry,
+    ensure_runtime_schema,
+    test_connection,
+)
 from app.core.logging import logger
 
 app = FastAPI(
@@ -61,6 +65,9 @@ async def startup_event():
         settings.DATA_DIR,
     ]:
         os.makedirs(directory, exist_ok=True)
+
+    if create_tables_with_retry():
+        ensure_runtime_schema()
 
     skip_db_check = os.getenv("SKIP_STARTUP_DB_CHECK", "0") == "1"
     if skip_db_check:

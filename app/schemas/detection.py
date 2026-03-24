@@ -204,6 +204,7 @@ class DetectionHistory(BaseModel):
     confidence: float
     processing_time: float
     model_name: str
+    model_type: Optional[str] = None
     created_at: datetime
 
     class Config:

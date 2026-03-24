@@ -2,7 +2,7 @@
 Database configuration for deepfake detection platform
 """
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
@@ -14,6 +14,7 @@ import pymysql
 from .config import settings
 from .logging import logger
 
+
 def create_database_engine():
     """Create database engine with optimized configuration based on ai-manager-plateform"""
     if settings.DATABASE_URL.startswith("sqlite"):
@@ -22,16 +23,16 @@ def create_database_engine():
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
             echo=False,
-            pool_pre_ping=True
+            pool_pre_ping=True,
         )
     else:
         engine = create_engine(
             settings.DATABASE_URL,
             pool_pre_ping=True,
-            pool_recycle=300,    # Shorter recycle time like ai-manager-plateform
-            pool_size=10,        # Base connection pool size
-            max_overflow=20,     # Additional connections when needed
-            echo=False,          # Set to True for SQL debugging
+            pool_recycle=300,  # Shorter recycle time like ai-manager-plateform
+            pool_size=10,  # Base connection pool size
+            max_overflow=20,  # Additional connections when needed
+            echo=False,  # Set to True for SQL debugging
         )
     return engine
 
@@ -44,6 +45,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Base(DeclarativeBase):
     """Base class for all database models"""
+
     pass
 
 
@@ -96,17 +98,26 @@ def test_connection_with_retry(max_retries: int = 3, retry_delay: int = 1) -> bo
             return True
         except OperationalError as e:
             if attempt == max_retries - 1:
-                logger.error("Database connection test failed after retries", 
-                           error=str(e), attempts=max_retries)
+                logger.error(
+                    "Database connection test failed after retries",
+                    error=str(e),
+                    attempts=max_retries,
+                )
                 return False
-            logger.warning(f"Database connection attempt {attempt + 1} failed, retrying in {retry_delay}s...", 
-                         error=str(e))
+            logger.warning(
+                f"Database connection attempt {attempt + 1} failed, retrying in {retry_delay}s...",
+                error=str(e),
+            )
             time.sleep(retry_delay)
         except SQLAlchemyError as e:
-            logger.error("Database connection test failed with SQLAlchemy error", error=str(e))
+            logger.error(
+                "Database connection test failed with SQLAlchemy error", error=str(e)
+            )
             return False
         except Exception as e:
-            logger.error("Database connection test failed with unexpected error", error=str(e))
+            logger.error(
+                "Database connection test failed with unexpected error", error=str(e)
+            )
             return False
     return False
 
@@ -122,19 +133,68 @@ def create_tables_with_retry(max_retries: int = 3, retry_delay: int = 2) -> bool
             return True
         except OperationalError as e:
             if attempt == max_retries - 1:
-                logger.error("Failed to create database tables after retries", 
-                           error=str(e), attempts=max_retries)
+                logger.error(
+                    "Failed to create database tables after retries",
+                    error=str(e),
+                    attempts=max_retries,
+                )
                 return False
-            logger.warning(f"Table creation attempt {attempt + 1} failed, retrying in {retry_delay}s...", 
-                         error=str(e))
+            logger.warning(
+                f"Table creation attempt {attempt + 1} failed, retrying in {retry_delay}s...",
+                error=str(e),
+            )
             time.sleep(retry_delay)
         except SQLAlchemyError as e:
-            logger.error("Failed to create database tables with SQLAlchemy error", error=str(e))
+            logger.error(
+                "Failed to create database tables with SQLAlchemy error", error=str(e)
+            )
             raise
         except Exception as e:
-            logger.error("Failed to create database tables with unexpected error", error=str(e))
+            logger.error(
+                "Failed to create database tables with unexpected error", error=str(e)
+            )
             raise
     return False
+
+
+def ensure_runtime_schema() -> bool:
+    """Apply lightweight additive schema fixes for existing deployments."""
+    try:
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
+        if "detection_results" not in existing_tables:
+            return True
+
+        existing_columns = {
+            column["name"] for column in inspector.get_columns("detection_results")
+        }
+        statements = []
+
+        if "model_name" not in existing_columns:
+            statements.append(
+                "ALTER TABLE detection_results ADD COLUMN model_name VARCHAR(255)"
+            )
+        if "model_type" not in existing_columns:
+            statements.append(
+                "ALTER TABLE detection_results ADD COLUMN model_type VARCHAR(50)"
+            )
+
+        if not statements:
+            return True
+
+        with engine.begin() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
+
+        logger.info(
+            "Runtime schema adjustments applied",
+            table="detection_results",
+            statements=statements,
+        )
+        return True
+    except Exception as e:
+        logger.error("Failed to apply runtime schema adjustments", error=str(e))
+        return False
 
 
 @contextmanager

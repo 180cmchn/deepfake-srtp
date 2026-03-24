@@ -8,6 +8,7 @@ import asyncio
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from fastapi import BackgroundTasks
 import torch
 import cv2
@@ -33,6 +34,10 @@ from app.schemas.detection import (
     PredictionType,
     FileType,
 )
+
+
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
 class DetectionService:
@@ -64,19 +69,24 @@ class DetectionService:
             if loaded_model["model_type"] == "lrcn":
                 raise ValueError("LRCN models only support video detection")
 
-            # Preprocess image
-            image = self._preprocess_image(
-                file_path,
-                input_size=loaded_model.get("input_size", settings.MODEL_INPUT_SIZE),
+            input_size = loaded_model.get("input_size", settings.MODEL_INPUT_SIZE)
+            if loaded_model.get("video_temporal_enabled"):
+                image = self._preprocess_image_clip(
+                    file_path,
+                    sequence_length=loaded_model.get("sequence_length", 8),
+                    input_size=input_size,
+                )
+            else:
+                image = self._preprocess_image(file_path, input_size=input_size)
+
+            inference_result = await self._predict_tensor(model, image)
+            prediction = inference_result["prediction"]
+            confidence = inference_result["confidence"]
+            probabilities = (
+                inference_result["probabilities"]
+                if request.return_probabilities
+                else None
             )
-
-            # Perform inference
-            prediction, confidence = await self._inference(model, image)
-
-            # Get probabilities if requested
-            probabilities = None
-            if request.return_probabilities:
-                probabilities = await self._get_probabilities(model, image)
 
             processing_time = time.time() - start_time
 
@@ -104,6 +114,8 @@ class DetectionService:
                 file_type=file_type,
                 result=detection_result,
                 model_id=request.model_id,
+                model_name=loaded_model.get("model_name"),
+                model_type=loaded_model.get("model_type"),
             )
 
             # Schedule cleanup in background
@@ -116,9 +128,7 @@ class DetectionService:
                     "name": file_name,
                     "type": file_type,
                     "size": file_size,
-                    "resolution": f"{image.shape[1]}x{image.shape[0]}"
-                    if hasattr(image, "shape")
-                    else None,
+                    "resolution": f"{input_size}x{input_size}",
                 },
                 result=detection_result,
                 processing_time=processing_time,
@@ -258,66 +268,75 @@ class DetectionService:
             loaded_model = await self._load_model(request.model_id, request.model_type)
             model = loaded_model["model"]
 
-            frame_results = []
-            predictions = []
-            confidences = []
-
-            if loaded_model["model_type"] == "lrcn":
-                processed_clip = self._preprocess_video_clip(
+            if loaded_model["model_type"] == "lrcn" or loaded_model.get(
+                "video_temporal_enabled"
+            ):
+                (
+                    frame_probabilities,
+                    processed_clips,
+                ) = await self._predict_video_with_temporal_context(
+                    model,
                     frames,
-                    sequence_length=loaded_model.get("sequence_length", 16),
-                    input_size=loaded_model.get(
-                        "input_size", settings.MODEL_INPUT_SIZE
-                    ),
+                    loaded_model,
                 )
-                aggregated_prediction, aggregated_confidence = await self._inference(
-                    model, processed_clip
-                )
-                predictions.append(aggregated_prediction)
-                confidences.append(aggregated_confidence)
+                temporal_strategy = "clip_temporal_fusion"
             else:
-                for i, (frame, timestamp) in enumerate(frames):
+                raw_frame_probabilities = []
+                for i, (frame, _timestamp) in enumerate(frames):
                     try:
-                        processed_frame = self._preprocess_frame(
-                            frame,
-                            input_size=loaded_model.get(
-                                "input_size", settings.MODEL_INPUT_SIZE
+                        prediction = await self._predict_tensor(
+                            model,
+                            self._preprocess_frame(
+                                frame,
+                                input_size=loaded_model.get(
+                                    "input_size", settings.MODEL_INPUT_SIZE
+                                ),
                             ),
                         )
-                        prediction, confidence = await self._inference(
-                            model, processed_frame
-                        )
-
-                        predictions.append(prediction)
-                        confidences.append(confidence)
-                        frame_results.append(
-                            {
-                                "frame_number": i + 1,
-                                "timestamp": timestamp,
-                                "result": {
-                                    "prediction": prediction,
-                                    "confidence": confidence,
-                                    "processing_time": 0.0,
-                                    "model_info": {
-                                        "model_id": loaded_model.get("model_id"),
-                                        "model_name": loaded_model.get("model_name"),
-                                        "model_type": loaded_model["model_type"],
-                                    },
-                                },
-                            }
-                        )
+                        raw_frame_probabilities.append(prediction["probabilities"])
                     except Exception as e:
                         logger.warning(
                             "Frame processing failed", frame_number=i + 1, error=str(e)
                         )
-                        continue
+                        raw_frame_probabilities.append(None)
 
-                if not frame_results:
+                frame_probabilities = []
+                valid_probabilities = [item for item in raw_frame_probabilities if item]
+                if not valid_probabilities:
                     raise ValueError("No frames could be processed successfully")
 
-                aggregated_prediction, aggregated_confidence = self._aggregate_results(
-                    predictions, confidences, request.confidence_threshold
+                smoothed_probabilities = self._smooth_probability_sequence(
+                    valid_probabilities
                 )
+                _, _, fallback_probabilities = self._aggregate_probability_sequence(
+                    smoothed_probabilities
+                )
+                smoothed_index = 0
+                for probabilities in raw_frame_probabilities:
+                    if probabilities:
+                        frame_probabilities.append(
+                            smoothed_probabilities[smoothed_index]
+                        )
+                        smoothed_index += 1
+                    else:
+                        frame_probabilities.append(fallback_probabilities)
+
+                processed_clips = 0
+                temporal_strategy = "smoothed_frame_sequence"
+
+            if not frame_probabilities:
+                raise ValueError("No frames could be processed successfully")
+
+            frame_results = self._build_frame_results_from_probabilities(
+                frames,
+                frame_probabilities,
+                loaded_model,
+            )
+            predictions = [item["result"]["prediction"] for item in frame_results]
+            confidences = [item["result"]["confidence"] for item in frame_results]
+            aggregated_prediction, aggregated_confidence, aggregated_probabilities = (
+                self._aggregate_probability_sequence(frame_probabilities)
+            )
 
             processing_time = time.time() - start_time
 
@@ -326,21 +345,24 @@ class DetectionService:
                 "name": file_name,
                 "size": file_size,
                 "total_frames": len(frames),
-                "processed_frames": len(frame_results),
+                "processed_frames": len(frame_probabilities),
                 "duration": frames[-1][1] if frames else 0,
             }
 
             summary = {
                 "total_frames": len(frames),
-                "processed_frames": len(frame_results),
-                "success_rate": len(frame_results) / len(frames) if frames else 0,
+                "processed_frames": len(frame_probabilities),
+                "processed_clips": processed_clips,
+                "success_rate": len(frame_probabilities) / len(frames) if frames else 0,
                 "average_confidence": np.mean(confidences) if confidences else 0,
                 "prediction_distribution": self._count_predictions_list(predictions),
+                "temporal_strategy": temporal_strategy,
             }
 
             detection_result = DetectionResultSchema(
                 prediction=aggregated_prediction,
                 confidence=aggregated_confidence,
+                probabilities=aggregated_probabilities,
                 processing_time=processing_time,
                 model_info={
                     "model_id": loaded_model.get("model_id"),
@@ -359,6 +381,8 @@ class DetectionService:
                 file_type="video",
                 result=detection_result,
                 model_id=request.model_id,
+                model_name=loaded_model.get("model_name"),
+                model_type=loaded_model.get("model_type"),
             )
 
             return VideoDetectionResponse(
@@ -412,8 +436,11 @@ class DetectionService:
                 query = query.filter(DetectionResult.prediction == prediction)
 
             if model_type:
-                query = query.join(ModelRegistry).filter(
-                    ModelRegistry.model_type == model_type
+                query = query.outerjoin(ModelRegistry).filter(
+                    or_(
+                        DetectionResult.model_type == model_type,
+                        ModelRegistry.model_type == model_type,
+                    )
                 )
 
             # TODO: Add user_id filtering when DetectionResult model has user_id field
@@ -465,7 +492,10 @@ class DetectionService:
                     processing_time=result.processing_time
                     if result.processing_time is not None
                     else 0.0,
-                    model_name=result.model.name if result.model else "Unknown",
+                    model_name=result.model_name
+                    or (result.model.name if result.model else "Built-in Model"),
+                    model_type=result.model_type
+                    or (result.model.model_type if result.model else None),
                     created_at=result.created_at,
                 )
                 detections.append(detection)
@@ -532,18 +562,20 @@ class DetectionService:
 
             # Get detections by model
             detections_by_model = {}
-            models = self.db.query(ModelRegistry).all()
-            for model in models:
-                count = (
-                    self.db.query(DetectionResult)
-                    .filter(
-                        DetectionResult.del_flag == 0,
-                        DetectionResult.model_id == model.id,
-                    )
-                    .count()
+            detection_model_rows = (
+                self.db.query(DetectionResult)
+                .filter(DetectionResult.del_flag == 0)
+                .all()
+            )
+            for result in detection_model_rows:
+                model_key = result.model_type or (
+                    result.model.model_type if result.model else None
                 )
-                if count > 0:
-                    detections_by_model[model.model_type] = count
+                if not model_key:
+                    model_key = "unknown"
+                detections_by_model[model_key] = (
+                    detections_by_model.get(model_key, 0) + 1
+                )
 
             # Get detections by file type
             detections_by_file_type = {}
@@ -587,6 +619,18 @@ class DetectionService:
                 else:
                     confidence_ranges["0.8-1.0"] += 1
 
+            daily_detections: Dict[str, int] = {}
+            detection_dates = (
+                self.db.query(DetectionResult.created_at)
+                .filter(DetectionResult.del_flag == 0)
+                .all()
+            )
+            for (created_at,) in detection_dates:
+                if not created_at:
+                    continue
+                day_key = created_at.strftime("%Y-%m-%d")
+                daily_detections[day_key] = daily_detections.get(day_key, 0) + 1
+
             return DetectionStatistics(
                 total_detections=total_detections,
                 real_detections=real_detections,
@@ -596,7 +640,7 @@ class DetectionService:
                 detections_by_model=detections_by_model,
                 detections_by_file_type=detections_by_file_type,
                 confidence_distribution=confidence_ranges,
-                daily_detections={},  # TODO: Implement daily statistics
+                daily_detections=daily_detections,
             )
 
         except Exception as e:
@@ -672,7 +716,13 @@ class DetectionService:
             state_dict = checkpoint.get("model_state_dict")
             if not state_dict:
                 raise ValueError("Checkpoint does not contain model_state_dict")
-            model.load_state_dict(state_dict)
+            self._load_model_state(
+                model,
+                state_dict,
+                allow_partial=bool(
+                    checkpoint.get("video_temporal_enabled") or model_type == "lrcn"
+                ),
+            )
             loaded = {
                 "model": model,
                 "model_id": model_record.id,
@@ -685,6 +735,14 @@ class DetectionService:
                     "sequence_length",
                     (model_record.parameters or {}).get("sequence_length", 16),
                 ),
+                "frame_stride": checkpoint.get(
+                    "frame_stride",
+                    (model_record.parameters or {}).get("frame_stride", 1),
+                ),
+                "video_temporal_enabled": bool(
+                    checkpoint.get("video_temporal_enabled")
+                ),
+                "training_mode": checkpoint.get("training_mode"),
                 "source": "registry",
             }
         else:
@@ -697,6 +755,11 @@ class DetectionService:
                 "model_type": model_type,
                 "input_size": settings.MODEL_INPUT_SIZE,
                 "sequence_length": 16,
+                "frame_stride": 1,
+                "video_temporal_enabled": model_type == "lrcn",
+                "training_mode": "builtin_sequence"
+                if model_type == "lrcn"
+                else "builtin_image",
                 "source": "builtin",
             }
 
@@ -709,34 +772,45 @@ class DetectionService:
     def _preprocess_image(self, image_path: str, input_size: int = None) -> np.ndarray:
         """Preprocess image for inference"""
         target_size = input_size or settings.MODEL_INPUT_SIZE
-        image = Image.open(image_path).convert("RGB")
-        image = image.resize((target_size, target_size))
-        image = np.array(image) / 255.0
-        image = np.transpose(image, (2, 0, 1))  # HWC to CHW
-        image = torch.FloatTensor(image).unsqueeze(0)  # Add batch dimension
-        return image
+        with Image.open(image_path) as image:
+            rgb_image = image.convert("RGB")
+            rgb_image = rgb_image.resize((target_size, target_size))
+            image_array = np.array(rgb_image, dtype=np.float32) / 255.0
+        return self._normalize_image_array(image_array)
 
     def _preprocess_frame(
         self, frame: np.ndarray, input_size: int = None
     ) -> np.ndarray:
         """Preprocess video frame for inference"""
         target_size = input_size or settings.MODEL_INPUT_SIZE
-        image = Image.fromarray(frame).convert("RGB")
-        image = image.resize((target_size, target_size))
-        image = np.array(image) / 255.0
-        image = np.transpose(image, (2, 0, 1))  # HWC to CHW
-        image = torch.FloatTensor(image).unsqueeze(0)  # Add batch dimension
-        return image
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(frame_rgb).resize((target_size, target_size))
+        image_array = np.array(image, dtype=np.float32) / 255.0
+        return self._normalize_image_array(image_array)
+
+    def _normalize_image_array(self, image_array: np.ndarray) -> torch.Tensor:
+        """Apply the same tensor normalization used during training."""
+        tensor = torch.from_numpy(np.transpose(image_array, (2, 0, 1))).float()
+        tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
+        return tensor.unsqueeze(0)
 
     def _preprocess_video_clip(
-        self, frames: List[tuple], sequence_length: int, input_size: int = None
+        self,
+        frames: List[tuple],
+        sequence_length: int,
+        input_size: int = None,
+        clip_indices: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """Preprocess extracted video frames into a fixed-length clip tensor."""
         if not frames:
             raise ValueError("No frames available for video clip preprocessing")
 
-        target_length = max(1, sequence_length)
-        selected_frames = [frame for frame, _ in frames[:target_length]]
+        if clip_indices:
+            selected_frames = [frames[idx][0] for idx in clip_indices]
+            target_length = len(selected_frames)
+        else:
+            target_length = max(1, sequence_length)
+            selected_frames = [frame for frame, _ in frames[:target_length]]
         while len(selected_frames) < target_length:
             selected_frames.append(selected_frames[-1])
 
@@ -746,30 +820,51 @@ class DetectionService:
         ]
         return torch.stack(processed_frames, dim=0).unsqueeze(0)
 
-    async def _inference(self, model, input_tensor: torch.Tensor) -> tuple:
-        """Perform model inference"""
+    def _preprocess_image_clip(
+        self,
+        image_path: str,
+        sequence_length: int,
+        input_size: int = None,
+    ) -> torch.Tensor:
+        """Repeat a single image into a fixed-length clip tensor."""
+        frame_tensor = self._preprocess_image(
+            image_path, input_size=input_size
+        ).squeeze(0)
+        clip = frame_tensor.unsqueeze(0).repeat(max(1, sequence_length), 1, 1, 1)
+        return clip.unsqueeze(0)
+
+    async def _predict_tensor(
+        self, model, input_tensor: torch.Tensor
+    ) -> Dict[str, Any]:
+        """Run a forward pass and return prediction metadata."""
         with torch.no_grad():
             outputs = model(input_tensor)
             probabilities = torch.softmax(outputs, dim=1)
-            confidence, predicted = torch.max(probabilities, 1)
+            fake_probability = probabilities[0][0].item()
+            real_probability = probabilities[0][1].item()
+            prediction, confidence = self._probabilities_to_prediction(
+                {"fake": fake_probability, "real": real_probability}
+            )
+            return {
+                "prediction": prediction,
+                "confidence": confidence,
+                "probabilities": {
+                    "fake": fake_probability,
+                    "real": real_probability,
+                },
+            }
 
-            prediction = "fake" if predicted.item() == 0 else "real"
-            confidence = confidence.item()
-
-            return prediction, confidence
+    async def _inference(self, model, input_tensor: torch.Tensor) -> tuple:
+        """Perform model inference"""
+        result = await self._predict_tensor(model, input_tensor)
+        return result["prediction"], result["confidence"]
 
     async def _get_probabilities(
         self, model, input_tensor: torch.Tensor
     ) -> Dict[str, float]:
         """Get class probabilities"""
-        with torch.no_grad():
-            outputs = model(input_tensor)
-            probabilities = torch.softmax(outputs, dim=1)
-
-            return {
-                "fake": probabilities[0][0].item(),
-                "real": probabilities[0][1].item(),
-            }
+        result = await self._predict_tensor(model, input_tensor)
+        return result["probabilities"]
 
     async def _extract_frames(
         self, video_path: str, interval: int, max_frames: int
@@ -802,6 +897,218 @@ class DetectionService:
 
         finally:
             cap.release()
+
+    def _build_inference_clip_indices(
+        self,
+        total_frames: int,
+        sequence_length: int,
+        frame_stride: int,
+    ) -> List[List[int]]:
+        """Build overlapping inference clips that preserve temporal continuity."""
+        target_length = max(1, sequence_length)
+        target_stride = max(1, frame_stride)
+        clip_span = ((target_length - 1) * target_stride) + 1
+
+        def build_clip(start_index: int) -> List[int]:
+            max_index = max(total_frames - 1, 0)
+            return [
+                min(max_index, max(0, start_index + (idx * target_stride)))
+                for idx in range(target_length)
+            ]
+
+        if total_frames <= 0:
+            return []
+        if total_frames <= clip_span:
+            return [build_clip(0)]
+
+        step = max(1, clip_span // 2)
+        start_positions = list(range(0, total_frames, step))
+        final_start = max(0, total_frames - clip_span)
+        if final_start not in start_positions:
+            start_positions.append(final_start)
+
+        clip_indices: List[List[int]] = []
+        seen = set()
+        for start_index in start_positions:
+            clip = tuple(build_clip(start_index))
+            if clip in seen:
+                continue
+            seen.add(clip)
+            clip_indices.append(list(clip))
+            if start_index >= final_start:
+                break
+        return clip_indices
+
+    def _clip_frame_weights(self, clip_length: int) -> List[float]:
+        """Favor the middle of a clip when projecting clip scores back to frames."""
+        if clip_length <= 1:
+            return [1.0]
+        center = (clip_length - 1) / 2.0
+        weights = [1.0 / (1.0 + abs(index - center)) for index in range(clip_length)]
+        total = sum(weights) or 1.0
+        return [weight / total for weight in weights]
+
+    async def _predict_video_with_temporal_context(
+        self,
+        model,
+        frames: List[tuple],
+        loaded_model: Dict[str, Any],
+    ) -> tuple:
+        """Infer clip-level predictions and project them back to frame timeline."""
+        sequence_length = max(1, int(loaded_model.get("sequence_length", 8)))
+        frame_stride = max(1, int(loaded_model.get("frame_stride", 1)))
+        input_size = loaded_model.get("input_size", settings.MODEL_INPUT_SIZE)
+        clip_indices_list = self._build_inference_clip_indices(
+            len(frames), sequence_length, frame_stride
+        )
+
+        frame_accumulators: List[List[Dict[str, float]]] = [
+            [] for _ in range(len(frames))
+        ]
+
+        for clip_indices in clip_indices_list:
+            processed_clip = self._preprocess_video_clip(
+                frames,
+                sequence_length=sequence_length,
+                input_size=input_size,
+                clip_indices=clip_indices,
+            )
+            prediction = await self._predict_tensor(model, processed_clip)
+            weights = self._clip_frame_weights(len(clip_indices))
+
+            for weight, frame_index in zip(weights, clip_indices):
+                probabilities = prediction["probabilities"]
+                frame_accumulators[frame_index].append(
+                    {
+                        "fake": probabilities["fake"] * weight,
+                        "real": probabilities["real"] * weight,
+                        "weight": weight,
+                    }
+                )
+
+        frame_probabilities: List[Dict[str, float]] = []
+        for frame_index, (frame, _timestamp) in enumerate(frames):
+            accumulators = frame_accumulators[frame_index]
+            if accumulators:
+                total_weight = sum(item["weight"] for item in accumulators) or 1.0
+                fake_probability = (
+                    sum(item["fake"] for item in accumulators) / total_weight
+                )
+                real_probability = (
+                    sum(item["real"] for item in accumulators) / total_weight
+                )
+            else:
+                if (
+                    loaded_model.get("video_temporal_enabled")
+                    or loaded_model.get("model_type") == "lrcn"
+                ):
+                    fallback_tensor = self._preprocess_video_clip(
+                        frames,
+                        sequence_length=sequence_length,
+                        input_size=input_size,
+                        clip_indices=[frame_index] * sequence_length,
+                    )
+                else:
+                    fallback_tensor = self._preprocess_frame(
+                        frame, input_size=input_size
+                    )
+                frame_prediction = await self._predict_tensor(
+                    model,
+                    fallback_tensor,
+                )
+                fake_probability = frame_prediction["probabilities"]["fake"]
+                real_probability = frame_prediction["probabilities"]["real"]
+
+            probability_total = fake_probability + real_probability
+            if probability_total > 0:
+                fake_probability /= probability_total
+                real_probability /= probability_total
+            frame_probabilities.append(
+                {"fake": fake_probability, "real": real_probability}
+            )
+
+        return frame_probabilities, len(clip_indices_list)
+
+    def _smooth_probability_sequence(
+        self,
+        frame_probabilities: List[Dict[str, float]],
+        window_size: int = 5,
+    ) -> List[Dict[str, float]]:
+        """Smooth frame probabilities with a short temporal window."""
+        if not frame_probabilities:
+            return []
+
+        radius = max(0, window_size // 2)
+        smoothed: List[Dict[str, float]] = []
+        for index, probabilities in enumerate(frame_probabilities):
+            start = max(0, index - radius)
+            end = min(len(frame_probabilities), index + radius + 1)
+            window = frame_probabilities[start:end]
+            fake_probability = sum(item["fake"] for item in window) / len(window)
+            blended_fake = (fake_probability + probabilities["fake"]) / 2.0
+            blended_fake = max(0.0, min(1.0, blended_fake))
+            smoothed.append(
+                {"fake": blended_fake, "real": max(0.0, 1.0 - blended_fake)}
+            )
+        return smoothed
+
+    def _probabilities_to_prediction(self, probabilities: Dict[str, float]) -> tuple:
+        """Convert class probabilities to label and confidence."""
+        fake_probability = probabilities.get("fake", 0.0)
+        real_probability = probabilities.get("real", 0.0)
+        if fake_probability >= real_probability:
+            return "fake", fake_probability
+        return "real", real_probability
+
+    def _build_frame_results_from_probabilities(
+        self,
+        frames: List[tuple],
+        frame_probabilities: List[Dict[str, float]],
+        loaded_model: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build frame result payloads from a probability timeline."""
+        frame_results = []
+        for index, ((_, timestamp), probabilities) in enumerate(
+            zip(frames, frame_probabilities), start=1
+        ):
+            prediction, confidence = self._probabilities_to_prediction(probabilities)
+            frame_results.append(
+                {
+                    "frame_number": index,
+                    "timestamp": timestamp,
+                    "result": {
+                        "prediction": prediction,
+                        "confidence": confidence,
+                        "probabilities": probabilities,
+                        "processing_time": 0.0,
+                        "model_info": {
+                            "model_id": loaded_model.get("model_id"),
+                            "model_name": loaded_model.get("model_name"),
+                            "model_type": loaded_model["model_type"],
+                        },
+                    },
+                }
+            )
+        return frame_results
+
+    def _aggregate_probability_sequence(
+        self,
+        frame_probabilities: List[Dict[str, float]],
+    ) -> tuple:
+        """Aggregate a probability timeline into a video-level prediction."""
+        if not frame_probabilities:
+            return "unknown", 0.0, {"fake": 0.0, "real": 0.0}
+
+        fake_probability = sum(item["fake"] for item in frame_probabilities) / len(
+            frame_probabilities
+        )
+        fake_probability = max(0.0, min(1.0, fake_probability))
+        probabilities = {
+            "fake": fake_probability,
+            "real": max(0.0, 1.0 - fake_probability),
+        }
+        prediction, confidence = self._probabilities_to_prediction(probabilities)
+        return prediction, confidence, probabilities
 
     def _aggregate_results(
         self, predictions: List[str], confidences: List[float], threshold: float
@@ -844,6 +1151,8 @@ class DetectionService:
         file_type: str,
         result: DetectionResultSchema,
         model_id: Optional[int],
+        model_name: Optional[str] = None,
+        model_type: Optional[str] = None,
     ) -> DetectionResult:
         """Save detection result to database"""
         db_result = DetectionResult(
@@ -854,6 +1163,8 @@ class DetectionService:
             confidence=result.confidence,
             processing_time=result.processing_time,
             model_id=model_id,
+            model_name=model_name,
+            model_type=model_type,
         )
 
         self.db.add(db_result)
@@ -948,7 +1259,25 @@ class DetectionService:
         kwargs: Dict[str, Any] = {
             "num_classes": checkpoint.get("num_classes", model_record.num_classes or 2)
         }
-        if model_type == "lrcn":
+        if checkpoint.get("video_temporal_enabled") and model_type != "lrcn":
+            kwargs.update(
+                {
+                    "video_temporal_enabled": True,
+                    "temporal_hidden_size": checkpoint.get(
+                        "temporal_hidden_size",
+                        parameters.get("temporal_hidden_size", 256),
+                    ),
+                    "temporal_num_layers": checkpoint.get(
+                        "temporal_num_layers",
+                        parameters.get("temporal_num_layers", 2),
+                    ),
+                    "feature_projection_size": checkpoint.get(
+                        "feature_projection_size",
+                        parameters.get("feature_projection_size", 256),
+                    ),
+                }
+            )
+        elif model_type == "lrcn":
             kwargs.update(
                 {
                     "input_size": checkpoint.get(
@@ -961,7 +1290,31 @@ class DetectionService:
                     "num_layers": checkpoint.get(
                         "num_layers", parameters.get("num_layers", 2)
                     ),
+                    "frame_projection_size": checkpoint.get(
+                        "frame_projection_size",
+                        parameters.get("frame_projection_size", 256),
+                    ),
                 }
             )
         kwargs["pretrained"] = False
         return create_model(model_type, **kwargs)
+
+    def _load_model_state(
+        self,
+        model,
+        state_dict: Dict[str, Any],
+        allow_partial: bool = False,
+    ) -> None:
+        """Load a checkpoint with an optional compatibility fallback."""
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            if not allow_partial:
+                raise
+            load_result = model.load_state_dict(state_dict, strict=False)
+            logger.warning(
+                "Checkpoint loaded with partial compatibility",
+                missing_keys=list(load_result.missing_keys),
+                unexpected_keys=list(load_result.unexpected_keys),
+                error=str(exc),
+            )
