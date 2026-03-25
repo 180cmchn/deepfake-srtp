@@ -6,6 +6,7 @@ import asyncio
 import html
 import hashlib
 import json
+import random
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -181,9 +182,15 @@ class ImageClassificationDataset(Dataset):
 class SequenceClassificationDataset(Dataset):
     """Dataset for video frame clips used by sequence models."""
 
-    def __init__(self, samples: List[Tuple[List[str], int]], transform=None):
+    def __init__(
+        self,
+        samples: List[Tuple[List[str], int]],
+        transform=None,
+        augment: bool = False,
+    ):
         self.samples = samples
         self.transform = transform
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -195,9 +202,15 @@ class SequenceClassificationDataset(Dataset):
         for frame_path in frame_paths:
             with Image.open(frame_path) as img:
                 image = img.convert("RGB")
-            if self.transform:
-                image = self.transform(image)
             frames.append(image)
+
+        if self.augment and frames and random.random() < 0.5:
+            frames = [
+                frame.transpose(Image.Transpose.FLIP_LEFT_RIGHT) for frame in frames
+            ]
+
+        if self.transform:
+            frames = [self.transform(frame) for frame in frames]
 
         clip = torch.stack(frames, dim=0)
         return clip, label
@@ -310,6 +323,84 @@ class TrainingService:
             torch.backends.cuda.matmul.allow_tf32 = True
         if hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision("high")
+
+    def _build_training_criterion(self, label_smoothing: float) -> nn.Module:
+        """Create a classification loss with optional smoothing fallback."""
+        try:
+            return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        except TypeError:
+            if label_smoothing > 0:
+                logger.warning(
+                    "CrossEntropyLoss label_smoothing unsupported, falling back to plain CE",
+                    label_smoothing=label_smoothing,
+                )
+            return nn.CrossEntropyLoss()
+
+    def _build_training_optimizer(
+        self,
+        model: nn.Module,
+        learning_rate: float,
+        weight_decay: float,
+    ) -> torch.optim.Optimizer:
+        """Create an optimizer with decoupled weight decay when enabled."""
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        params = trainable_params if trainable_params else model.parameters()
+        if weight_decay > 0:
+            return torch.optim.AdamW(
+                params,
+                lr=learning_rate,
+                weight_decay=weight_decay,
+            )
+        return torch.optim.Adam(params, lr=learning_rate)
+
+    def _build_plateau_scheduler(
+        self,
+        optimizer: torch.optim.Optimizer,
+        learning_rate: float,
+        patience: int,
+    ) -> Optional[torch.optim.lr_scheduler.ReduceLROnPlateau]:
+        """Create a conservative LR scheduler for long plateaus."""
+        if patience <= 1:
+            return None
+        scheduler_patience = max(1, patience // 2)
+        min_lr = min(1e-5, learning_rate) if learning_rate > 0 else 1e-6
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=scheduler_patience,
+            threshold=1e-4,
+            min_lr=min_lr,
+        )
+
+    def _get_optimizer_learning_rate(self, optimizer: torch.optim.Optimizer) -> float:
+        """Read the current learning rate from the first param group."""
+        for group in optimizer.param_groups:
+            return float(group.get("lr", 0.0))
+        return 0.0
+
+    def _is_validation_improved(
+        self,
+        val_accuracy: float,
+        val_loss: Optional[float],
+        best_val_accuracy: float,
+        best_val_loss: Optional[float],
+        min_delta: float,
+    ) -> bool:
+        """Determine whether validation metrics improved enough to keep training."""
+        if best_val_accuracy < 0:
+            return True
+        if val_accuracy > best_val_accuracy + min_delta:
+            return True
+
+        accuracy_gap = abs(val_accuracy - best_val_accuracy)
+        if accuracy_gap <= min_delta and val_loss is not None:
+            if best_val_loss is None:
+                return True
+            loss_delta = max(min_delta * 0.1, 1e-5)
+            return val_loss < best_val_loss - loss_delta
+
+        return False
 
     def _video_frame_cache_root(self, input_size: int) -> Path:
         return Path(settings.DATA_DIR) / "frame_cache" / f"{input_size}px"
@@ -1261,6 +1352,12 @@ class TrainingService:
                     "epochs": job.epochs,
                     "learning_rate": job.learning_rate,
                     "batch_size": job.batch_size,
+                    "validation_split": 0.2,
+                    "early_stopping": True,
+                    "patience": 10,
+                    "early_stopping_min_delta": 0.002,
+                    "weight_decay": 0.0001,
+                    "label_smoothing": 0.05,
                 },
             )
 
@@ -1599,6 +1696,15 @@ class TrainingService:
             learning_rate = float(parameters.get("learning_rate", job.learning_rate))
             batch_size = int(parameters.get("batch_size", job.batch_size))
             validation_split = float(parameters.get("validation_split", 0.2))
+            early_stopping = bool(parameters.get("early_stopping", True))
+            patience = max(1, int(parameters.get("patience", 10)))
+            early_stopping_min_delta = max(
+                0.0, float(parameters.get("early_stopping_min_delta", 0.002))
+            )
+            weight_decay = max(0.0, float(parameters.get("weight_decay", 0.0001)))
+            label_smoothing = min(
+                0.2, max(0.0, float(parameters.get("label_smoothing", 0.05)))
+            )
             sequence_length = int(parameters.get("sequence_length", 8))
             frame_stride = int(parameters.get("frame_stride", 2))
             temporal_hidden_size = int(parameters.get("temporal_hidden_size", 256))
@@ -1632,6 +1738,12 @@ class TrainingService:
             {
                 "total_epochs": epochs,
                 "mode": training_mode,
+                "validation_split": validation_split,
+                "early_stopping": early_stopping,
+                "patience": patience,
+                "early_stopping_min_delta": early_stopping_min_delta,
+                "weight_decay": weight_decay,
+                "label_smoothing": label_smoothing,
             },
         )
 
@@ -1712,13 +1824,13 @@ class TrainingService:
             model = model.to(memory_format=torch.channels_last)
         amp_enabled = device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-        criterion = nn.CrossEntropyLoss()
-
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(
-            trainable_params if trainable_params else model.parameters(),
-            lr=learning_rate,
+        criterion = self._build_training_criterion(label_smoothing)
+        optimizer = self._build_training_optimizer(
+            model,
+            learning_rate,
+            weight_decay,
         )
+        scheduler = self._build_plateau_scheduler(optimizer, learning_rate, patience)
 
         model_dir = Path(settings.MODEL_DIR)
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -1726,6 +1838,8 @@ class TrainingService:
 
         best_val_accuracy = -1.0
         best_val_loss = None
+        best_epoch = 0
+        epochs_without_improvement = 0
         epoch_prefix = "视频时序融合" if uses_temporal_context else "Epoch"
 
         for epoch in range(1, epochs + 1):
@@ -1755,6 +1869,7 @@ class TrainingService:
                     message=f"{epoch_prefix} {epoch}/{epochs} 训练中（批次 {batch_index}/{batch_total}）",
                 )
 
+            epoch_learning_rate = self._get_optimizer_learning_rate(optimizer)
             train_loss, train_accuracy = self._run_train_epoch(
                 model,
                 train_loader,
@@ -1802,8 +1917,11 @@ class TrainingService:
                 train_accuracy,
                 val_loss,
                 val_accuracy,
-                learning_rate,
+                epoch_learning_rate,
             )
+
+            if scheduler is not None:
+                scheduler.step(val_loss)
 
             logger.info(
                 "Training epoch completed",
@@ -1817,15 +1935,27 @@ class TrainingService:
                 progress=progress,
             )
 
-            if val_accuracy > best_val_accuracy:
+            improved = self._is_validation_improved(
+                val_accuracy,
+                val_loss,
+                best_val_accuracy,
+                best_val_loss,
+                early_stopping_min_delta,
+            )
+
+            if improved:
                 best_val_accuracy = val_accuracy
                 best_val_loss = val_loss
+                best_epoch = epoch
+                epochs_without_improvement = 0
                 self._set_active_job_metadata(
                     job_id,
                     {
                         "message": f"{epoch_prefix} {epoch}/{epochs} 正在保存最佳模型",
                         "current_epoch": epoch,
                         "total_epochs": epochs,
+                        "best_epoch": best_epoch,
+                        "epochs_trained": epoch,
                     },
                 )
                 checkpoint_payload = {
@@ -1837,11 +1967,18 @@ class TrainingService:
                     "batch_size": batch_size,
                     "validation_split": validation_split,
                     "training_device": training_device,
+                    "weight_decay": weight_decay,
+                    "label_smoothing": label_smoothing,
+                    "early_stopping": early_stopping,
+                    "patience": patience,
+                    "early_stopping_min_delta": early_stopping_min_delta,
                     "num_classes": 2,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_accuracy": val_accuracy,
                     "val_loss": val_loss,
+                    "best_epoch": best_epoch,
+                    "epochs_trained": epoch,
                     "input_size": settings.MODEL_INPUT_SIZE,
                     "video_temporal_enabled": uses_temporal_context,
                     "training_mode": training_mode,
@@ -1858,12 +1995,50 @@ class TrainingService:
                         }
                     )
                 torch.save(checkpoint_payload, str(best_checkpoint_path))
+            else:
+                epochs_without_improvement += 1
+                self._set_active_job_metadata(
+                    job_id,
+                    {
+                        "best_epoch": best_epoch or None,
+                        "epochs_trained": epoch,
+                    },
+                )
+
+            if (
+                early_stopping
+                and epochs_without_improvement >= patience
+                and epoch < epochs
+            ):
+                logger.info(
+                    "Early stopping triggered for image training",
+                    job_id=job_id,
+                    epoch=epoch,
+                    patience=patience,
+                    best_epoch=best_epoch,
+                    best_val_accuracy=best_val_accuracy,
+                    best_val_loss=best_val_loss,
+                )
+                self._set_active_job_metadata(
+                    job_id,
+                    {
+                        "message": f"{epoch_prefix} {epoch}/{epochs} 验证指标连续 {patience} 轮未提升，提前停止",
+                        "current_epoch": epoch,
+                        "total_epochs": epochs,
+                        "best_epoch": best_epoch or None,
+                        "epochs_trained": epoch,
+                    },
+                )
+                break
 
         self._finalize_successful_training(
             job_id,
             best_val_accuracy,
             best_val_loss,
             best_checkpoint_path,
+            epochs_trained=epoch,
+            best_epoch=best_epoch or None,
+            stopped_early=early_stopping and epoch < epochs,
         )
 
     def _train_sequence_model(self, job_id: int, parameters: Dict[str, Any]):
@@ -1879,6 +2054,15 @@ class TrainingService:
             learning_rate = float(parameters.get("learning_rate", job.learning_rate))
             batch_size = int(parameters.get("batch_size", job.batch_size))
             validation_split = float(parameters.get("validation_split", 0.2))
+            early_stopping = bool(parameters.get("early_stopping", True))
+            patience = max(1, int(parameters.get("patience", 10)))
+            early_stopping_min_delta = max(
+                0.0, float(parameters.get("early_stopping_min_delta", 0.002))
+            )
+            weight_decay = max(0.0, float(parameters.get("weight_decay", 0.0001)))
+            label_smoothing = min(
+                0.2, max(0.0, float(parameters.get("label_smoothing", 0.05)))
+            )
             sequence_length = int(parameters.get("sequence_length", 16))
             frame_stride = int(parameters.get("frame_stride", 1))
             hidden_size = int(parameters.get("hidden_size", 512))
@@ -1908,6 +2092,12 @@ class TrainingService:
             {
                 "total_epochs": epochs,
                 "mode": "sequence",
+                "validation_split": validation_split,
+                "early_stopping": early_stopping,
+                "patience": patience,
+                "early_stopping_min_delta": early_stopping_min_delta,
+                "weight_decay": weight_decay,
+                "label_smoothing": label_smoothing,
             },
         )
         preprocessing_reporter(
@@ -1965,13 +2155,13 @@ class TrainingService:
         ).to(device)
         amp_enabled = device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-        criterion = nn.CrossEntropyLoss()
-
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(
-            trainable_params if trainable_params else model.parameters(),
-            lr=learning_rate,
+        criterion = self._build_training_criterion(label_smoothing)
+        optimizer = self._build_training_optimizer(
+            model,
+            learning_rate,
+            weight_decay,
         )
+        scheduler = self._build_plateau_scheduler(optimizer, learning_rate, patience)
 
         model_dir = Path(settings.MODEL_DIR)
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -1979,6 +2169,8 @@ class TrainingService:
 
         best_val_accuracy = -1.0
         best_val_loss = None
+        best_epoch = 0
+        epochs_without_improvement = 0
 
         for epoch in range(1, epochs + 1):
             if self._is_job_cancelled(job_id):
@@ -2007,6 +2199,7 @@ class TrainingService:
                     message=f"Sequence epoch {epoch}/{epochs} 训练中（批次 {batch_index}/{batch_total}）",
                 )
 
+            epoch_learning_rate = self._get_optimizer_learning_rate(optimizer)
             train_loss, train_accuracy = self._run_train_epoch(
                 model,
                 train_loader,
@@ -2052,8 +2245,11 @@ class TrainingService:
                 train_accuracy,
                 val_loss,
                 val_accuracy,
-                learning_rate,
+                epoch_learning_rate,
             )
+
+            if scheduler is not None:
+                scheduler.step(val_loss)
 
             logger.info(
                 "Sequence training epoch completed",
@@ -2069,15 +2265,27 @@ class TrainingService:
                 frame_stride=frame_stride,
             )
 
-            if val_accuracy > best_val_accuracy:
+            improved = self._is_validation_improved(
+                val_accuracy,
+                val_loss,
+                best_val_accuracy,
+                best_val_loss,
+                early_stopping_min_delta,
+            )
+
+            if improved:
                 best_val_accuracy = val_accuracy
                 best_val_loss = val_loss
+                best_epoch = epoch
+                epochs_without_improvement = 0
                 self._set_active_job_metadata(
                     job_id,
                     {
                         "message": f"Sequence epoch {epoch}/{epochs} 正在保存最佳模型",
                         "current_epoch": epoch,
                         "total_epochs": epochs,
+                        "best_epoch": best_epoch,
+                        "epochs_trained": epoch,
                     },
                 )
                 torch.save(
@@ -2090,6 +2298,11 @@ class TrainingService:
                         "batch_size": batch_size,
                         "validation_split": validation_split,
                         "training_device": training_device,
+                        "weight_decay": weight_decay,
+                        "label_smoothing": label_smoothing,
+                        "early_stopping": early_stopping,
+                        "patience": patience,
+                        "early_stopping_min_delta": early_stopping_min_delta,
                         "num_classes": 2,
                         "hidden_size": hidden_size,
                         "num_layers": num_layers,
@@ -2099,6 +2312,8 @@ class TrainingService:
                         "optimizer_state_dict": optimizer.state_dict(),
                         "val_accuracy": val_accuracy,
                         "val_loss": val_loss,
+                        "best_epoch": best_epoch,
+                        "epochs_trained": epoch,
                         "input_size": settings.MODEL_INPUT_SIZE,
                         "sequence_length": sequence_length,
                         "frame_stride": frame_stride,
@@ -2108,12 +2323,50 @@ class TrainingService:
                     },
                     str(best_checkpoint_path),
                 )
+            else:
+                epochs_without_improvement += 1
+                self._set_active_job_metadata(
+                    job_id,
+                    {
+                        "best_epoch": best_epoch or None,
+                        "epochs_trained": epoch,
+                    },
+                )
+
+            if (
+                early_stopping
+                and epochs_without_improvement >= patience
+                and epoch < epochs
+            ):
+                logger.info(
+                    "Early stopping triggered for sequence training",
+                    job_id=job_id,
+                    epoch=epoch,
+                    patience=patience,
+                    best_epoch=best_epoch,
+                    best_val_accuracy=best_val_accuracy,
+                    best_val_loss=best_val_loss,
+                )
+                self._set_active_job_metadata(
+                    job_id,
+                    {
+                        "message": f"Sequence epoch {epoch}/{epochs} 验证指标连续 {patience} 轮未提升，提前停止",
+                        "current_epoch": epoch,
+                        "total_epochs": epochs,
+                        "best_epoch": best_epoch or None,
+                        "epochs_trained": epoch,
+                    },
+                )
+                break
 
         self._finalize_successful_training(
             job_id,
             best_val_accuracy,
             best_val_loss,
             best_checkpoint_path,
+            epochs_trained=epoch,
+            best_epoch=best_epoch or None,
+            stopped_early=early_stopping and epoch < epochs,
         )
 
     def _finalize_successful_training(
@@ -2122,6 +2375,9 @@ class TrainingService:
         best_val_accuracy: float,
         best_val_loss: Optional[float],
         best_checkpoint_path: Path,
+        epochs_trained: Optional[int] = None,
+        best_epoch: Optional[int] = None,
+        stopped_early: bool = False,
     ):
         """Persist final job state after successful training."""
         with get_db_session() as db:
@@ -2150,7 +2406,13 @@ class TrainingService:
                 "current_accuracy": best_val_accuracy
                 if best_val_accuracy >= 0
                 else None,
-                "message": "训练完成，可决定是否保留模型文件",
+                "message": (
+                    f"训练已提前停止并完成，最佳轮次 {best_epoch}，可决定是否保留模型文件"
+                    if stopped_early and best_epoch
+                    else "训练完成，可决定是否保留模型文件"
+                ),
+                "epochs_trained": epochs_trained,
+                "best_epoch": best_epoch,
             },
         )
 
@@ -2182,6 +2444,17 @@ class TrainingService:
             [
                 transforms.Resize((input_size, input_size)),
                 transforms.RandomHorizontalFlip(),
+                transforms.RandomApply(
+                    [
+                        transforms.ColorJitter(
+                            brightness=0.12,
+                            contrast=0.12,
+                            saturation=0.08,
+                            hue=0.02,
+                        )
+                    ],
+                    p=0.35,
+                ),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -2477,7 +2750,9 @@ class TrainingService:
             raise ValueError("No labeled validation clips found")
 
         train_dataset = SequenceClassificationDataset(
-            train_samples, transform=train_transform
+            train_samples,
+            transform=train_transform,
+            augment=True,
         )
         val_dataset = SequenceClassificationDataset(
             val_samples, transform=val_transform
@@ -3260,6 +3535,14 @@ class TrainingService:
         current_epoch = active_meta.get("current_epoch")
         total_epochs = active_meta.get("total_epochs", job.epochs)
         progress_message = active_meta.get("message")
+        validation_split = active_meta.get("validation_split", 0.2)
+        early_stopping = active_meta.get("early_stopping", True)
+        patience = active_meta.get("patience", 10)
+        early_stopping_min_delta = active_meta.get("early_stopping_min_delta", 0.002)
+        weight_decay = active_meta.get("weight_decay", 0.0001)
+        label_smoothing = active_meta.get("label_smoothing", 0.05)
+        best_epoch = active_meta.get("best_epoch")
+        epochs_trained = active_meta.get("epochs_trained")
         preprocessing_stage = active_meta.get("preprocessing_stage")
         preprocessing_progress = active_meta.get("preprocessing_progress")
         preprocessing_current = active_meta.get("preprocessing_current")
@@ -3268,6 +3551,8 @@ class TrainingService:
 
         if current_epoch is None and job.status == JobStatus.COMPLETED.value:
             current_epoch = job.epochs
+        if epochs_trained is None and job.status == JobStatus.COMPLETED.value:
+            epochs_trained = job.epochs
 
         if progress_message is None:
             if job.status == JobStatus.COMPLETED.value:
@@ -3287,16 +3572,25 @@ class TrainingService:
             batch_size=job.batch_size
             if job.batch_size is not None
             else settings.MODEL_BATCH_SIZE,
-            validation_split=0.2,
-            early_stopping=True,
-            patience=10,
+            validation_split=validation_split,
+            early_stopping=early_stopping,
+            patience=patience,
+            early_stopping_min_delta=early_stopping_min_delta,
+            weight_decay=weight_decay,
+            label_smoothing=label_smoothing,
             training_device=training_device,
         )
 
         results = None
         if job.accuracy is not None:
             results = TrainingResults(
-                accuracy=job.accuracy, loss=job.loss, model_path=job.model_path
+                accuracy=job.accuracy,
+                loss=job.loss,
+                val_accuracy=job.accuracy,
+                val_loss=job.loss,
+                epochs_trained=epochs_trained,
+                best_epoch=best_epoch,
+                model_path=job.model_path,
             )
 
         return TrainingJobResponse(
@@ -3417,6 +3711,11 @@ class TrainingService:
             "learning_rate": checkpoint.get("learning_rate"),
             "batch_size": checkpoint.get("batch_size"),
             "validation_split": checkpoint.get("validation_split"),
+            "weight_decay": checkpoint.get("weight_decay"),
+            "label_smoothing": checkpoint.get("label_smoothing"),
+            "early_stopping": checkpoint.get("early_stopping"),
+            "patience": checkpoint.get("patience"),
+            "early_stopping_min_delta": checkpoint.get("early_stopping_min_delta"),
             "training_device": checkpoint.get("training_device"),
             "sequence_length": checkpoint.get("sequence_length"),
             "frame_stride": checkpoint.get("frame_stride"),
@@ -3428,6 +3727,8 @@ class TrainingService:
             "temporal_num_layers": checkpoint.get("temporal_num_layers"),
             "feature_projection_size": checkpoint.get("feature_projection_size"),
             "frame_projection_size": checkpoint.get("frame_projection_size"),
+            "best_epoch": checkpoint.get("best_epoch"),
+            "epochs_trained": checkpoint.get("epochs_trained"),
         }
         filtered_parameters = {
             key: value for key, value in parameters.items() if value is not None

@@ -37,6 +37,21 @@ class TrainingParameters(BaseModel):
     patience: int = Field(
         default=10, ge=1, le=100, description="Early stopping patience"
     )
+    early_stopping_min_delta: float = Field(
+        default=0.002,
+        ge=0.0,
+        le=1.0,
+        description="Minimum validation accuracy improvement to reset early stopping",
+    )
+    weight_decay: float = Field(
+        default=0.0001, ge=0.0, le=1.0, description="AdamW weight decay"
+    )
+    label_smoothing: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.2,
+        description="Cross-entropy label smoothing factor",
+    )
     training_device: str = Field(
         default="auto", description="Training device: auto, mps, cuda, cpu"
     )
