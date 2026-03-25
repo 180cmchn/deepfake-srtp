@@ -458,27 +458,15 @@ class TrainingService:
     def _build_balanced_sampler(
         self, labels: List[int], context: str
     ) -> Optional[WeightedRandomSampler]:
-        """Create a weighted sampler for imbalanced binary training sets."""
+        """Disable sampler reweighting when imbalance is handled explicitly elsewhere."""
         counts = self._count_labels(labels)
-        if len(counts) < 2:
-            return None
-
-        min_count = min(counts.values())
-        max_count = max(counts.values())
-        if min_count <= 0 or max_count <= int(min_count * 1.5):
-            return None
-
-        sample_weights = [1.0 / counts[int(label)] for label in labels]
-        logger.info(
-            "Enabled weighted sampler for imbalanced training split",
-            context=context,
-            counts=counts,
-        )
-        return WeightedRandomSampler(
-            weights=torch.DoubleTensor(sample_weights),
-            num_samples=len(sample_weights),
-            replacement=True,
-        )
+        if counts:
+            logger.info(
+                "Skipping sampler reweighting; using majority downsampling and class-weighted loss",
+                context=context,
+                counts=counts,
+            )
+        return None
 
     def _resolve_temporal_clip_budget(
         self, sequence_length: int, training: bool
@@ -511,17 +499,105 @@ class TrainingService:
                 deduplicated.append(value)
         return deduplicated or values[:target_count]
 
-    def _build_training_criterion(self, label_smoothing: float) -> nn.Module:
+    def _downsample_majority_items(
+        self,
+        items: List[Any],
+        label_getter: Callable[[Any], int],
+        context: str,
+    ) -> List[Any]:
+        """Downsample the majority class in the training split to the minority count."""
+        if not items:
+            return items
+
+        label_groups: Dict[int, List[Any]] = {}
+        for item in items:
+            label = int(label_getter(item))
+            label_groups.setdefault(label, []).append(item)
+
+        if len(label_groups) < 2:
+            return items
+
+        counts_before = {
+            label: len(group) for label, group in sorted(label_groups.items())
+        }
+        minority_count = min(counts_before.values())
+        majority_count = max(counts_before.values())
+        if majority_count <= minority_count:
+            return items
+
+        rng = random.Random(42)
+        balanced_items: List[Any] = []
+        counts_after: Dict[int, int] = {}
+        for label, group in sorted(label_groups.items()):
+            selected = list(group)
+            rng.shuffle(selected)
+            if len(selected) > minority_count:
+                selected = selected[:minority_count]
+            counts_after[label] = len(selected)
+            balanced_items.extend(selected)
+
+        rng.shuffle(balanced_items)
+        logger.info(
+            "Downsampled majority class for training split",
+            context=context,
+            before=counts_before,
+            after=counts_after,
+        )
+        return balanced_items
+
+    def _compute_class_weights(
+        self,
+        labels: List[int],
+        num_classes: int = 2,
+    ) -> Optional[List[float]]:
+        """Compute capped class weights that follow the current majority-upweight policy."""
+        counts = self._count_labels(labels)
+        if len(counts) < 2:
+            return None
+
+        min_count = min(counts.values())
+        weights: List[float] = []
+        for label in range(num_classes):
+            count = counts.get(label)
+            if not count:
+                weights.append(1.0)
+                continue
+            weight = (count / float(min_count)) ** 0.5
+            weights.append(min(3.0, max(1.0, weight)))
+
+        logger.info(
+            "Computed class weights for imbalanced training",
+            counts=counts,
+            weights=weights,
+        )
+        return weights
+
+    def _build_training_criterion(
+        self,
+        label_smoothing: float,
+        class_weights: Optional[List[float]] = None,
+        device: Optional[torch.device] = None,
+    ) -> nn.Module:
         """Create a classification loss with optional smoothing fallback."""
+        weight_tensor = None
+        if class_weights:
+            weight_tensor = torch.tensor(
+                class_weights,
+                dtype=torch.float32,
+                device=device or torch.device("cpu"),
+            )
         try:
-            return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            return nn.CrossEntropyLoss(
+                weight=weight_tensor,
+                label_smoothing=label_smoothing,
+            )
         except TypeError:
             if label_smoothing > 0:
                 logger.warning(
                     "CrossEntropyLoss label_smoothing unsupported, falling back to plain CE",
                     label_smoothing=label_smoothing,
                 )
-            return nn.CrossEntropyLoss()
+            return nn.CrossEntropyLoss(weight=weight_tensor)
 
     def _build_training_optimizer(
         self,
@@ -1965,7 +2041,7 @@ class TrainingService:
                 f"正在准备视频时序样本（长度 {sequence_length}，步长 {frame_stride}）",
                 {"stage": "prepare_temporal_dataset", "unit": "phase"},
             )
-            train_loader, val_loader = self._build_temporal_dataloaders(
+            train_loader, val_loader, class_weights = self._build_temporal_dataloaders(
                 dataset_path,
                 batch_size,
                 validation_split,
@@ -1988,7 +2064,7 @@ class TrainingService:
                 "正在扫描训练数据集并整理样本",
                 {"stage": "scan_dataset", "unit": "phase"},
             )
-            train_loader, val_loader = self._build_dataloaders(
+            train_loader, val_loader, class_weights = self._build_dataloaders(
                 dataset_path,
                 batch_size,
                 validation_split,
@@ -2011,7 +2087,18 @@ class TrainingService:
             model = model.to(memory_format=torch.channels_last)
         amp_enabled = device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-        criterion = self._build_training_criterion(label_smoothing)
+        criterion = self._build_training_criterion(
+            label_smoothing,
+            class_weights=class_weights,
+            device=device,
+        )
+        self._set_active_job_metadata(
+            job_id,
+            {
+                "class_weights": class_weights,
+                "majority_downsampling": True,
+            },
+        )
         optimizer = self._build_training_optimizer(
             model,
             learning_rate,
@@ -2156,6 +2243,8 @@ class TrainingService:
                     "training_device": training_device,
                     "weight_decay": weight_decay,
                     "label_smoothing": label_smoothing,
+                    "class_weights": class_weights,
+                    "majority_downsampling": True,
                     "early_stopping": early_stopping,
                     "patience": patience,
                     "early_stopping_min_delta": early_stopping_min_delta,
@@ -2314,7 +2403,7 @@ class TrainingService:
             apple_silicon=self._is_apple_silicon(),
             requested_device=training_device,
         )
-        train_loader, val_loader = self._build_sequence_dataloaders(
+        train_loader, val_loader, class_weights = self._build_sequence_dataloaders(
             dataset_path,
             batch_size,
             validation_split,
@@ -2344,7 +2433,18 @@ class TrainingService:
         ).to(device)
         amp_enabled = device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-        criterion = self._build_training_criterion(label_smoothing)
+        criterion = self._build_training_criterion(
+            label_smoothing,
+            class_weights=class_weights,
+            device=device,
+        )
+        self._set_active_job_metadata(
+            job_id,
+            {
+                "class_weights": class_weights,
+                "majority_downsampling": True,
+            },
+        )
         optimizer = self._build_training_optimizer(
             model,
             learning_rate,
@@ -2489,6 +2589,8 @@ class TrainingService:
                         "training_device": training_device,
                         "weight_decay": weight_decay,
                         "label_smoothing": label_smoothing,
+                        "class_weights": class_weights,
+                        "majority_downsampling": True,
                         "early_stopping": early_stopping,
                         "patience": patience,
                         "early_stopping_min_delta": early_stopping_min_delta,
@@ -2613,7 +2715,7 @@ class TrainingService:
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
-    ) -> Tuple[DataLoader, DataLoader]:
+    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]]]:
         """Build train/validation dataloaders from image dataset path."""
         root_path = Path(dataset_path).expanduser()
         if not root_path.exists() or not root_path.is_dir():
@@ -2744,6 +2846,15 @@ class TrainingService:
         if not val_samples:
             raise ValueError("No labeled validation samples found")
 
+        train_class_weights = self._compute_class_weights(
+            [sample.label for sample in train_samples]
+        )
+        train_samples = self._downsample_majority_items(
+            train_samples,
+            lambda sample: int(sample.label),
+            "image_train_samples",
+        )
+
         self._ensure_label_coverage(
             [sample.label for sample in train_samples],
             [sample.label for sample in val_samples],
@@ -2819,7 +2930,7 @@ class TrainingService:
                 },
             )
 
-        return train_loader, val_loader
+        return train_loader, val_loader, train_class_weights
 
     def _build_sequence_dataloaders(
         self,
@@ -2831,7 +2942,7 @@ class TrainingService:
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
-    ) -> Tuple[DataLoader, DataLoader]:
+    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]]]:
         """Build train/validation dataloaders for frame sequence clips."""
         return self._build_temporal_dataloaders(
             dataset_path,
@@ -2852,7 +2963,7 @@ class TrainingService:
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
-    ) -> Tuple[DataLoader, DataLoader]:
+    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]]]:
         """Build temporal dataloaders from mixed image/video datasets."""
         root_path = Path(dataset_path).expanduser()
         if not root_path.exists() or not root_path.is_dir():
@@ -2938,6 +3049,18 @@ class TrainingService:
         )
         self._log_label_distribution(
             "temporal_val_sources", [source.label for source in val_sources]
+        )
+        train_class_weights = self._compute_class_weights(
+            [source.label for source in train_sources]
+        )
+        train_sources = self._downsample_majority_items(
+            train_sources,
+            lambda source: int(source.label),
+            "temporal_train_sources",
+        )
+        self._log_label_distribution(
+            "temporal_train_sources_balanced",
+            [source.label for source in train_sources],
         )
 
         train_clip_budget = self._resolve_temporal_clip_budget(
@@ -3039,7 +3162,7 @@ class TrainingService:
                 },
             )
 
-        return train_loader, val_loader
+        return train_loader, val_loader, train_class_weights
 
     def _dataset_has_temporal_media(self, dataset_path: str) -> bool:
         """Return True when the dataset contains video files or frame-group videos."""
@@ -3981,6 +4104,8 @@ class TrainingService:
             "validation_split": checkpoint.get("validation_split"),
             "weight_decay": checkpoint.get("weight_decay"),
             "label_smoothing": checkpoint.get("label_smoothing"),
+            "class_weights": checkpoint.get("class_weights"),
+            "majority_downsampling": checkpoint.get("majority_downsampling"),
             "early_stopping": checkpoint.get("early_stopping"),
             "patience": checkpoint.get("patience"),
             "early_stopping_min_delta": checkpoint.get("early_stopping_min_delta"),
