@@ -192,6 +192,15 @@ docker build -t deepfake-detection .
 docker run -p 8000:8000 deepfake-detection
 ```
 
+### Connect Local Frontend to Remote Backend
+If the backend runs on the remote cloud host while the frontend runs locally, create an SSH tunnel on your local machine to forward local port `8000` to the remote backend:
+
+```bash
+ssh -p 13114 -L 8000:127.0.0.1:8000 root@connect.westd.seetacloud.com
+```
+
+After the tunnel is established, the local frontend can keep using `http://localhost:8000/api/v1` and requests will be forwarded to the remote backend.
+
 ## 📚 API Documentation
 
 Once the application is running, visit:

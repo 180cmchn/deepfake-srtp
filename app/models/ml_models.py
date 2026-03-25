@@ -128,7 +128,7 @@ class LRCN(nn.Module):
         num_layers,
         num_classes=2,
         pretrained=True,
-        frame_projection_size=256,
+        frame_projection_size=128,
     ):
         super(LRCN, self).__init__()
         self.pretrained_cnn = PretrainedVGG(pretrained=pretrained)
@@ -424,10 +424,10 @@ class ModelRegistry:
         if model_type == "lrcn":
             # LRCN requires specific parameters
             input_size = kwargs.get("input_size", 25088)  # VGG feature size
-            hidden_size = kwargs.get("hidden_size", 512)
-            num_layers = kwargs.get("num_layers", 2)
+            hidden_size = kwargs.get("hidden_size", 256)
+            num_layers = kwargs.get("num_layers", 1)
             num_classes = kwargs.get("num_classes", 2)
-            frame_projection_size = kwargs.get("frame_projection_size", 256)
+            frame_projection_size = kwargs.get("frame_projection_size", 128)
             return model_class(
                 input_size,
                 hidden_size,

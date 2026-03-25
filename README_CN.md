@@ -162,6 +162,15 @@ docker build -t deepfake-detection .
 docker run -p 8000:8000 -v $(pwd)/data:/app/data deepfake-detection
 ```
 
+### 本地前端联动远程后端
+如果后端部署在远程云主机、本地只运行前端，可在本地建立 SSH 隧道，把本地 `8000` 转发到远程后端：
+
+```bash
+ssh -p 13114 -L 8000:127.0.0.1:8000 root@connect.westd.seetacloud.com
+```
+
+建立后，本地前端可继续访问 `http://localhost:8000/api/v1`，请求会自动转发到远程后端。
+
 ## 📚 API文档
 
 应用启动后，访问：

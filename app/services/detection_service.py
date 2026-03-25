@@ -1285,14 +1285,14 @@ class DetectionService:
                         parameters.get("feature_input_size", 25088),
                     ),
                     "hidden_size": checkpoint.get(
-                        "hidden_size", parameters.get("hidden_size", 512)
+                        "hidden_size", parameters.get("hidden_size", 256)
                     ),
                     "num_layers": checkpoint.get(
-                        "num_layers", parameters.get("num_layers", 2)
+                        "num_layers", parameters.get("num_layers", 1)
                     ),
                     "frame_projection_size": checkpoint.get(
                         "frame_projection_size",
-                        parameters.get("frame_projection_size", 256),
+                        parameters.get("frame_projection_size", 128),
                     ),
                 }
             )

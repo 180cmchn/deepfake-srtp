@@ -3,6 +3,7 @@ Training service for deepfake detection platform
 """
 
 import asyncio
+from collections import Counter
 import html
 import hashlib
 import json
@@ -17,9 +18,9 @@ from typing import List, Optional, Dict, Any, Tuple, Callable
 
 import cv2
 import torch
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -204,16 +205,64 @@ class SequenceClassificationDataset(Dataset):
                 image = img.convert("RGB")
             frames.append(image)
 
-        if self.augment and frames and random.random() < 0.5:
-            frames = [
-                frame.transpose(Image.Transpose.FLIP_LEFT_RIGHT) for frame in frames
-            ]
+        if self.augment and frames:
+            frames = self._apply_clip_augmentation(frames)
 
         if self.transform:
             frames = [self.transform(frame) for frame in frames]
 
         clip = torch.stack(frames, dim=0)
         return clip, label
+
+    def _apply_clip_augmentation(self, frames: List[Image.Image]) -> List[Image.Image]:
+        """Apply temporally consistent augmentation to an entire clip."""
+        augmented = list(frames)
+
+        if random.random() < 0.5:
+            augmented = [ImageOps.mirror(frame) for frame in augmented]
+
+        if random.random() < 0.35:
+            width, height = augmented[0].size
+            crop_scale = random.uniform(0.84, 1.0)
+            crop_width = max(1, int(width * crop_scale))
+            crop_height = max(1, int(height * crop_scale))
+            left = 0 if crop_width >= width else random.randint(0, width - crop_width)
+            top = (
+                0 if crop_height >= height else random.randint(0, height - crop_height)
+            )
+            crop_box = (left, top, left + crop_width, top + crop_height)
+            augmented = [
+                frame.crop(crop_box).resize((width, height), Image.BILINEAR)
+                for frame in augmented
+            ]
+
+        if random.random() < 0.4:
+            brightness = random.uniform(0.88, 1.12)
+            contrast = random.uniform(0.88, 1.12)
+            saturation = random.uniform(0.9, 1.1)
+            augmented = [
+                ImageEnhance.Color(
+                    ImageEnhance.Contrast(
+                        ImageEnhance.Brightness(frame).enhance(brightness)
+                    ).enhance(contrast)
+                ).enhance(saturation)
+                for frame in augmented
+            ]
+
+        if random.random() < 0.18:
+            angle = random.uniform(-4.0, 4.0)
+            augmented = [
+                frame.rotate(angle, resample=Image.BILINEAR) for frame in augmented
+            ]
+
+        if random.random() < 0.16:
+            blur_radius = random.uniform(0.35, 0.8)
+            augmented = [
+                frame.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                for frame in augmented
+            ]
+
+        return augmented
 
 
 class TrainingService:
@@ -323,6 +372,144 @@ class TrainingService:
             torch.backends.cuda.matmul.allow_tf32 = True
         if hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision("high")
+
+    def _count_labels(self, labels: List[int]) -> Dict[int, int]:
+        """Count labels and keep output stable for logging/debugging."""
+        counts = Counter(int(label) for label in labels)
+        return {label: counts[label] for label in sorted(counts)}
+
+    def _log_label_distribution(self, stage: str, labels: List[int]) -> None:
+        """Log label counts to make class imbalance visible during training."""
+        counts = self._count_labels(labels)
+        if not counts:
+            return
+        logger.info(
+            "Training label distribution",
+            stage=stage,
+            total=sum(counts.values()),
+            counts=counts,
+        )
+
+    def _ensure_label_coverage(
+        self,
+        train_labels: List[int],
+        val_labels: List[int],
+        context: str,
+    ) -> None:
+        """Require both train and validation splits to cover every present label."""
+        train_set = {int(label) for label in train_labels}
+        val_set = {int(label) for label in val_labels}
+        observed = train_set | val_set
+        if len(observed) < 2:
+            raise ValueError(f"{context} must contain at least 2 distinct labels")
+
+        missing_train = sorted(observed - train_set)
+        missing_val = sorted(observed - val_set)
+        if missing_train or missing_val:
+            raise ValueError(
+                f"{context} must keep every label in both train and validation splits; "
+                f"missing_train={missing_train}, missing_val={missing_val}"
+            )
+
+    def _stratified_split_items(
+        self,
+        items: List[Any],
+        validation_split: float,
+        label_getter: Callable[[Any], int],
+        context: str,
+    ) -> Tuple[List[Any], List[Any]]:
+        """Split sources per label so train/val keep class coverage and ratio."""
+        label_groups: Dict[int, List[Any]] = {}
+        for item in items:
+            label = int(label_getter(item))
+            label_groups.setdefault(label, []).append(item)
+
+        if len(label_groups) < 2:
+            raise ValueError(f"{context} requires at least 2 labels to create a split")
+
+        rng = random.Random(42)
+        train_items: List[Any] = []
+        val_items: List[Any] = []
+
+        for label, group in sorted(label_groups.items()):
+            if len(group) < 2:
+                raise ValueError(
+                    f"{context} needs at least 2 items for label {label} to stratify train/val"
+                )
+            shuffled = list(group)
+            rng.shuffle(shuffled)
+
+            val_count = max(1, int(round(len(shuffled) * validation_split)))
+            if val_count >= len(shuffled):
+                val_count = len(shuffled) - 1
+
+            val_items.extend(shuffled[:val_count])
+            train_items.extend(shuffled[val_count:])
+
+        rng.shuffle(train_items)
+        rng.shuffle(val_items)
+        self._ensure_label_coverage(
+            [int(label_getter(item)) for item in train_items],
+            [int(label_getter(item)) for item in val_items],
+            context,
+        )
+        return train_items, val_items
+
+    def _build_balanced_sampler(
+        self, labels: List[int], context: str
+    ) -> Optional[WeightedRandomSampler]:
+        """Create a weighted sampler for imbalanced binary training sets."""
+        counts = self._count_labels(labels)
+        if len(counts) < 2:
+            return None
+
+        min_count = min(counts.values())
+        max_count = max(counts.values())
+        if min_count <= 0 or max_count <= int(min_count * 1.5):
+            return None
+
+        sample_weights = [1.0 / counts[int(label)] for label in labels]
+        logger.info(
+            "Enabled weighted sampler for imbalanced training split",
+            context=context,
+            counts=counts,
+        )
+        return WeightedRandomSampler(
+            weights=torch.DoubleTensor(sample_weights),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+    def _resolve_temporal_clip_budget(
+        self, sequence_length: int, training: bool
+    ) -> int:
+        """Limit per-source clip counts while still sampling enough temporal windows."""
+        reference_frames = max(1, int(settings.MAX_FRAMES_PER_VIDEO))
+        if training:
+            divisor = max(1, sequence_length // 2)
+            base_budget = (reference_frames + divisor - 1) // divisor
+            return min(8, max(4, base_budget))
+
+        divisor = max(1, sequence_length)
+        base_budget = (reference_frames + divisor - 1) // divisor
+        return min(4, max(2, base_budget))
+
+    def _sample_evenly_spaced_items(
+        self, values: List[int], target_count: Optional[int]
+    ) -> List[int]:
+        """Subsample an ordered list while preserving temporal coverage."""
+        if target_count is None or target_count <= 0 or len(values) <= target_count:
+            return values
+        if target_count == 1:
+            return [values[len(values) // 2]]
+
+        step = (len(values) - 1) / float(target_count - 1)
+        sampled = [values[int(round(step * index))] for index in range(target_count)]
+        deduplicated: List[int] = []
+        for value in sampled:
+            if not deduplicated or deduplicated[-1] != value:
+                deduplicated.append(value)
+        return deduplicated or values[:target_count]
 
     def _build_training_criterion(self, label_smoothing: float) -> nn.Module:
         """Create a classification loss with optional smoothing fallback."""
@@ -2065,9 +2252,9 @@ class TrainingService:
             )
             sequence_length = int(parameters.get("sequence_length", 16))
             frame_stride = int(parameters.get("frame_stride", 1))
-            hidden_size = int(parameters.get("hidden_size", 512))
-            num_layers = int(parameters.get("num_layers", 2))
-            frame_projection_size = int(parameters.get("frame_projection_size", 256))
+            hidden_size = int(parameters.get("hidden_size", 256))
+            num_layers = int(parameters.get("num_layers", 1))
+            frame_projection_size = int(parameters.get("frame_projection_size", 128))
             training_device = str(
                 parameters.get("training_device", settings.TRAINING_DEVICE)
             )
@@ -2076,6 +2263,8 @@ class TrainingService:
             raise ValueError("sequence_length must be greater than 0")
         if frame_stride <= 0:
             raise ValueError("frame_stride must be greater than 0")
+        hidden_size = max(64, hidden_size)
+        num_layers = max(1, num_layers)
         frame_projection_size = max(32, frame_projection_size)
         preprocessing_progress_end = 25.0
         training_progress_span = 99.0 - preprocessing_progress_end
@@ -2491,6 +2680,11 @@ class TrainingService:
             val_samples = self._collect_labeled_media_samples(
                 split_dirs["val"], split_dirs["val"]
             )
+            self._ensure_label_coverage(
+                [sample.label for sample in train_samples],
+                [sample.label for sample in val_samples],
+                "Image dataset split",
+            )
         else:
             if progress_callback is not None:
                 progress_callback(
@@ -2507,11 +2701,6 @@ class TrainingService:
                 )
 
             validation_split = max(0.0, min(0.9, validation_split))
-            val_size = max(1, int(total_sources * validation_split))
-            train_size = total_sources - val_size
-            if train_size <= 0:
-                train_size = total_sources - 1
-                val_size = 1
 
             source_entries: List[Dict[str, Any]] = [
                 {"kind": "image", "sample": sample} for sample in image_sources
@@ -2525,12 +2714,16 @@ class TrainingService:
                 for video_path, label in video_sources
             )
 
-            generator = torch.Generator().manual_seed(42)
-            indices = torch.randperm(len(source_entries), generator=generator).tolist()
-            shuffled = [source_entries[idx] for idx in indices]
-
-            train_entries = shuffled[:train_size]
-            val_entries = shuffled[train_size:]
+            train_entries, val_entries = self._stratified_split_items(
+                source_entries,
+                validation_split,
+                lambda entry: int(
+                    entry["sample"].label
+                    if entry.get("kind") == "image"
+                    else entry["label"]
+                ),
+                "Image/video source split",
+            )
             if progress_callback is not None:
                 progress_callback(
                     0.3,
@@ -2550,6 +2743,18 @@ class TrainingService:
             raise ValueError("No labeled training samples found")
         if not val_samples:
             raise ValueError("No labeled validation samples found")
+
+        self._ensure_label_coverage(
+            [sample.label for sample in train_samples],
+            [sample.label for sample in val_samples],
+            "Image dataset samples",
+        )
+        self._log_label_distribution(
+            "image_train_samples", [sample.label for sample in train_samples]
+        )
+        self._log_label_distribution(
+            "image_val_samples", [sample.label for sample in val_samples]
+        )
 
         train_cache_progress = self._chain_progress_reporter(
             progress_callback, 0.45, 0.75
@@ -2581,12 +2786,17 @@ class TrainingService:
             train_samples, transform=train_transform
         )
         val_dataset = ImageClassificationDataset(val_samples, transform=val_transform)
+        train_sampler = self._build_balanced_sampler(
+            [sample.label for sample in train_samples],
+            "image_train_samples",
+        )
 
         loader_kwargs = self._dataloader_kwargs(len(train_dataset))
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             **loader_kwargs,
         )
         val_loader_kwargs = self._dataloader_kwargs(len(val_dataset))
@@ -2697,6 +2907,11 @@ class TrainingService:
             val_sources = self._collect_temporal_training_sources(
                 split_dirs["val"], split_dirs["val"]
             )
+            self._ensure_label_coverage(
+                [source.label for source in train_sources],
+                [source.label for source in val_sources],
+                "Temporal source split",
+            )
         else:
             if progress_callback is not None:
                 progress_callback(
@@ -2711,17 +2926,26 @@ class TrainingService:
                 )
 
             validation_split = max(0.0, min(0.9, validation_split))
-            val_size = max(1, int(len(all_sources) * validation_split))
-            train_size = len(all_sources) - val_size
-            if train_size <= 0:
-                train_size = len(all_sources) - 1
-                val_size = 1
+            train_sources, val_sources = self._stratified_split_items(
+                all_sources,
+                validation_split,
+                lambda source: int(source.label),
+                "Temporal source split",
+            )
 
-            generator = torch.Generator().manual_seed(42)
-            indices = torch.randperm(len(all_sources), generator=generator).tolist()
-            shuffled = [all_sources[idx] for idx in indices]
-            train_sources = shuffled[:train_size]
-            val_sources = shuffled[train_size:]
+        self._log_label_distribution(
+            "temporal_train_sources", [source.label for source in train_sources]
+        )
+        self._log_label_distribution(
+            "temporal_val_sources", [source.label for source in val_sources]
+        )
+
+        train_clip_budget = self._resolve_temporal_clip_budget(
+            sequence_length, training=True
+        )
+        val_clip_budget = self._resolve_temporal_clip_budget(
+            sequence_length, training=False
+        )
 
         train_clip_progress = self._chain_progress_reporter(
             progress_callback, 0.35, 0.72
@@ -2734,6 +2958,8 @@ class TrainingService:
             input_size,
             progress_callback=train_clip_progress,
             progress_label="正在生成训练集时序片段",
+            max_clips_per_source=train_clip_budget,
+            clip_overlap_ratio=0.7,
         )
         val_samples = self._expand_temporal_sources_to_clips(
             val_sources,
@@ -2742,12 +2968,28 @@ class TrainingService:
             input_size,
             progress_callback=val_clip_progress,
             progress_label="正在生成验证集时序片段",
+            max_clips_per_source=val_clip_budget,
+            clip_overlap_ratio=0.35,
         )
 
         if not train_samples:
             raise ValueError("No labeled training clips found")
         if not val_samples:
             raise ValueError("No labeled validation clips found")
+
+        self._ensure_label_coverage(
+            [label for _frame_paths, label in train_samples],
+            [label for _frame_paths, label in val_samples],
+            "Temporal clip split",
+        )
+        self._log_label_distribution(
+            "temporal_train_clips",
+            [label for _frame_paths, label in train_samples],
+        )
+        self._log_label_distribution(
+            "temporal_val_clips",
+            [label for _frame_paths, label in val_samples],
+        )
 
         train_dataset = SequenceClassificationDataset(
             train_samples,
@@ -2756,6 +2998,10 @@ class TrainingService:
         )
         val_dataset = SequenceClassificationDataset(
             val_samples, transform=val_transform
+        )
+        train_sampler = self._build_balanced_sampler(
+            [label for _frame_paths, label in train_samples],
+            "temporal_train_clips",
         )
 
         if progress_callback is not None:
@@ -2769,7 +3015,8 @@ class TrainingService:
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             **loader_kwargs,
         )
         val_loader_kwargs = self._dataloader_kwargs(len(val_dataset))
@@ -2848,6 +3095,8 @@ class TrainingService:
         sequence_length: int,
         frame_stride: int,
         input_size: int,
+        max_clips_per_source: Optional[int] = None,
+        clip_overlap_ratio: float = 0.5,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
@@ -2872,6 +3121,8 @@ class TrainingService:
                         source.label,
                         sequence_length,
                         frame_stride,
+                        max_clips=max_clips_per_source,
+                        overlap_ratio=clip_overlap_ratio,
                     )
                 )
             elif source.kind == "video" and source.path:
@@ -2887,6 +3138,8 @@ class TrainingService:
                         sequence_length,
                         frame_stride,
                         input_size,
+                        max_clips=max_clips_per_source,
+                        overlap_ratio=clip_overlap_ratio,
                         progress_callback=source_progress,
                         progress_label=f"{progress_label}：{source_name}",
                     )
@@ -2954,6 +3207,8 @@ class TrainingService:
         sequence_length: int,
         frame_stride: int,
         input_size: int,
+        max_clips: Optional[int] = None,
+        overlap_ratio: float = 0.5,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
@@ -2979,6 +3234,8 @@ class TrainingService:
             frame_count,
             sequence_length,
             frame_stride,
+            max_clips=max_clips,
+            overlap_ratio=overlap_ratio,
         )
         total_clips = len(sampled_clips)
         progress_interval = max(1, total_clips // 20) if total_clips else 1
@@ -3029,6 +3286,8 @@ class TrainingService:
         frame_count: int,
         sequence_length: int,
         frame_stride: int,
+        max_clips: Optional[int] = None,
+        overlap_ratio: float = 0.5,
     ) -> List[List[int]]:
         """Sample temporally ordered frame index clips from a raw video."""
         target_length = max(1, sequence_length)
@@ -3048,16 +3307,17 @@ class TrainingService:
         if frame_count <= clip_span:
             return [build_clip(0)]
 
-        max_reference_frames = max(target_length, int(settings.MAX_FRAMES_PER_VIDEO))
-        max_clips = max(1, (max_reference_frames + target_length - 1) // target_length)
         available_span = max(0, frame_count - clip_span)
-
-        if max_clips == 1 or available_span == 0:
-            start_positions = [available_span // 2]
+        if available_span == 0:
+            start_positions = [0]
         else:
-            step = available_span / float(max_clips - 1)
-            start_positions = sorted(
-                {int(round(step * clip_idx)) for clip_idx in range(max_clips)}
+            overlap_ratio = min(max(overlap_ratio, 0.0), 0.9)
+            window_step = max(1, int(round(clip_span * (1.0 - overlap_ratio))))
+            start_positions = list(range(0, available_span + 1, window_step))
+            if not start_positions or start_positions[-1] != available_span:
+                start_positions.append(available_span)
+            start_positions = self._sample_evenly_spaced_items(
+                sorted(set(start_positions)), max_clips
             )
 
         return [build_clip(start_index) for start_index in start_positions]
@@ -3068,6 +3328,8 @@ class TrainingService:
         label: int,
         sequence_length: int,
         frame_stride: int,
+        max_clips: Optional[int] = None,
+        overlap_ratio: float = 0.5,
     ) -> List[Tuple[List[str], int]]:
         """Create fixed-length clips from sorted frame paths."""
         if not frame_paths:
@@ -3089,8 +3351,17 @@ class TrainingService:
             ]
             return [(clip, label)]
 
-        step = max(1, clip_span // 2)
-        for start in range(0, len(frame_paths), step):
+        available_span = len(frame_paths) - clip_span
+        overlap_ratio = min(max(overlap_ratio, 0.0), 0.9)
+        window_step = max(1, int(round(clip_span * (1.0 - overlap_ratio))))
+        start_positions = list(range(0, available_span + 1, window_step))
+        if not start_positions or start_positions[-1] != available_span:
+            start_positions.append(available_span)
+        start_positions = self._sample_evenly_spaced_items(
+            sorted(set(start_positions)), max_clips
+        )
+
+        for start in start_positions:
             clip = []
             for i in range(sequence_length):
                 idx = start + (i * frame_stride)
@@ -3098,9 +3369,6 @@ class TrainingService:
                     idx = len(frame_paths) - 1
                 clip.append(frame_paths[idx])
             clips.append((clip, label))
-
-            if start + clip_span >= len(frame_paths):
-                break
 
         return clips
 
