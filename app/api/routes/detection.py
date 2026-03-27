@@ -7,6 +7,7 @@ from fastapi import (
     Depends,
     UploadFile,
     File,
+    Form,
     HTTPException,
     BackgroundTasks,
     Header,
@@ -38,11 +39,69 @@ from app.schemas.detection import (
 router = APIRouter()
 
 
+def parse_detection_request(
+    model_id: Optional[int] = Form(None),
+    model_type: Optional[str] = Form(None),
+    confidence_threshold: float = Form(0.5),
+    return_probabilities: bool = Form(False),
+    preprocess: bool = Form(True),
+) -> DetectionRequest:
+    return DetectionRequest(
+        model_id=model_id,
+        model_type=model_type,
+        confidence_threshold=confidence_threshold,
+        return_probabilities=return_probabilities,
+        preprocess=preprocess,
+    )
+
+
+def parse_batch_detection_request(
+    model_id: Optional[int] = Form(None),
+    model_type: Optional[str] = Form(None),
+    confidence_threshold: float = Form(0.5),
+    return_probabilities: bool = Form(False),
+    preprocess: bool = Form(True),
+    parallel_processing: bool = Form(True),
+    max_workers: int = Form(4),
+) -> BatchDetectionRequest:
+    return BatchDetectionRequest(
+        model_id=model_id,
+        model_type=model_type,
+        confidence_threshold=confidence_threshold,
+        return_probabilities=return_probabilities,
+        preprocess=preprocess,
+        parallel_processing=parallel_processing,
+        max_workers=max_workers,
+    )
+
+
+def parse_video_detection_request(
+    model_id: Optional[int] = Form(None),
+    model_type: Optional[str] = Form(None),
+    confidence_threshold: float = Form(0.5),
+    frame_extraction_interval: int = Form(4),
+    max_frames: int = Form(20),
+    aggregate_results: bool = Form(True),
+    return_frame_results: bool = Form(False),
+    preprocess: bool = Form(True),
+) -> VideoDetectionRequest:
+    return VideoDetectionRequest(
+        model_id=model_id,
+        model_type=model_type,
+        confidence_threshold=confidence_threshold,
+        frame_extraction_interval=frame_extraction_interval,
+        max_frames=max_frames,
+        aggregate_results=aggregate_results,
+        return_frame_results=return_frame_results,
+        preprocess=preprocess,
+    )
+
+
 @router.post("/detect", response_model=DetectionResponse)
 async def detect_deepfake(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    request: DetectionRequest = Depends(),
+    request: DetectionRequest = Depends(parse_detection_request),
     db: Session = Depends(get_db),
     current_user: str = Depends(get_current_user),
 ):
@@ -174,7 +233,7 @@ async def detect_deepfake(
 async def detect_deepfake_batch(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
-    request: BatchDetectionRequest = Depends(),
+    request: BatchDetectionRequest = Depends(parse_batch_detection_request),
     db: Session = Depends(get_db),
 ):
     """
@@ -230,7 +289,7 @@ async def detect_deepfake_batch(
 async def detect_deepfake_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    request: VideoDetectionRequest = Depends(),
+    request: VideoDetectionRequest = Depends(parse_video_detection_request),
     db: Session = Depends(get_db),
 ):
     """
