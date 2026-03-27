@@ -31,6 +31,7 @@ from app.schemas.detection import (
     DetectionHistoryList,
     DetectionStatistics,
     DetectionResult as DetectionResultSchema,
+    DetectionDecisionMetrics,
     PredictionType,
     FileType,
 )
@@ -80,13 +81,18 @@ class DetectionService:
                 image = self._preprocess_image(file_path, input_size=input_size)
 
             inference_result = await self._predict_tensor(model, image)
-            prediction = inference_result["prediction"]
-            confidence = inference_result["confidence"]
-            probabilities = (
-                inference_result["probabilities"]
-                if request.return_probabilities
-                else None
+            raw_probabilities = inference_result["probabilities"]
+            prediction, confidence = self._probabilities_to_prediction(
+                raw_probabilities,
+                confidence_threshold=request.confidence_threshold,
             )
+            decision_metrics = self._build_decision_metrics(
+                raw_probabilities,
+                request.confidence_threshold,
+                prediction,
+                confidence,
+            )
+            probabilities = raw_probabilities if request.return_probabilities else None
 
             processing_time = time.time() - start_time
 
@@ -95,6 +101,7 @@ class DetectionService:
                 prediction=prediction,
                 confidence=confidence,
                 probabilities=probabilities,
+                decision_metrics=decision_metrics,
                 processing_time=processing_time,
                 model_info={
                     "model_id": loaded_model.get("model_id"),
@@ -308,8 +315,9 @@ class DetectionService:
                 smoothed_probabilities = self._smooth_probability_sequence(
                     valid_probabilities
                 )
-                _, _, fallback_probabilities = self._aggregate_probability_sequence(
-                    smoothed_probabilities
+                _, _, fallback_probabilities, _ = self._aggregate_probability_sequence(
+                    smoothed_probabilities,
+                    confidence_threshold=request.confidence_threshold,
                 )
                 smoothed_index = 0
                 for probabilities in raw_frame_probabilities:
@@ -331,11 +339,18 @@ class DetectionService:
                 frames,
                 frame_probabilities,
                 loaded_model,
+                request.confidence_threshold,
             )
             predictions = [item["result"]["prediction"] for item in frame_results]
             confidences = [item["result"]["confidence"] for item in frame_results]
-            aggregated_prediction, aggregated_confidence, aggregated_probabilities = (
-                self._aggregate_probability_sequence(frame_probabilities)
+            (
+                aggregated_prediction,
+                aggregated_confidence,
+                aggregated_probabilities,
+                aggregated_decision_metrics,
+            ) = self._aggregate_probability_sequence(
+                frame_probabilities,
+                confidence_threshold=request.confidence_threshold,
             )
 
             processing_time = time.time() - start_time
@@ -363,6 +378,7 @@ class DetectionService:
                 prediction=aggregated_prediction,
                 confidence=aggregated_confidence,
                 probabilities=aggregated_probabilities,
+                decision_metrics=aggregated_decision_metrics,
                 processing_time=processing_time,
                 model_info={
                     "model_id": loaded_model.get("model_id"),
@@ -1052,26 +1068,55 @@ class DetectionService:
             )
         return smoothed
 
-    def _probabilities_to_prediction(self, probabilities: Dict[str, float]) -> tuple:
-        """Convert class probabilities to label and confidence."""
+    def _build_decision_metrics(
+        self,
+        probabilities: Dict[str, float],
+        confidence_threshold: float,
+        prediction: str,
+        confidence: float,
+    ) -> DetectionDecisionMetrics:
+        fake_probability = float(probabilities.get("fake", 0.0))
+        real_probability = float(probabilities.get("real", 0.0))
+        predicted_probability = (
+            fake_probability if prediction == "fake" else real_probability
+        )
+        return DetectionDecisionMetrics(
+            confidence_threshold=confidence_threshold,
+            fake_probability=max(0.0, min(1.0, fake_probability)),
+            real_probability=max(0.0, min(1.0, real_probability)),
+            predicted_probability=max(0.0, min(1.0, predicted_probability)),
+            decision_margin=max(-1.0, min(1.0, fake_probability - real_probability)),
+            threshold_gap=max(-1.0, min(1.0, fake_probability - confidence_threshold)),
+            threshold_applied_to_fake=True,
+        )
+
+    def _probabilities_to_prediction(
+        self,
+        probabilities: Dict[str, float],
+        confidence_threshold: float = 0.5,
+    ) -> tuple:
         fake_probability = probabilities.get("fake", 0.0)
         real_probability = probabilities.get("real", 0.0)
-        if fake_probability >= real_probability:
-            return "fake", fake_probability
-        return "real", real_probability
+        confidence = max(fake_probability, real_probability)
+        if fake_probability >= confidence_threshold:
+            return "fake", confidence
+        return "real", confidence
 
     def _build_frame_results_from_probabilities(
         self,
         frames: List[tuple],
         frame_probabilities: List[Dict[str, float]],
         loaded_model: Dict[str, Any],
+        confidence_threshold: float,
     ) -> List[Dict[str, Any]]:
         """Build frame result payloads from a probability timeline."""
         frame_results = []
         for index, ((_, timestamp), probabilities) in enumerate(
             zip(frames, frame_probabilities), start=1
         ):
-            prediction, confidence = self._probabilities_to_prediction(probabilities)
+            prediction, confidence = self._probabilities_to_prediction(
+                probabilities, confidence_threshold=confidence_threshold
+            )
             frame_results.append(
                 {
                     "frame_number": index,
@@ -1080,6 +1125,12 @@ class DetectionService:
                         "prediction": prediction,
                         "confidence": confidence,
                         "probabilities": probabilities,
+                        "decision_metrics": self._build_decision_metrics(
+                            probabilities,
+                            confidence_threshold,
+                            prediction,
+                            confidence,
+                        ).model_dump(),
                         "processing_time": 0.0,
                         "model_info": {
                             "model_id": loaded_model.get("model_id"),
@@ -1094,10 +1145,22 @@ class DetectionService:
     def _aggregate_probability_sequence(
         self,
         frame_probabilities: List[Dict[str, float]],
+        confidence_threshold: float = 0.5,
     ) -> tuple:
         """Aggregate a probability timeline into a video-level prediction."""
         if not frame_probabilities:
-            return "unknown", 0.0, {"fake": 0.0, "real": 0.0}
+            empty_probabilities = {"fake": 0.0, "real": 0.0}
+            return (
+                "unknown",
+                0.0,
+                empty_probabilities,
+                self._build_decision_metrics(
+                    empty_probabilities,
+                    confidence_threshold,
+                    "real",
+                    0.0,
+                ),
+            )
 
         fake_probability = sum(item["fake"] for item in frame_probabilities) / len(
             frame_probabilities
@@ -1107,8 +1170,17 @@ class DetectionService:
             "fake": fake_probability,
             "real": max(0.0, 1.0 - fake_probability),
         }
-        prediction, confidence = self._probabilities_to_prediction(probabilities)
-        return prediction, confidence, probabilities
+        prediction, confidence = self._probabilities_to_prediction(
+            probabilities,
+            confidence_threshold=confidence_threshold,
+        )
+        decision_metrics = self._build_decision_metrics(
+            probabilities,
+            confidence_threshold,
+            prediction,
+            confidence,
+        )
+        return prediction, confidence, probabilities, decision_metrics
 
     def _aggregate_results(
         self, predictions: List[str], confidences: List[float], threshold: float

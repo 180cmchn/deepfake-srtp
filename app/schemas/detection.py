@@ -56,10 +56,29 @@ class DetectionRequest(BaseModel):
 class DetectionResult(BaseModel):
     """Schema for single detection result"""
 
+
+class DetectionDecisionMetrics(BaseModel):
+    confidence_threshold: float = Field(..., ge=0.0, le=1.0)
+    fake_probability: float = Field(..., ge=0.0, le=1.0)
+    real_probability: float = Field(..., ge=0.0, le=1.0)
+    predicted_probability: float = Field(..., ge=0.0, le=1.0)
+    decision_margin: float = Field(..., ge=-1.0, le=1.0)
+    threshold_gap: float = Field(..., ge=-1.0, le=1.0)
+    threshold_applied_to_fake: bool = Field(
+        default=True, description="Whether the fake-class threshold controls prediction"
+    )
+
+
+class DetectionResult(BaseModel):
+    """Schema for single detection result"""
+
     prediction: PredictionType
     confidence: float = Field(..., ge=0.0, le=1.0)
     probabilities: Optional[Dict[str, float]] = Field(
         None, description="Class probabilities"
+    )
+    decision_metrics: Optional[DetectionDecisionMetrics] = Field(
+        None, description="Threshold-aware decision support metrics"
     )
     processing_time: float = Field(
         ..., ge=0.0, description="Processing time in seconds"

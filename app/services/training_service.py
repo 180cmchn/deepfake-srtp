@@ -462,7 +462,7 @@ class TrainingService:
         counts = self._count_labels(labels)
         if counts:
             logger.info(
-                "Skipping sampler reweighting; using majority downsampling and class-weighted loss",
+                "Skipping sampler reweighting; using class-weighted loss only",
                 context=context,
                 counts=counts,
             )
@@ -550,20 +550,30 @@ class TrainingService:
         labels: List[int],
         num_classes: int = 2,
     ) -> Optional[List[float]]:
-        """Compute capped class weights that follow the current majority-upweight policy."""
         counts = self._count_labels(labels)
         if len(counts) < 2:
             return None
 
-        min_count = min(counts.values())
+        fake_count = counts.get(0, 0)
+        real_count = counts.get(1, 0)
         weights: List[float] = []
         for label in range(num_classes):
             count = counts.get(label)
             if not count:
                 weights.append(1.0)
                 continue
-            weight = (count / float(min_count)) ** 0.5
-            weights.append(min(3.0, max(1.0, weight)))
+
+            if label == 0:
+                if fake_count and real_count:
+                    imbalance_ratio = max(fake_count, real_count) / float(
+                        max(1, min(fake_count, real_count))
+                    )
+                    weight = max(1.0, imbalance_ratio**0.5)
+                else:
+                    weight = 1.0
+            else:
+                weight = 1.0
+            weights.append(min(3.0, weight))
 
         logger.info(
             "Computed class weights for imbalanced training",
@@ -2096,7 +2106,7 @@ class TrainingService:
             job_id,
             {
                 "class_weights": class_weights,
-                "majority_downsampling": True,
+                "majority_downsampling": False,
             },
         )
         optimizer = self._build_training_optimizer(
@@ -2244,7 +2254,7 @@ class TrainingService:
                     "weight_decay": weight_decay,
                     "label_smoothing": label_smoothing,
                     "class_weights": class_weights,
-                    "majority_downsampling": True,
+                    "majority_downsampling": False,
                     "early_stopping": early_stopping,
                     "patience": patience,
                     "early_stopping_min_delta": early_stopping_min_delta,
@@ -2442,7 +2452,7 @@ class TrainingService:
             job_id,
             {
                 "class_weights": class_weights,
-                "majority_downsampling": True,
+                "majority_downsampling": False,
             },
         )
         optimizer = self._build_training_optimizer(
@@ -2590,7 +2600,7 @@ class TrainingService:
                         "weight_decay": weight_decay,
                         "label_smoothing": label_smoothing,
                         "class_weights": class_weights,
-                        "majority_downsampling": True,
+                        "majority_downsampling": False,
                         "early_stopping": early_stopping,
                         "patience": patience,
                         "early_stopping_min_delta": early_stopping_min_delta,
@@ -2849,11 +2859,6 @@ class TrainingService:
         train_class_weights = self._compute_class_weights(
             [sample.label for sample in train_samples]
         )
-        train_samples = self._downsample_majority_items(
-            train_samples,
-            lambda sample: int(sample.label),
-            "image_train_samples",
-        )
 
         self._ensure_label_coverage(
             [sample.label for sample in train_samples],
@@ -3052,15 +3057,6 @@ class TrainingService:
         )
         train_class_weights = self._compute_class_weights(
             [source.label for source in train_sources]
-        )
-        train_sources = self._downsample_majority_items(
-            train_sources,
-            lambda source: int(source.label),
-            "temporal_train_sources",
-        )
-        self._log_label_distribution(
-            "temporal_train_sources_balanced",
-            [source.label for source in train_sources],
         )
 
         train_clip_budget = self._resolve_temporal_clip_budget(
