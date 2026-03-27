@@ -40,6 +40,7 @@ from app.schemas.training import (
     TrainingEpochMetricsResponse,
     TrainingProgress,
     TrainingMetrics,
+    TrainingParameters,
     JobStatus,
 )
 from app.models.ml_models import create_model
@@ -74,6 +75,7 @@ class MediaClassificationSample:
     path: str
     label: int
     frame_index: Optional[int] = None
+    source_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,14 @@ class TemporalMediaSource:
     label: int
     path: Optional[str] = None
     frame_paths: Optional[List[str]] = None
+    source_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TemporalClipSample:
+    frame_paths: List[str]
+    label: int
+    source_id: str
 
 
 class TrainingCancelledError(Exception):
@@ -91,9 +101,15 @@ class TrainingCancelledError(Exception):
 class ImageClassificationDataset(Dataset):
     """Simple image classification dataset for real/fake labels."""
 
-    def __init__(self, samples: List[MediaClassificationSample], transform=None):
+    def __init__(
+        self,
+        samples: List[MediaClassificationSample],
+        transform=None,
+        include_source_id: bool = False,
+    ):
         self.samples = samples
         self.transform = transform
+        self.include_source_id = include_source_id
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -110,6 +126,8 @@ class ImageClassificationDataset(Dataset):
 
         if self.transform:
             image = self.transform(image)
+        if self.include_source_id:
+            return image, label, sample.source_id or sample.path
         return image, label
 
     @staticmethod
@@ -185,19 +203,23 @@ class SequenceClassificationDataset(Dataset):
 
     def __init__(
         self,
-        samples: List[Tuple[List[str], int]],
+        samples: List[TemporalClipSample],
         transform=None,
         augment: bool = False,
+        include_source_id: bool = False,
     ):
         self.samples = samples
         self.transform = transform
         self.augment = augment
+        self.include_source_id = include_source_id
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        frame_paths, label = self.samples[idx]
+        sample = self.samples[idx]
+        frame_paths = sample.frame_paths
+        label = sample.label
         frames = []
 
         for frame_path in frame_paths:
@@ -212,6 +234,8 @@ class SequenceClassificationDataset(Dataset):
             frames = [self.transform(frame) for frame in frames]
 
         clip = torch.stack(frames, dim=0)
+        if self.include_source_id:
+            return clip, label, sample.source_id
         return clip, label
 
     def _apply_clip_augmentation(self, frames: List[Image.Image]) -> List[Image.Image]:
@@ -499,6 +523,92 @@ class TrainingService:
                 deduplicated.append(value)
         return deduplicated or values[:target_count]
 
+    def _celeb_df_manifest_path(self, root_path: Path) -> Optional[Path]:
+        manifest_path = root_path / "List_of_testing_videos.txt"
+        if manifest_path.exists() and manifest_path.is_file():
+            return manifest_path
+        return None
+
+    def _normalize_celeb_df_relative_path(self, relative_path: str) -> str:
+        alias_map = {
+            "celeb-synthesis": "fake",
+            "celeb_real": "real",
+            "celeb-real": "real",
+            "youtube_real": "youtube-real",
+            "youtube-real": "youtube-real",
+        }
+        normalized_parts = []
+        for part in Path(relative_path).as_posix().split("/"):
+            token = part.strip()
+            if not token or token == ".":
+                continue
+            normalized_parts.append(alias_map.get(token.lower(), token.lower()))
+        return "/".join(normalized_parts)
+
+    def _load_celeb_df_test_paths(self, root_path: Path) -> Optional[set[str]]:
+        manifest_path = self._celeb_df_manifest_path(root_path)
+        if manifest_path is None:
+            return None
+
+        test_paths: set[str] = set()
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = line.split(maxsplit=1)
+                candidate_path = parts[1] if len(parts) == 2 else parts[0]
+                normalized = self._normalize_celeb_df_relative_path(candidate_path)
+                if normalized:
+                    test_paths.add(normalized)
+        return test_paths
+
+    def _relative_media_key(self, media_path: str, root_path: Path) -> str:
+        path_obj = Path(media_path)
+        try:
+            relative_path = (
+                path_obj.resolve().relative_to(root_path.resolve()).as_posix()
+            )
+        except Exception:
+            try:
+                relative_path = path_obj.relative_to(root_path).as_posix()
+            except Exception:
+                relative_path = path_obj.as_posix()
+        return self._normalize_celeb_df_relative_path(relative_path)
+
+    def _partition_items_by_official_test_list(
+        self,
+        items: List[Any],
+        root_path: Path,
+        path_getter: Callable[[Any], Optional[str]],
+        context: str,
+    ) -> Tuple[List[Any], List[Any]]:
+        official_test_paths = self._load_celeb_df_test_paths(root_path)
+        if not official_test_paths:
+            return items, []
+
+        train_val_items: List[Any] = []
+        official_test_items: List[Any] = []
+        for item in items:
+            media_path = path_getter(item)
+            if not media_path:
+                train_val_items.append(item)
+                continue
+            relative_key = self._relative_media_key(media_path, root_path)
+            if relative_key in official_test_paths:
+                official_test_items.append(item)
+            else:
+                train_val_items.append(item)
+
+        logger.info(
+            "Applied official Celeb-DF test split",
+            context=context,
+            root_path=str(root_path),
+            train_val_items=len(train_val_items),
+            official_test_items=len(official_test_items),
+        )
+        return train_val_items, official_test_items
+
     def _downsample_majority_items(
         self,
         items: List[Any],
@@ -774,10 +884,12 @@ class TrainingService:
         }
         if detail.get("stage") is not None:
             updates["preprocessing_stage"] = detail.get("stage")
-        if detail.get("current") is not None:
-            updates["preprocessing_current"] = int(detail.get("current"))
-        if detail.get("total") is not None:
-            updates["preprocessing_total"] = int(detail.get("total"))
+        current_value = detail.get("current")
+        if current_value is not None:
+            updates["preprocessing_current"] = int(current_value)
+        total_value = detail.get("total")
+        if total_value is not None:
+            updates["preprocessing_total"] = int(total_value)
         if detail.get("unit") is not None:
             updates["preprocessing_unit"] = detail.get("unit")
         self._set_active_job_metadata(job_id, updates)
@@ -854,6 +966,9 @@ class TrainingService:
         val_loss: float,
         val_accuracy: float,
         learning_rate: float,
+        val_sample_loss: Optional[float] = None,
+        val_sample_accuracy: Optional[float] = None,
+        val_video_count: Optional[int] = None,
     ) -> None:
         """Append or update one epoch of metric history for charting."""
         payload = self._read_epoch_metrics_payload(job_id)
@@ -869,6 +984,15 @@ class TrainingService:
                 "train_accuracy": float(train_accuracy),
                 "val_loss": float(val_loss),
                 "val_accuracy": float(val_accuracy),
+                "val_sample_loss": float(val_sample_loss)
+                if val_sample_loss is not None
+                else None,
+                "val_sample_accuracy": float(val_sample_accuracy)
+                if val_sample_accuracy is not None
+                else None,
+                "val_video_count": int(val_video_count)
+                if val_video_count is not None
+                else None,
                 "learning_rate": float(learning_rate),
                 "recorded_at": datetime.now().isoformat(),
             }
@@ -1153,7 +1277,11 @@ class TrainingService:
             if cached_frame_path != sample.path:
                 extracted_count += 1
             materialized.append(
-                MediaClassificationSample(path=cached_frame_path, label=sample.label)
+                MediaClassificationSample(
+                    path=cached_frame_path,
+                    label=sample.label,
+                    source_id=sample.source_id,
+                )
             )
             processed_video_backed += 1
 
@@ -1237,14 +1365,15 @@ class TrainingService:
                 )
 
             # Create training job
+            parameters = job.parameters or TrainingParameters()
             db_job = TrainingJob(
                 name=job.name,
                 description=job.description,
                 model_type=job.model_type,
                 dataset_path=job.dataset_path,
-                epochs=job.parameters.epochs,
-                learning_rate=job.parameters.learning_rate,
-                batch_size=job.parameters.batch_size,
+                epochs=parameters.epochs,
+                learning_rate=parameters.learning_rate,
+                batch_size=parameters.batch_size,
             )
 
             self.db.add(db_job)
@@ -1254,7 +1383,7 @@ class TrainingService:
             # Start training in background only when requested
             if auto_start:
                 background_tasks.add_task(
-                    self._run_training, db_job.id, job.parameters.dict()
+                    self._run_training, db_job.id, parameters.dict()
                 )
 
             logger.info(
@@ -2125,6 +2254,7 @@ class TrainingService:
         best_epoch = 0
         epochs_without_improvement = 0
         epoch_prefix = "视频时序融合" if uses_temporal_context else "Epoch"
+        epoch = 0
 
         for epoch in range(1, epochs + 1):
             if self._is_job_cancelled(job_id):
@@ -2173,7 +2303,7 @@ class TrainingService:
                     "total_epochs": epochs,
                 },
             )
-            val_loss, val_accuracy = self._run_eval_epoch(
+            val_metrics = self._run_eval_epoch(
                 model,
                 val_loader,
                 criterion,
@@ -2181,6 +2311,11 @@ class TrainingService:
                 amp_enabled=amp_enabled,
                 channels_last=channels_last,
             )
+            val_loss = float(val_metrics["loss"])
+            val_accuracy = float(val_metrics["accuracy"])
+            val_sample_loss = float(val_metrics["sample_loss"])
+            val_sample_accuracy = float(val_metrics["sample_accuracy"])
+            val_video_count = int(val_metrics["video_count"])
 
             progress = preprocessing_progress_end + (
                 (epoch / epochs) * training_progress_span
@@ -2190,6 +2325,9 @@ class TrainingService:
                 progress,
                 val_accuracy,
                 val_loss,
+                sample_accuracy=val_sample_accuracy,
+                sample_loss=val_sample_loss,
+                video_count=val_video_count,
                 epoch=epoch,
                 total_epochs=epochs,
                 message=f"{epoch_prefix} {epoch}/{epochs} completed",
@@ -2202,6 +2340,9 @@ class TrainingService:
                 val_loss,
                 val_accuracy,
                 epoch_learning_rate,
+                val_sample_loss=val_sample_loss,
+                val_sample_accuracy=val_sample_accuracy,
+                val_video_count=val_video_count,
             )
 
             if scheduler is not None:
@@ -2240,6 +2381,9 @@ class TrainingService:
                         "total_epochs": epochs,
                         "best_epoch": best_epoch,
                         "epochs_trained": epoch,
+                        "val_sample_loss": val_sample_loss,
+                        "val_sample_accuracy": val_sample_accuracy,
+                        "val_video_count": val_video_count,
                     },
                 )
                 checkpoint_payload = {
@@ -2263,6 +2407,9 @@ class TrainingService:
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_accuracy": val_accuracy,
                     "val_loss": val_loss,
+                    "val_sample_accuracy": val_sample_accuracy,
+                    "val_sample_loss": val_sample_loss,
+                    "val_video_count": val_video_count,
                     "best_epoch": best_epoch,
                     "epochs_trained": epoch,
                     "input_size": settings.MODEL_INPUT_SIZE,
@@ -2288,6 +2435,9 @@ class TrainingService:
                     {
                         "best_epoch": best_epoch or None,
                         "epochs_trained": epoch,
+                        "val_sample_loss": val_sample_loss,
+                        "val_sample_accuracy": val_sample_accuracy,
+                        "val_video_count": val_video_count,
                     },
                 )
 
@@ -2470,6 +2620,7 @@ class TrainingService:
         best_val_loss = None
         best_epoch = 0
         epochs_without_improvement = 0
+        epoch = 0
 
         for epoch in range(1, epochs + 1):
             if self._is_job_cancelled(job_id):
@@ -2517,13 +2668,18 @@ class TrainingService:
                     "total_epochs": epochs,
                 },
             )
-            val_loss, val_accuracy = self._run_eval_epoch(
+            val_metrics = self._run_eval_epoch(
                 model,
                 val_loader,
                 criterion,
                 device,
                 amp_enabled=amp_enabled,
             )
+            val_loss = float(val_metrics["loss"])
+            val_accuracy = float(val_metrics["accuracy"])
+            val_sample_loss = float(val_metrics["sample_loss"])
+            val_sample_accuracy = float(val_metrics["sample_accuracy"])
+            val_video_count = int(val_metrics["video_count"])
 
             progress = preprocessing_progress_end + (
                 (epoch / epochs) * training_progress_span
@@ -2533,6 +2689,9 @@ class TrainingService:
                 progress,
                 val_accuracy,
                 val_loss,
+                sample_accuracy=val_sample_accuracy,
+                sample_loss=val_sample_loss,
+                video_count=val_video_count,
                 epoch=epoch,
                 total_epochs=epochs,
                 message=f"Sequence epoch {epoch}/{epochs} completed",
@@ -2545,6 +2704,9 @@ class TrainingService:
                 val_loss,
                 val_accuracy,
                 epoch_learning_rate,
+                val_sample_loss=val_sample_loss,
+                val_sample_accuracy=val_sample_accuracy,
+                val_video_count=val_video_count,
             )
 
             if scheduler is not None:
@@ -2585,6 +2747,9 @@ class TrainingService:
                         "total_epochs": epochs,
                         "best_epoch": best_epoch,
                         "epochs_trained": epoch,
+                        "val_sample_loss": val_sample_loss,
+                        "val_sample_accuracy": val_sample_accuracy,
+                        "val_video_count": val_video_count,
                     },
                 )
                 torch.save(
@@ -2613,6 +2778,9 @@ class TrainingService:
                         "optimizer_state_dict": optimizer.state_dict(),
                         "val_accuracy": val_accuracy,
                         "val_loss": val_loss,
+                        "val_sample_accuracy": val_sample_accuracy,
+                        "val_sample_loss": val_sample_loss,
+                        "val_video_count": val_video_count,
                         "best_epoch": best_epoch,
                         "epochs_trained": epoch,
                         "input_size": settings.MODEL_INPUT_SIZE,
@@ -2631,6 +2799,9 @@ class TrainingService:
                     {
                         "best_epoch": best_epoch or None,
                         "epochs_trained": epoch,
+                        "val_sample_loss": val_sample_loss,
+                        "val_sample_accuracy": val_sample_accuracy,
+                        "val_video_count": val_video_count,
                     },
                 )
 
@@ -2825,17 +2996,37 @@ class TrainingService:
                 }
                 for video_path, label in video_sources
             )
-
-            train_entries, val_entries = self._stratified_split_items(
-                source_entries,
-                validation_split,
-                lambda entry: int(
-                    entry["sample"].label
-                    if entry.get("kind") == "image"
-                    else entry["label"]
-                ),
-                "Image/video source split",
+            source_entries, official_test_entries = (
+                self._partition_items_by_official_test_list(
+                    source_entries,
+                    root_path,
+                    lambda entry: (
+                        entry.get("sample").path
+                        if entry.get("kind") == "image"
+                        and entry.get("sample") is not None
+                        else entry.get("path")
+                    ),
+                    "image_video_sources",
+                )
             )
+            if len(source_entries) < 2:
+                raise ValueError(
+                    "Celeb-DF official test split leaves fewer than 2 train/validation sources"
+                )
+            if official_test_entries:
+                train_entries = source_entries
+                val_entries = official_test_entries
+            else:
+                train_entries, val_entries = self._stratified_split_items(
+                    source_entries,
+                    validation_split,
+                    lambda entry: int(
+                        entry["sample"].label
+                        if entry.get("kind") == "image"
+                        else entry["label"]
+                    ),
+                    "Image/video source split",
+                )
             if progress_callback is not None:
                 progress_callback(
                     0.3,
@@ -2901,7 +3092,11 @@ class TrainingService:
         train_dataset = ImageClassificationDataset(
             train_samples, transform=train_transform
         )
-        val_dataset = ImageClassificationDataset(val_samples, transform=val_transform)
+        val_dataset = ImageClassificationDataset(
+            val_samples,
+            transform=val_transform,
+            include_source_id=True,
+        )
         train_sampler = self._build_balanced_sampler(
             [sample.label for sample in train_samples],
             "image_train_samples",
@@ -3042,12 +3237,31 @@ class TrainingService:
                 )
 
             validation_split = max(0.0, min(0.9, validation_split))
-            train_sources, val_sources = self._stratified_split_items(
-                all_sources,
-                validation_split,
-                lambda source: int(source.label),
-                "Temporal source split",
+            all_sources, official_test_sources = (
+                self._partition_items_by_official_test_list(
+                    all_sources,
+                    root_path,
+                    lambda source: (
+                        source.path
+                        or (source.frame_paths[0] if source.frame_paths else None)
+                    ),
+                    "temporal_sources",
+                )
             )
+            if len(all_sources) < 2:
+                raise ValueError(
+                    "Celeb-DF official test split leaves fewer than 2 temporal sources for train/validation"
+                )
+            if official_test_sources:
+                train_sources = all_sources
+                val_sources = official_test_sources
+            else:
+                train_sources, val_sources = self._stratified_split_items(
+                    all_sources,
+                    validation_split,
+                    lambda source: int(source.label),
+                    "Temporal source split",
+                )
 
         self._log_label_distribution(
             "temporal_train_sources", [source.label for source in train_sources]
@@ -3097,17 +3311,17 @@ class TrainingService:
             raise ValueError("No labeled validation clips found")
 
         self._ensure_label_coverage(
-            [label for _frame_paths, label in train_samples],
-            [label for _frame_paths, label in val_samples],
+            [sample.label for sample in train_samples],
+            [sample.label for sample in val_samples],
             "Temporal clip split",
         )
         self._log_label_distribution(
             "temporal_train_clips",
-            [label for _frame_paths, label in train_samples],
+            [sample.label for sample in train_samples],
         )
         self._log_label_distribution(
             "temporal_val_clips",
-            [label for _frame_paths, label in val_samples],
+            [sample.label for sample in val_samples],
         )
 
         train_dataset = SequenceClassificationDataset(
@@ -3116,10 +3330,12 @@ class TrainingService:
             augment=True,
         )
         val_dataset = SequenceClassificationDataset(
-            val_samples, transform=val_transform
+            val_samples,
+            transform=val_transform,
+            include_source_id=True,
         )
         train_sampler = self._build_balanced_sampler(
-            [label for _frame_paths, label in train_samples],
+            [sample.label for sample in train_samples],
             "temporal_train_clips",
         )
 
@@ -3188,7 +3404,10 @@ class TrainingService:
 
         sources: List[TemporalMediaSource] = [
             TemporalMediaSource(
-                kind="frame_group", label=label, frame_paths=frame_paths
+                kind="frame_group",
+                label=label,
+                frame_paths=frame_paths,
+                source_id=str(Path(frame_paths[0]).parent.resolve()),
             )
             for frame_paths, label in grouped_videos
         ]
@@ -3199,11 +3418,21 @@ class TrainingService:
             if sample.path not in grouped_frame_paths
         ]
         sources.extend(
-            TemporalMediaSource(kind="image", label=sample.label, path=sample.path)
+            TemporalMediaSource(
+                kind="image",
+                label=sample.label,
+                path=sample.path,
+                source_id=sample.source_id or sample.path,
+            )
             for sample in standalone_images
         )
         sources.extend(
-            TemporalMediaSource(kind="video", label=label, path=video_path)
+            TemporalMediaSource(
+                kind="video",
+                label=label,
+                path=video_path,
+                source_id=str(Path(video_path).resolve()),
+            )
             for video_path, label in self._collect_labeled_videos(root_path, label_root)
         )
         return sources
@@ -3220,9 +3449,9 @@ class TrainingService:
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
         progress_label: str = "正在生成时序片段",
-    ) -> List[Tuple[List[str], int]]:
+    ) -> List[TemporalClipSample]:
         """Expand mixed temporal sources into fixed-length clips."""
-        clips: List[Tuple[List[str], int]] = []
+        clips: List[TemporalClipSample] = []
         total_sources = len(sources)
         progress_interval = max(1, total_sources // 20) if total_sources else 1
 
@@ -3231,13 +3460,21 @@ class TrainingService:
                 source.frame_paths[0] if source.frame_paths else ""
             )
             source_name = Path(source_path).name if source_path else f"source-{index}"
+            source_id = source.source_id or source_path or f"source-{index}"
             if source.kind == "image" and source.path:
-                clips.append(([source.path] * sequence_length, source.label))
+                clips.append(
+                    TemporalClipSample(
+                        frame_paths=[source.path] * sequence_length,
+                        label=source.label,
+                        source_id=source_id,
+                    )
+                )
             elif source.kind == "frame_group" and source.frame_paths:
                 clips.extend(
                     self._build_clips_from_video_frames(
                         source.frame_paths,
                         source.label,
+                        source_id,
                         sequence_length,
                         frame_stride,
                         max_clips=max_clips_per_source,
@@ -3254,6 +3491,7 @@ class TrainingService:
                     self._build_clips_from_raw_video(
                         source.path,
                         source.label,
+                        source_id,
                         sequence_length,
                         frame_stride,
                         input_size,
@@ -3323,6 +3561,7 @@ class TrainingService:
         self,
         video_path: str,
         label: int,
+        source_id: str,
         sequence_length: int,
         frame_stride: int,
         input_size: int,
@@ -3332,7 +3571,7 @@ class TrainingService:
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
         progress_label: str = "正在从原始视频取帧",
-    ) -> List[Tuple[List[str], int]]:
+    ) -> List[TemporalClipSample]:
         """Build cached clip samples directly from a raw video file."""
         capture = cv2.VideoCapture(video_path)
         if not capture.isOpened():
@@ -3348,7 +3587,7 @@ class TrainingService:
 
         cache_root = self._video_frame_cache_root(input_size)
         cache_root.mkdir(parents=True, exist_ok=True)
-        clips: List[Tuple[List[str], int]] = []
+        clips: List[TemporalClipSample] = []
         sampled_clips = self._sample_video_clip_indices(
             frame_count,
             sequence_length,
@@ -3382,7 +3621,13 @@ class TrainingService:
                     break
 
             if frame_paths:
-                clips.append((frame_paths, label))
+                clips.append(
+                    TemporalClipSample(
+                        frame_paths=frame_paths,
+                        label=label,
+                        source_id=source_id,
+                    )
+                )
 
             if progress_callback and (
                 clip_index == 1
@@ -3445,30 +3690,43 @@ class TrainingService:
         self,
         frame_paths: List[str],
         label: int,
+        source_id: str,
         sequence_length: int,
         frame_stride: int,
         max_clips: Optional[int] = None,
         overlap_ratio: float = 0.5,
-    ) -> List[Tuple[List[str], int]]:
+    ) -> List[TemporalClipSample]:
         """Create fixed-length clips from sorted frame paths."""
         if not frame_paths:
             return []
 
         clip_span = ((sequence_length - 1) * frame_stride) + 1
-        clips: List[Tuple[List[str], int]] = []
+        clips: List[TemporalClipSample] = []
 
         if len(frame_paths) < sequence_length:
             padded = frame_paths + [frame_paths[-1]] * (
                 sequence_length - len(frame_paths)
             )
-            return [(padded, label)]
+            return [
+                TemporalClipSample(
+                    frame_paths=padded,
+                    label=label,
+                    source_id=source_id,
+                )
+            ]
 
         if len(frame_paths) < clip_span:
             clip = [
                 frame_paths[min(i * frame_stride, len(frame_paths) - 1)]
                 for i in range(sequence_length)
             ]
-            return [(clip, label)]
+            return [
+                TemporalClipSample(
+                    frame_paths=clip,
+                    label=label,
+                    source_id=source_id,
+                )
+            ]
 
         available_span = len(frame_paths) - clip_span
         overlap_ratio = min(max(overlap_ratio, 0.0), 0.9)
@@ -3487,7 +3745,13 @@ class TrainingService:
                 if idx >= len(frame_paths):
                     idx = len(frame_paths) - 1
                 clip.append(frame_paths[idx])
-            clips.append((clip, label))
+            clips.append(
+                TemporalClipSample(
+                    frame_paths=clip,
+                    label=label,
+                    source_id=source_id,
+                )
+            )
 
         return clips
 
@@ -3563,7 +3827,14 @@ class TrainingService:
                 logger.warning("Skipping invalid image file", path=str(file_path))
                 continue
 
-            samples.append(MediaClassificationSample(path=str(file_path), label=label))
+            resolved_path = str(file_path.resolve())
+            samples.append(
+                MediaClassificationSample(
+                    path=resolved_path,
+                    label=label,
+                    source_id=resolved_path,
+                )
+            )
 
         return samples
 
@@ -3587,7 +3858,7 @@ class TrainingService:
                 logger.warning("Skipping invalid video file", path=str(file_path))
                 continue
 
-            videos.append((str(file_path), label))
+            videos.append((str(file_path.resolve()), label))
 
         return videos
 
@@ -3627,6 +3898,7 @@ class TrainingService:
                         path=video_path,
                         label=label,
                         frame_index=frame_index,
+                        source_id=str(Path(video_path).resolve()),
                     )
                 )
 
@@ -3818,15 +4090,23 @@ class TrainingService:
         device: torch.device,
         amp_enabled: bool = False,
         channels_last: bool = False,
-    ) -> Tuple[float, float]:
+    ) -> Dict[str, float]:
         """Run one validation epoch."""
         model.eval()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+        grouped_logits: Dict[str, List[torch.Tensor]] = {}
+        grouped_labels: Dict[str, int] = {}
 
         with torch.no_grad():
-            for images, labels in dataloader:
+            for batch in dataloader:
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    images, labels, source_ids = batch
+                else:
+                    images, labels = batch
+                    source_ids = None
+
                 images = images.to(device, non_blocking=device.type == "cuda")
                 if channels_last and images.ndim == 4:
                     images = images.contiguous(memory_format=torch.channels_last)
@@ -3846,9 +4126,63 @@ class TrainingService:
                 total_correct += (outputs.argmax(dim=1) == labels).sum().item()
                 total_samples += current_batch_size
 
-        average_loss = total_loss / max(total_samples, 1)
-        accuracy = total_correct / max(total_samples, 1)
-        return average_loss, accuracy
+                if source_ids is not None:
+                    detached_outputs = outputs.detach().float().cpu()
+                    detached_labels = labels.detach().cpu()
+                    for item_index, source_id in enumerate(source_ids):
+                        source_key = str(source_id)
+                        grouped_logits.setdefault(source_key, []).append(
+                            detached_outputs[item_index]
+                        )
+                        label_value = int(detached_labels[item_index].item())
+                        if (
+                            source_key in grouped_labels
+                            and grouped_labels[source_key] != label_value
+                        ):
+                            raise ValueError(
+                                f"Inconsistent validation labels for source {source_key}"
+                            )
+                        grouped_labels[source_key] = label_value
+
+        sample_loss = total_loss / max(total_samples, 1)
+        sample_accuracy = total_correct / max(total_samples, 1)
+
+        if grouped_logits:
+            ordered_source_ids = sorted(grouped_logits)
+            aggregated_logits = torch.stack(
+                [
+                    torch.stack(grouped_logits[source_id], dim=0).mean(dim=0)
+                    for source_id in ordered_source_ids
+                ],
+                dim=0,
+            ).to(device)
+            aggregated_labels = torch.tensor(
+                [grouped_labels[source_id] for source_id in ordered_source_ids],
+                dtype=torch.long,
+                device=device,
+            )
+            video_loss = float(criterion(aggregated_logits, aggregated_labels).item())
+            video_accuracy = float(
+                (aggregated_logits.argmax(dim=1) == aggregated_labels)
+                .float()
+                .mean()
+                .item()
+            )
+            return {
+                "loss": video_loss,
+                "accuracy": video_accuracy,
+                "sample_loss": sample_loss,
+                "sample_accuracy": sample_accuracy,
+                "video_count": len(ordered_source_ids),
+            }
+
+        return {
+            "loss": sample_loss,
+            "accuracy": sample_accuracy,
+            "sample_loss": sample_loss,
+            "sample_accuracy": sample_accuracy,
+            "video_count": total_samples,
+        }
 
     def _update_epoch_metrics(
         self,
@@ -3856,6 +4190,9 @@ class TrainingService:
         progress: float,
         accuracy: float,
         loss: float,
+        sample_accuracy: Optional[float] = None,
+        sample_loss: Optional[float] = None,
+        video_count: Optional[int] = None,
         epoch: Optional[int] = None,
         total_epochs: Optional[int] = None,
         message: Optional[str] = None,
@@ -3879,6 +4216,12 @@ class TrainingService:
             "current_loss": loss,
             "current_accuracy": accuracy,
         }
+        if sample_loss is not None:
+            active_update["val_sample_loss"] = sample_loss
+        if sample_accuracy is not None:
+            active_update["val_sample_accuracy"] = sample_accuracy
+        if video_count is not None:
+            active_update["val_video_count"] = video_count
         if epoch is not None:
             active_update["current_epoch"] = epoch
         if total_epochs is not None:
@@ -3930,6 +4273,9 @@ class TrainingService:
         label_smoothing = active_meta.get("label_smoothing", 0.05)
         best_epoch = active_meta.get("best_epoch")
         epochs_trained = active_meta.get("epochs_trained")
+        val_sample_accuracy = active_meta.get("val_sample_accuracy")
+        val_sample_loss = active_meta.get("val_sample_loss")
+        val_video_count = active_meta.get("val_video_count")
         preprocessing_stage = active_meta.get("preprocessing_stage")
         preprocessing_progress = active_meta.get("preprocessing_progress")
         preprocessing_current = active_meta.get("preprocessing_current")
@@ -3975,6 +4321,9 @@ class TrainingService:
                 loss=job.loss,
                 val_accuracy=job.accuracy,
                 val_loss=job.loss,
+                val_sample_accuracy=val_sample_accuracy,
+                val_sample_loss=val_sample_loss,
+                val_video_count=val_video_count,
                 epochs_trained=epochs_trained,
                 best_epoch=best_epoch,
                 model_path=job.model_path,
@@ -4118,6 +4467,9 @@ class TrainingService:
             "frame_projection_size": checkpoint.get("frame_projection_size"),
             "best_epoch": checkpoint.get("best_epoch"),
             "epochs_trained": checkpoint.get("epochs_trained"),
+            "val_sample_accuracy": checkpoint.get("val_sample_accuracy"),
+            "val_sample_loss": checkpoint.get("val_sample_loss"),
+            "val_video_count": checkpoint.get("val_video_count"),
         }
         filtered_parameters = {
             key: value for key, value in parameters.items() if value is not None

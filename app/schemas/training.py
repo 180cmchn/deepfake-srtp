@@ -81,6 +81,15 @@ class TrainingResults(BaseModel):
         None, ge=0.0, le=1.0, description="Final validation accuracy"
     )
     val_loss: Optional[float] = Field(None, ge=0.0, description="Final validation loss")
+    val_sample_accuracy: Optional[float] = Field(
+        None, ge=0.0, le=1.0, description="Validation accuracy at sample or clip level"
+    )
+    val_sample_loss: Optional[float] = Field(
+        None, ge=0.0, description="Validation loss at sample or clip level"
+    )
+    val_video_count: Optional[int] = Field(
+        None, ge=0, description="Number of validation videos aggregated"
+    )
     training_time: Optional[float] = Field(
         None, ge=0.0, description="Training time in seconds"
     )
@@ -207,6 +216,9 @@ class EpochMetricPoint(BaseModel):
     train_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
     val_loss: Optional[float] = Field(None, ge=0.0)
     val_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
+    val_sample_loss: Optional[float] = Field(None, ge=0.0)
+    val_sample_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
+    val_video_count: Optional[int] = Field(None, ge=0)
     learning_rate: Optional[float] = Field(None, ge=0.0)
     recorded_at: Optional[datetime] = None
 
