@@ -52,6 +52,14 @@ class TrainingParameters(BaseModel):
         le=0.2,
         description="Cross-entropy label smoothing factor",
     )
+    class_weight_strategy: str = Field(
+        default="balanced",
+        description="Class weighting strategy: none, balanced, fake_prior",
+    )
+    use_official_test_as_validation: bool = Field(
+        default=False,
+        description="Whether to use Celeb-DF official test list as the validation split",
+    )
     training_device: str = Field(
         default="auto", description="Training device: auto, mps, cuda, cpu"
     )
@@ -68,6 +76,22 @@ class TrainingParameters(BaseModel):
         if v not in allowed:
             raise ValueError(f"training_device must be one of: {sorted(allowed)}")
         return v
+
+    @validator("class_weight_strategy")
+    def validate_class_weight_strategy(cls, v):
+        allowed = {"none", "balanced", "fake_prior"}
+        if v not in allowed:
+            raise ValueError(f"class_weight_strategy must be one of: {sorted(allowed)}")
+        return v
+
+
+class ValidationSubgroupMetric(BaseModel):
+    sample_count: int = Field(default=0, ge=0)
+    video_count: int = Field(default=0, ge=0)
+    sample_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
+    sample_loss: Optional[float] = Field(None, ge=0.0)
+    video_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
+    video_loss: Optional[float] = Field(None, ge=0.0)
 
 
 class TrainingResults(BaseModel):
@@ -89,6 +113,21 @@ class TrainingResults(BaseModel):
     )
     val_video_count: Optional[int] = Field(
         None, ge=0, description="Number of validation videos aggregated"
+    )
+    val_subgroup_metrics: Optional[Dict[str, ValidationSubgroupMetric]] = Field(
+        None, description="Per-subgroup validation metrics"
+    )
+    val_subgroup_macro_accuracy: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Macro video accuracy across validation subgroups",
+    )
+    checkpoint_selection_score: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Score used to select the best checkpoint",
     )
     training_time: Optional[float] = Field(
         None, ge=0.0, description="Training time in seconds"
@@ -219,6 +258,9 @@ class EpochMetricPoint(BaseModel):
     val_sample_loss: Optional[float] = Field(None, ge=0.0)
     val_sample_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
     val_video_count: Optional[int] = Field(None, ge=0)
+    val_subgroup_metrics: Optional[Dict[str, ValidationSubgroupMetric]] = Field(None)
+    val_subgroup_macro_accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
+    checkpoint_selection_score: Optional[float] = Field(None, ge=0.0, le=1.0)
     learning_rate: Optional[float] = Field(None, ge=0.0)
     recorded_at: Optional[datetime] = None
 

@@ -66,6 +66,7 @@ REAL_LABEL_KEYWORDS = {
 }
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
+CELEB_DF_SUBGROUPS = ("fake", "celeb-real", "youtube-real")
 
 
 @dataclass(frozen=True)
@@ -523,6 +524,112 @@ class TrainingService:
                 deduplicated.append(value)
         return deduplicated or values[:target_count]
 
+    def _infer_validation_subgroup_from_path(
+        self, media_path: Optional[str], root_path: Optional[Path] = None
+    ) -> str:
+        if not media_path:
+            return "other"
+
+        normalized_path = (
+            self._relative_media_key(media_path, root_path)
+            if root_path is not None
+            else Path(media_path).as_posix().lower()
+        )
+        path_parts = [part for part in normalized_path.split("/") if part]
+        head = path_parts[0] if path_parts else normalized_path
+        is_celeb_df_context = (
+            root_path is not None
+            and self._celeb_df_manifest_path(root_path) is not None
+        ) or ("celeb-df" in normalized_path)
+
+        if head in {"fake", "celeb-synthesis"}:
+            return "fake"
+        if head in {"youtube-real", "youtube_real"}:
+            return "youtube-real"
+        if head in {"real", "celeb-real", "celeb_real"}:
+            return "celeb-real" if is_celeb_df_context else "real"
+
+        normalized_text = normalized_path.replace("_", "-")
+        if "youtube-real" in normalized_text:
+            return "youtube-real"
+        if "celeb-real" in normalized_text or (
+            is_celeb_df_context and "/real/" in normalized_text
+        ):
+            return "celeb-real"
+        if "celeb-synthesis" in normalized_text or "/fake/" in normalized_text:
+            return "fake"
+        if self._matches_keyword(normalized_text, FAKE_LABEL_KEYWORDS - {"0", "1"}):
+            return "fake"
+        if self._matches_keyword(normalized_text, REAL_LABEL_KEYWORDS - {"0", "1"}):
+            return "real"
+        return "other"
+
+    def _stratified_split_items_by_group(
+        self,
+        items: List[Any],
+        validation_split: float,
+        group_getter: Callable[[Any], str],
+        context: str,
+    ) -> Tuple[List[Any], List[Any]]:
+        group_buckets: Dict[str, List[Any]] = {}
+        for item in items:
+            group = group_getter(item) or "other"
+            group_buckets.setdefault(group, []).append(item)
+
+        if len(group_buckets) < 2:
+            raise ValueError(f"{context} requires at least 2 groups to create a split")
+
+        rng = random.Random(42)
+        train_items: List[Any] = []
+        val_items: List[Any] = []
+        for group, bucket in sorted(group_buckets.items()):
+            if len(bucket) < 2:
+                raise ValueError(
+                    f"{context} needs at least 2 items for subgroup {group} to stratify train/val"
+                )
+            shuffled = list(bucket)
+            rng.shuffle(shuffled)
+
+            val_count = max(1, int(round(len(shuffled) * validation_split)))
+            if val_count >= len(shuffled):
+                val_count = len(shuffled) - 1
+
+            val_items.extend(shuffled[:val_count])
+            train_items.extend(shuffled[val_count:])
+
+        rng.shuffle(train_items)
+        rng.shuffle(val_items)
+        return train_items, val_items
+
+    def _compute_subgroup_macro_accuracy(
+        self, subgroup_metrics: Dict[str, Dict[str, Any]]
+    ) -> Optional[float]:
+        normalized_metrics = dict(subgroup_metrics)
+        if "real" in normalized_metrics and "celeb-real" not in normalized_metrics:
+            normalized_metrics["celeb-real"] = normalized_metrics["real"]
+
+        candidate_groups = []
+        if any(group in normalized_metrics for group in CELEB_DF_SUBGROUPS):
+            candidate_groups = [
+                group for group in CELEB_DF_SUBGROUPS if group in normalized_metrics
+            ]
+        else:
+            candidate_groups = [
+                group for group in normalized_metrics.keys() if group not in {"other"}
+            ]
+
+        scores = [
+            normalized_metrics[group].get("video_accuracy")
+            for group in candidate_groups
+            if normalized_metrics[group].get("video_accuracy") is not None
+        ]
+        if not scores:
+            return None
+        numeric_scores = [float(score) for score in scores if score is not None]
+        if not numeric_scores:
+            return None
+        return float(sum(numeric_scores) / len(numeric_scores))
+
     def _celeb_df_manifest_path(self, root_path: Path) -> Optional[Path]:
         manifest_path = root_path / "List_of_testing_videos.txt"
         if manifest_path.exists() and manifest_path.is_file():
@@ -659,13 +766,18 @@ class TrainingService:
         self,
         labels: List[int],
         num_classes: int = 2,
+        strategy: str = "balanced",
     ) -> Optional[List[float]]:
+        if strategy == "none":
+            return None
+
         counts = self._count_labels(labels)
         if len(counts) < 2:
             return None
 
         fake_count = counts.get(0, 0)
         real_count = counts.get(1, 0)
+        total_count = sum(counts.values())
         weights: List[float] = []
         for label in range(num_classes):
             count = counts.get(label)
@@ -673,8 +785,8 @@ class TrainingService:
                 weights.append(1.0)
                 continue
 
-            if label == 0:
-                if fake_count and real_count:
+            if strategy == "fake_prior":
+                if label == 0 and fake_count and real_count:
                     imbalance_ratio = max(fake_count, real_count) / float(
                         max(1, min(fake_count, real_count))
                     )
@@ -682,13 +794,15 @@ class TrainingService:
                 else:
                     weight = 1.0
             else:
-                weight = 1.0
+                balanced_weight = (total_count / float(num_classes * count)) ** 0.5
+                weight = min(3.0, max(0.6, balanced_weight))
             weights.append(min(3.0, weight))
 
         logger.info(
             "Computed class weights for imbalanced training",
             counts=counts,
             weights=weights,
+            strategy=strategy,
         )
         return weights
 
@@ -764,16 +878,22 @@ class TrainingService:
 
     def _is_validation_improved(
         self,
+        selection_score: float,
         val_accuracy: float,
         val_loss: Optional[float],
+        best_selection_score: float,
         best_val_accuracy: float,
         best_val_loss: Optional[float],
         min_delta: float,
     ) -> bool:
         """Determine whether validation metrics improved enough to keep training."""
-        if best_val_accuracy < 0:
+        if best_selection_score < 0:
             return True
-        if val_accuracy > best_val_accuracy + min_delta:
+        if selection_score > best_selection_score + min_delta:
+            return True
+
+        score_gap = abs(selection_score - best_selection_score)
+        if score_gap <= min_delta and val_accuracy > best_val_accuracy + min_delta:
             return True
 
         accuracy_gap = abs(val_accuracy - best_val_accuracy)
@@ -969,6 +1089,9 @@ class TrainingService:
         val_sample_loss: Optional[float] = None,
         val_sample_accuracy: Optional[float] = None,
         val_video_count: Optional[int] = None,
+        val_subgroup_metrics: Optional[Dict[str, Any]] = None,
+        val_subgroup_macro_accuracy: Optional[float] = None,
+        checkpoint_selection_score: Optional[float] = None,
     ) -> None:
         """Append or update one epoch of metric history for charting."""
         payload = self._read_epoch_metrics_payload(job_id)
@@ -992,6 +1115,13 @@ class TrainingService:
                 else None,
                 "val_video_count": int(val_video_count)
                 if val_video_count is not None
+                else None,
+                "val_subgroup_metrics": val_subgroup_metrics,
+                "val_subgroup_macro_accuracy": float(val_subgroup_macro_accuracy)
+                if val_subgroup_macro_accuracy is not None
+                else None,
+                "checkpoint_selection_score": float(checkpoint_selection_score)
+                if checkpoint_selection_score is not None
                 else None,
                 "learning_rate": float(learning_rate),
                 "recorded_at": datetime.now().isoformat(),
@@ -1379,6 +1509,20 @@ class TrainingService:
             self.db.add(db_job)
             self.db.commit()
             self.db.refresh(db_job)
+            self._set_active_job_metadata(
+                db_job.id,
+                {
+                    "validation_split": parameters.validation_split,
+                    "early_stopping": parameters.early_stopping,
+                    "patience": parameters.patience,
+                    "early_stopping_min_delta": parameters.early_stopping_min_delta,
+                    "weight_decay": parameters.weight_decay,
+                    "label_smoothing": parameters.label_smoothing,
+                    "class_weight_strategy": parameters.class_weight_strategy,
+                    "use_official_test_as_validation": parameters.use_official_test_as_validation,
+                    "requested_device": parameters.training_device,
+                },
+            )
 
             # Start training in background only when requested
             if auto_start:
@@ -1746,6 +1890,7 @@ class TrainingService:
 
             job.error_message = None
             self.db.commit()
+            pending_meta = self._active_jobs.get(job_id, {})
 
             background_tasks.add_task(
                 self._run_training,
@@ -1754,12 +1899,23 @@ class TrainingService:
                     "epochs": job.epochs,
                     "learning_rate": job.learning_rate,
                     "batch_size": job.batch_size,
-                    "validation_split": 0.2,
-                    "early_stopping": True,
-                    "patience": 10,
-                    "early_stopping_min_delta": 0.002,
-                    "weight_decay": 0.0001,
-                    "label_smoothing": 0.05,
+                    "validation_split": pending_meta.get("validation_split", 0.2),
+                    "early_stopping": pending_meta.get("early_stopping", True),
+                    "patience": pending_meta.get("patience", 10),
+                    "early_stopping_min_delta": pending_meta.get(
+                        "early_stopping_min_delta", 0.002
+                    ),
+                    "weight_decay": pending_meta.get("weight_decay", 0.0001),
+                    "label_smoothing": pending_meta.get("label_smoothing", 0.05),
+                    "class_weight_strategy": pending_meta.get(
+                        "class_weight_strategy", "balanced"
+                    ),
+                    "use_official_test_as_validation": pending_meta.get(
+                        "use_official_test_as_validation", False
+                    ),
+                    "training_device": pending_meta.get(
+                        "requested_device", settings.TRAINING_DEVICE
+                    ),
                 },
             )
 
@@ -2107,6 +2263,12 @@ class TrainingService:
             label_smoothing = min(
                 0.2, max(0.0, float(parameters.get("label_smoothing", 0.05)))
             )
+            class_weight_strategy = str(
+                parameters.get("class_weight_strategy", "balanced")
+            )
+            use_official_test_as_validation = bool(
+                parameters.get("use_official_test_as_validation", False)
+            )
             sequence_length = int(parameters.get("sequence_length", 8))
             frame_stride = int(parameters.get("frame_stride", 2))
             temporal_hidden_size = int(parameters.get("temporal_hidden_size", 256))
@@ -2146,6 +2308,8 @@ class TrainingService:
                 "early_stopping_min_delta": early_stopping_min_delta,
                 "weight_decay": weight_decay,
                 "label_smoothing": label_smoothing,
+                "class_weight_strategy": class_weight_strategy,
+                "use_official_test_as_validation": use_official_test_as_validation,
             },
         )
 
@@ -2180,13 +2344,17 @@ class TrainingService:
                 f"正在准备视频时序样本（长度 {sequence_length}，步长 {frame_stride}）",
                 {"stage": "prepare_temporal_dataset", "unit": "phase"},
             )
-            train_loader, val_loader, class_weights = self._build_temporal_dataloaders(
-                dataset_path,
-                batch_size,
-                validation_split,
-                sequence_length,
-                frame_stride,
-                progress_callback=preprocessing_reporter,
+            train_loader, val_loader, class_weights, split_metadata = (
+                self._build_temporal_dataloaders(
+                    dataset_path,
+                    batch_size,
+                    validation_split,
+                    sequence_length,
+                    frame_stride,
+                    class_weight_strategy=class_weight_strategy,
+                    use_official_test_as_validation=use_official_test_as_validation,
+                    progress_callback=preprocessing_reporter,
+                )
             )
             model = create_model(
                 model_type=model_type,
@@ -2203,11 +2371,15 @@ class TrainingService:
                 "正在扫描训练数据集并整理样本",
                 {"stage": "scan_dataset", "unit": "phase"},
             )
-            train_loader, val_loader, class_weights = self._build_dataloaders(
-                dataset_path,
-                batch_size,
-                validation_split,
-                progress_callback=preprocessing_reporter,
+            train_loader, val_loader, class_weights, split_metadata = (
+                self._build_dataloaders(
+                    dataset_path,
+                    batch_size,
+                    validation_split,
+                    class_weight_strategy=class_weight_strategy,
+                    use_official_test_as_validation=use_official_test_as_validation,
+                    progress_callback=preprocessing_reporter,
+                )
             )
             model = create_model(
                 model_type=model_type,
@@ -2236,6 +2408,12 @@ class TrainingService:
             {
                 "class_weights": class_weights,
                 "majority_downsampling": False,
+                "split_strategy": split_metadata.get("split_strategy"),
+                "official_test_holdout_count": split_metadata.get(
+                    "official_test_holdout_count"
+                ),
+                "train_subgroup_counts": split_metadata.get("train_subgroup_counts"),
+                "val_subgroup_counts": split_metadata.get("val_subgroup_counts"),
             },
         )
         optimizer = self._build_training_optimizer(
@@ -2251,6 +2429,12 @@ class TrainingService:
 
         best_val_accuracy = -1.0
         best_val_loss = None
+        best_selection_score = -1.0
+        best_val_sample_accuracy = None
+        best_val_sample_loss = None
+        best_val_video_count = None
+        best_val_subgroup_metrics = None
+        best_val_subgroup_macro_accuracy = None
         best_epoch = 0
         epochs_without_improvement = 0
         epoch_prefix = "视频时序融合" if uses_temporal_context else "Epoch"
@@ -2316,6 +2500,11 @@ class TrainingService:
             val_sample_loss = float(val_metrics["sample_loss"])
             val_sample_accuracy = float(val_metrics["sample_accuracy"])
             val_video_count = int(val_metrics["video_count"])
+            val_subgroup_metrics = val_metrics.get("subgroup_metrics")
+            val_subgroup_macro_accuracy = val_metrics.get("subgroup_macro_accuracy")
+            checkpoint_selection_score = float(
+                val_metrics.get("selection_score", val_accuracy)
+            )
 
             progress = preprocessing_progress_end + (
                 (epoch / epochs) * training_progress_span
@@ -2328,6 +2517,9 @@ class TrainingService:
                 sample_accuracy=val_sample_accuracy,
                 sample_loss=val_sample_loss,
                 video_count=val_video_count,
+                subgroup_metrics=val_subgroup_metrics,
+                subgroup_macro_accuracy=val_subgroup_macro_accuracy,
+                checkpoint_selection_score=checkpoint_selection_score,
                 epoch=epoch,
                 total_epochs=epochs,
                 message=f"{epoch_prefix} {epoch}/{epochs} completed",
@@ -2343,6 +2535,9 @@ class TrainingService:
                 val_sample_loss=val_sample_loss,
                 val_sample_accuracy=val_sample_accuracy,
                 val_video_count=val_video_count,
+                val_subgroup_metrics=val_subgroup_metrics,
+                val_subgroup_macro_accuracy=val_subgroup_macro_accuracy,
+                checkpoint_selection_score=checkpoint_selection_score,
             )
 
             if scheduler is not None:
@@ -2361,16 +2556,24 @@ class TrainingService:
             )
 
             improved = self._is_validation_improved(
+                checkpoint_selection_score,
                 val_accuracy,
                 val_loss,
+                best_selection_score,
                 best_val_accuracy,
                 best_val_loss,
                 early_stopping_min_delta,
             )
 
             if improved:
+                best_selection_score = checkpoint_selection_score
                 best_val_accuracy = val_accuracy
                 best_val_loss = val_loss
+                best_val_sample_accuracy = val_sample_accuracy
+                best_val_sample_loss = val_sample_loss
+                best_val_video_count = val_video_count
+                best_val_subgroup_metrics = val_subgroup_metrics
+                best_val_subgroup_macro_accuracy = val_subgroup_macro_accuracy
                 best_epoch = epoch
                 epochs_without_improvement = 0
                 self._set_active_job_metadata(
@@ -2384,6 +2587,9 @@ class TrainingService:
                         "val_sample_loss": val_sample_loss,
                         "val_sample_accuracy": val_sample_accuracy,
                         "val_video_count": val_video_count,
+                        "val_subgroup_metrics": val_subgroup_metrics,
+                        "val_subgroup_macro_accuracy": val_subgroup_macro_accuracy,
+                        "checkpoint_selection_score": checkpoint_selection_score,
                     },
                 )
                 checkpoint_payload = {
@@ -2397,8 +2603,18 @@ class TrainingService:
                     "training_device": training_device,
                     "weight_decay": weight_decay,
                     "label_smoothing": label_smoothing,
+                    "class_weight_strategy": class_weight_strategy,
                     "class_weights": class_weights,
                     "majority_downsampling": False,
+                    "use_official_test_as_validation": use_official_test_as_validation,
+                    "split_strategy": split_metadata.get("split_strategy"),
+                    "official_test_holdout_count": split_metadata.get(
+                        "official_test_holdout_count"
+                    ),
+                    "train_subgroup_counts": split_metadata.get(
+                        "train_subgroup_counts"
+                    ),
+                    "val_subgroup_counts": split_metadata.get("val_subgroup_counts"),
                     "early_stopping": early_stopping,
                     "patience": patience,
                     "early_stopping_min_delta": early_stopping_min_delta,
@@ -2410,6 +2626,9 @@ class TrainingService:
                     "val_sample_accuracy": val_sample_accuracy,
                     "val_sample_loss": val_sample_loss,
                     "val_video_count": val_video_count,
+                    "val_subgroup_metrics": val_subgroup_metrics,
+                    "val_subgroup_macro_accuracy": val_subgroup_macro_accuracy,
+                    "checkpoint_selection_score": checkpoint_selection_score,
                     "best_epoch": best_epoch,
                     "epochs_trained": epoch,
                     "input_size": settings.MODEL_INPUT_SIZE,
@@ -2438,6 +2657,9 @@ class TrainingService:
                         "val_sample_loss": val_sample_loss,
                         "val_sample_accuracy": val_sample_accuracy,
                         "val_video_count": val_video_count,
+                        "val_subgroup_metrics": val_subgroup_metrics,
+                        "val_subgroup_macro_accuracy": val_subgroup_macro_accuracy,
+                        "checkpoint_selection_score": checkpoint_selection_score,
                     },
                 )
 
@@ -2475,6 +2697,14 @@ class TrainingService:
             epochs_trained=epoch,
             best_epoch=best_epoch or None,
             stopped_early=early_stopping and epoch < epochs,
+            val_sample_accuracy=best_val_sample_accuracy,
+            val_sample_loss=best_val_sample_loss,
+            val_video_count=best_val_video_count,
+            val_subgroup_metrics=best_val_subgroup_metrics,
+            val_subgroup_macro_accuracy=best_val_subgroup_macro_accuracy,
+            checkpoint_selection_score=best_selection_score
+            if best_selection_score >= 0
+            else None,
         )
 
     def _train_sequence_model(self, job_id: int, parameters: Dict[str, Any]):
@@ -2498,6 +2728,12 @@ class TrainingService:
             weight_decay = max(0.0, float(parameters.get("weight_decay", 0.0001)))
             label_smoothing = min(
                 0.2, max(0.0, float(parameters.get("label_smoothing", 0.05)))
+            )
+            class_weight_strategy = str(
+                parameters.get("class_weight_strategy", "balanced")
+            )
+            use_official_test_as_validation = bool(
+                parameters.get("use_official_test_as_validation", False)
             )
             sequence_length = int(parameters.get("sequence_length", 16))
             frame_stride = int(parameters.get("frame_stride", 1))
@@ -2536,6 +2772,8 @@ class TrainingService:
                 "early_stopping_min_delta": early_stopping_min_delta,
                 "weight_decay": weight_decay,
                 "label_smoothing": label_smoothing,
+                "class_weight_strategy": class_weight_strategy,
+                "use_official_test_as_validation": use_official_test_as_validation,
             },
         )
         preprocessing_reporter(
@@ -2563,13 +2801,17 @@ class TrainingService:
             apple_silicon=self._is_apple_silicon(),
             requested_device=training_device,
         )
-        train_loader, val_loader, class_weights = self._build_sequence_dataloaders(
-            dataset_path,
-            batch_size,
-            validation_split,
-            sequence_length,
-            frame_stride,
-            progress_callback=preprocessing_reporter,
+        train_loader, val_loader, class_weights, split_metadata = (
+            self._build_sequence_dataloaders(
+                dataset_path,
+                batch_size,
+                validation_split,
+                sequence_length,
+                frame_stride,
+                class_weight_strategy=class_weight_strategy,
+                use_official_test_as_validation=use_official_test_as_validation,
+                progress_callback=preprocessing_reporter,
+            )
         )
         preprocessing_reporter(
             1.0,
@@ -2603,6 +2845,12 @@ class TrainingService:
             {
                 "class_weights": class_weights,
                 "majority_downsampling": False,
+                "split_strategy": split_metadata.get("split_strategy"),
+                "official_test_holdout_count": split_metadata.get(
+                    "official_test_holdout_count"
+                ),
+                "train_subgroup_counts": split_metadata.get("train_subgroup_counts"),
+                "val_subgroup_counts": split_metadata.get("val_subgroup_counts"),
             },
         )
         optimizer = self._build_training_optimizer(
@@ -2618,6 +2866,12 @@ class TrainingService:
 
         best_val_accuracy = -1.0
         best_val_loss = None
+        best_selection_score = -1.0
+        best_val_sample_accuracy = None
+        best_val_sample_loss = None
+        best_val_video_count = None
+        best_val_subgroup_metrics = None
+        best_val_subgroup_macro_accuracy = None
         best_epoch = 0
         epochs_without_improvement = 0
         epoch = 0
@@ -2680,6 +2934,11 @@ class TrainingService:
             val_sample_loss = float(val_metrics["sample_loss"])
             val_sample_accuracy = float(val_metrics["sample_accuracy"])
             val_video_count = int(val_metrics["video_count"])
+            val_subgroup_metrics = val_metrics.get("subgroup_metrics")
+            val_subgroup_macro_accuracy = val_metrics.get("subgroup_macro_accuracy")
+            checkpoint_selection_score = float(
+                val_metrics.get("selection_score", val_accuracy)
+            )
 
             progress = preprocessing_progress_end + (
                 (epoch / epochs) * training_progress_span
@@ -2692,6 +2951,9 @@ class TrainingService:
                 sample_accuracy=val_sample_accuracy,
                 sample_loss=val_sample_loss,
                 video_count=val_video_count,
+                subgroup_metrics=val_subgroup_metrics,
+                subgroup_macro_accuracy=val_subgroup_macro_accuracy,
+                checkpoint_selection_score=checkpoint_selection_score,
                 epoch=epoch,
                 total_epochs=epochs,
                 message=f"Sequence epoch {epoch}/{epochs} completed",
@@ -2707,6 +2969,9 @@ class TrainingService:
                 val_sample_loss=val_sample_loss,
                 val_sample_accuracy=val_sample_accuracy,
                 val_video_count=val_video_count,
+                val_subgroup_metrics=val_subgroup_metrics,
+                val_subgroup_macro_accuracy=val_subgroup_macro_accuracy,
+                checkpoint_selection_score=checkpoint_selection_score,
             )
 
             if scheduler is not None:
@@ -2727,16 +2992,24 @@ class TrainingService:
             )
 
             improved = self._is_validation_improved(
+                checkpoint_selection_score,
                 val_accuracy,
                 val_loss,
+                best_selection_score,
                 best_val_accuracy,
                 best_val_loss,
                 early_stopping_min_delta,
             )
 
             if improved:
+                best_selection_score = checkpoint_selection_score
                 best_val_accuracy = val_accuracy
                 best_val_loss = val_loss
+                best_val_sample_accuracy = val_sample_accuracy
+                best_val_sample_loss = val_sample_loss
+                best_val_video_count = val_video_count
+                best_val_subgroup_metrics = val_subgroup_metrics
+                best_val_subgroup_macro_accuracy = val_subgroup_macro_accuracy
                 best_epoch = epoch
                 epochs_without_improvement = 0
                 self._set_active_job_metadata(
@@ -2750,6 +3023,9 @@ class TrainingService:
                         "val_sample_loss": val_sample_loss,
                         "val_sample_accuracy": val_sample_accuracy,
                         "val_video_count": val_video_count,
+                        "val_subgroup_metrics": val_subgroup_metrics,
+                        "val_subgroup_macro_accuracy": val_subgroup_macro_accuracy,
+                        "checkpoint_selection_score": checkpoint_selection_score,
                     },
                 )
                 torch.save(
@@ -2764,8 +3040,20 @@ class TrainingService:
                         "training_device": training_device,
                         "weight_decay": weight_decay,
                         "label_smoothing": label_smoothing,
+                        "class_weight_strategy": class_weight_strategy,
                         "class_weights": class_weights,
                         "majority_downsampling": False,
+                        "use_official_test_as_validation": use_official_test_as_validation,
+                        "split_strategy": split_metadata.get("split_strategy"),
+                        "official_test_holdout_count": split_metadata.get(
+                            "official_test_holdout_count"
+                        ),
+                        "train_subgroup_counts": split_metadata.get(
+                            "train_subgroup_counts"
+                        ),
+                        "val_subgroup_counts": split_metadata.get(
+                            "val_subgroup_counts"
+                        ),
                         "early_stopping": early_stopping,
                         "patience": patience,
                         "early_stopping_min_delta": early_stopping_min_delta,
@@ -2781,6 +3069,9 @@ class TrainingService:
                         "val_sample_accuracy": val_sample_accuracy,
                         "val_sample_loss": val_sample_loss,
                         "val_video_count": val_video_count,
+                        "val_subgroup_metrics": val_subgroup_metrics,
+                        "val_subgroup_macro_accuracy": val_subgroup_macro_accuracy,
+                        "checkpoint_selection_score": checkpoint_selection_score,
                         "best_epoch": best_epoch,
                         "epochs_trained": epoch,
                         "input_size": settings.MODEL_INPUT_SIZE,
@@ -2802,6 +3093,9 @@ class TrainingService:
                         "val_sample_loss": val_sample_loss,
                         "val_sample_accuracy": val_sample_accuracy,
                         "val_video_count": val_video_count,
+                        "val_subgroup_metrics": val_subgroup_metrics,
+                        "val_subgroup_macro_accuracy": val_subgroup_macro_accuracy,
+                        "checkpoint_selection_score": checkpoint_selection_score,
                     },
                 )
 
@@ -2839,6 +3133,14 @@ class TrainingService:
             epochs_trained=epoch,
             best_epoch=best_epoch or None,
             stopped_early=early_stopping and epoch < epochs,
+            val_sample_accuracy=best_val_sample_accuracy,
+            val_sample_loss=best_val_sample_loss,
+            val_video_count=best_val_video_count,
+            val_subgroup_metrics=best_val_subgroup_metrics,
+            val_subgroup_macro_accuracy=best_val_subgroup_macro_accuracy,
+            checkpoint_selection_score=best_selection_score
+            if best_selection_score >= 0
+            else None,
         )
 
     def _finalize_successful_training(
@@ -2850,6 +3152,12 @@ class TrainingService:
         epochs_trained: Optional[int] = None,
         best_epoch: Optional[int] = None,
         stopped_early: bool = False,
+        val_sample_accuracy: Optional[float] = None,
+        val_sample_loss: Optional[float] = None,
+        val_video_count: Optional[int] = None,
+        val_subgroup_metrics: Optional[Dict[str, Any]] = None,
+        val_subgroup_macro_accuracy: Optional[float] = None,
+        checkpoint_selection_score: Optional[float] = None,
     ):
         """Persist final job state after successful training."""
         with get_db_session() as db:
@@ -2885,6 +3193,12 @@ class TrainingService:
                 ),
                 "epochs_trained": epochs_trained,
                 "best_epoch": best_epoch,
+                "val_sample_accuracy": val_sample_accuracy,
+                "val_sample_loss": val_sample_loss,
+                "val_video_count": val_video_count,
+                "val_subgroup_metrics": val_subgroup_metrics,
+                "val_subgroup_macro_accuracy": val_subgroup_macro_accuracy,
+                "checkpoint_selection_score": checkpoint_selection_score,
             },
         )
 
@@ -2893,10 +3207,12 @@ class TrainingService:
         dataset_path: str,
         batch_size: int,
         validation_split: float,
+        class_weight_strategy: str = "balanced",
+        use_official_test_as_validation: bool = False,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
-    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]]]:
+    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]], Dict[str, Any]]:
         """Build train/validation dataloaders from image dataset path."""
         root_path = Path(dataset_path).expanduser()
         if not root_path.exists() or not root_path.is_dir():
@@ -2944,6 +3260,12 @@ class TrainingService:
         )
 
         split_dirs = self._find_split_dirs(root_path)
+        split_metadata: Dict[str, Any] = {
+            "split_strategy": "explicit_train_val_dirs"
+            if split_dirs
+            else "internal_label_validation",
+            "official_test_holdout_count": 0,
+        }
         if split_dirs:
             if progress_callback is not None:
                 progress_callback(
@@ -2996,16 +3318,18 @@ class TrainingService:
                 }
                 for video_path, label in video_sources
             )
+
+            def entry_media_path(entry: Dict[str, Any]) -> Optional[str]:
+                if entry.get("kind") == "image":
+                    sample = entry.get("sample")
+                    return sample.path if sample is not None else None
+                return entry.get("path")
+
             source_entries, official_test_entries = (
                 self._partition_items_by_official_test_list(
                     source_entries,
                     root_path,
-                    lambda entry: (
-                        entry.get("sample").path
-                        if entry.get("kind") == "image"
-                        and entry.get("sample") is not None
-                        else entry.get("path")
-                    ),
+                    entry_media_path,
                     "image_video_sources",
                 )
             )
@@ -3013,20 +3337,54 @@ class TrainingService:
                 raise ValueError(
                     "Celeb-DF official test split leaves fewer than 2 train/validation sources"
                 )
-            if official_test_entries:
+            split_metadata["official_test_holdout_count"] = len(official_test_entries)
+            if official_test_entries and use_official_test_as_validation:
                 train_entries = source_entries
                 val_entries = official_test_entries
+                split_metadata["split_strategy"] = "official_test_as_validation"
             else:
-                train_entries, val_entries = self._stratified_split_items(
-                    source_entries,
-                    validation_split,
-                    lambda entry: int(
-                        entry["sample"].label
-                        if entry.get("kind") == "image"
-                        else entry["label"]
-                    ),
-                    "Image/video source split",
+                try:
+                    train_entries, val_entries = self._stratified_split_items_by_group(
+                        source_entries,
+                        validation_split,
+                        lambda entry: self._infer_validation_subgroup_from_path(
+                            entry_media_path(entry),
+                            root_path,
+                        ),
+                        "Image/video subgroup split",
+                    )
+                    split_metadata["split_strategy"] = "internal_subgroup_validation"
+                except ValueError:
+                    train_entries, val_entries = self._stratified_split_items(
+                        source_entries,
+                        validation_split,
+                        lambda entry: int(
+                            entry["sample"].label
+                            if entry.get("kind") == "image"
+                            else entry["label"]
+                        ),
+                        "Image/video source split",
+                    )
+                    split_metadata["split_strategy"] = "internal_label_validation"
+
+            split_metadata["train_subgroup_counts"] = dict(
+                Counter(
+                    self._infer_validation_subgroup_from_path(
+                        entry_media_path(entry),
+                        root_path,
+                    )
+                    for entry in train_entries
                 )
+            )
+            split_metadata["val_subgroup_counts"] = dict(
+                Counter(
+                    self._infer_validation_subgroup_from_path(
+                        entry_media_path(entry),
+                        root_path,
+                    )
+                    for entry in val_entries
+                )
+            )
             if progress_callback is not None:
                 progress_callback(
                     0.3,
@@ -3048,7 +3406,8 @@ class TrainingService:
             raise ValueError("No labeled validation samples found")
 
         train_class_weights = self._compute_class_weights(
-            [sample.label for sample in train_samples]
+            [sample.label for sample in train_samples],
+            strategy=class_weight_strategy,
         )
 
         self._ensure_label_coverage(
@@ -3130,7 +3489,7 @@ class TrainingService:
                 },
             )
 
-        return train_loader, val_loader, train_class_weights
+        return train_loader, val_loader, train_class_weights, split_metadata
 
     def _build_sequence_dataloaders(
         self,
@@ -3139,10 +3498,12 @@ class TrainingService:
         validation_split: float,
         sequence_length: int,
         frame_stride: int,
+        class_weight_strategy: str = "balanced",
+        use_official_test_as_validation: bool = False,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
-    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]]]:
+    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]], Dict[str, Any]]:
         """Build train/validation dataloaders for frame sequence clips."""
         return self._build_temporal_dataloaders(
             dataset_path,
@@ -3150,6 +3511,8 @@ class TrainingService:
             validation_split,
             sequence_length,
             frame_stride,
+            class_weight_strategy=class_weight_strategy,
+            use_official_test_as_validation=use_official_test_as_validation,
             progress_callback=progress_callback,
         )
 
@@ -3160,10 +3523,12 @@ class TrainingService:
         validation_split: float,
         sequence_length: int,
         frame_stride: int,
+        class_weight_strategy: str = "balanced",
+        use_official_test_as_validation: bool = False,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
-    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]]]:
+    ) -> Tuple[DataLoader, DataLoader, Optional[List[float]], Dict[str, Any]]:
         """Build temporal dataloaders from mixed image/video datasets."""
         root_path = Path(dataset_path).expanduser()
         if not root_path.exists() or not root_path.is_dir():
@@ -3199,6 +3564,12 @@ class TrainingService:
         )
 
         split_dirs = self._find_split_dirs(root_path)
+        split_metadata: Dict[str, Any] = {
+            "split_strategy": "explicit_train_val_dirs"
+            if split_dirs
+            else "internal_label_validation",
+            "official_test_holdout_count": 0,
+        }
         if split_dirs:
             if progress_callback is not None:
                 progress_callback(
@@ -3252,16 +3623,53 @@ class TrainingService:
                 raise ValueError(
                     "Celeb-DF official test split leaves fewer than 2 temporal sources for train/validation"
                 )
-            if official_test_sources:
+            split_metadata["official_test_holdout_count"] = len(official_test_sources)
+            if official_test_sources and use_official_test_as_validation:
                 train_sources = all_sources
                 val_sources = official_test_sources
+                split_metadata["split_strategy"] = "official_test_as_validation"
             else:
-                train_sources, val_sources = self._stratified_split_items(
-                    all_sources,
-                    validation_split,
-                    lambda source: int(source.label),
-                    "Temporal source split",
+                try:
+                    train_sources, val_sources = self._stratified_split_items_by_group(
+                        all_sources,
+                        validation_split,
+                        lambda source: self._infer_validation_subgroup_from_path(
+                            source.path
+                            or (source.frame_paths[0] if source.frame_paths else None),
+                            root_path,
+                        ),
+                        "Temporal subgroup split",
+                    )
+                    split_metadata["split_strategy"] = "internal_subgroup_validation"
+                except ValueError:
+                    train_sources, val_sources = self._stratified_split_items(
+                        all_sources,
+                        validation_split,
+                        lambda source: int(source.label),
+                        "Temporal source split",
+                    )
+                    split_metadata["split_strategy"] = "internal_label_validation"
+
+            split_metadata["train_subgroup_counts"] = dict(
+                Counter(
+                    self._infer_validation_subgroup_from_path(
+                        source.path
+                        or (source.frame_paths[0] if source.frame_paths else None),
+                        root_path,
+                    )
+                    for source in train_sources
                 )
+            )
+            split_metadata["val_subgroup_counts"] = dict(
+                Counter(
+                    self._infer_validation_subgroup_from_path(
+                        source.path
+                        or (source.frame_paths[0] if source.frame_paths else None),
+                        root_path,
+                    )
+                    for source in val_sources
+                )
+            )
 
         self._log_label_distribution(
             "temporal_train_sources", [source.label for source in train_sources]
@@ -3270,7 +3678,8 @@ class TrainingService:
             "temporal_val_sources", [source.label for source in val_sources]
         )
         train_class_weights = self._compute_class_weights(
-            [source.label for source in train_sources]
+            [source.label for source in train_sources],
+            strategy=class_weight_strategy,
         )
 
         train_clip_budget = self._resolve_temporal_clip_budget(
@@ -3374,7 +3783,7 @@ class TrainingService:
                 },
             )
 
-        return train_loader, val_loader, train_class_weights
+        return train_loader, val_loader, train_class_weights, split_metadata
 
     def _dataset_has_temporal_media(self, dataset_path: str) -> bool:
         """Return True when the dataset contains video files or frame-group videos."""
@@ -4082,6 +4491,26 @@ class TrainingService:
         """Reserve 100% for jobs that are fully finalized."""
         return min(max(progress, 0.0), 99.0)
 
+    def _summarize_logit_bucket(
+        self,
+        logits_list: List[torch.Tensor],
+        labels_list: List[int],
+        criterion: nn.Module,
+        device: torch.device,
+    ) -> Dict[str, float]:
+        if not logits_list or not labels_list:
+            return {}
+
+        logits = torch.stack(logits_list, dim=0).to(device)
+        labels = torch.tensor(labels_list, dtype=torch.long, device=device)
+        loss = float(criterion(logits, labels).item())
+        accuracy = float((logits.argmax(dim=1) == labels).float().mean().item())
+        return {
+            "count": int(labels.shape[0]),
+            "loss": loss,
+            "accuracy": accuracy,
+        }
+
     def _run_eval_epoch(
         self,
         model: nn.Module,
@@ -4090,7 +4519,7 @@ class TrainingService:
         device: torch.device,
         amp_enabled: bool = False,
         channels_last: bool = False,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """Run one validation epoch."""
         model.eval()
         total_loss = 0.0
@@ -4098,6 +4527,8 @@ class TrainingService:
         total_samples = 0
         grouped_logits: Dict[str, List[torch.Tensor]] = {}
         grouped_labels: Dict[str, int] = {}
+        sample_subgroup_logits: Dict[str, List[torch.Tensor]] = {}
+        sample_subgroup_labels: Dict[str, List[int]] = {}
 
         with torch.no_grad():
             for batch in dataloader:
@@ -4131,10 +4562,17 @@ class TrainingService:
                     detached_labels = labels.detach().cpu()
                     for item_index, source_id in enumerate(source_ids):
                         source_key = str(source_id)
+                        subgroup = self._infer_validation_subgroup_from_path(source_key)
                         grouped_logits.setdefault(source_key, []).append(
                             detached_outputs[item_index]
                         )
                         label_value = int(detached_labels[item_index].item())
+                        sample_subgroup_logits.setdefault(subgroup, []).append(
+                            detached_outputs[item_index]
+                        )
+                        sample_subgroup_labels.setdefault(subgroup, []).append(
+                            label_value
+                        )
                         if (
                             source_key in grouped_labels
                             and grouped_labels[source_key] != label_value
@@ -4147,8 +4585,28 @@ class TrainingService:
         sample_loss = total_loss / max(total_samples, 1)
         sample_accuracy = total_correct / max(total_samples, 1)
 
+        subgroup_metrics: Dict[str, Dict[str, Any]] = {}
+        for subgroup, logits_list in sample_subgroup_logits.items():
+            summary = self._summarize_logit_bucket(
+                logits_list,
+                sample_subgroup_labels.get(subgroup, []),
+                criterion,
+                device,
+            )
+            if summary:
+                subgroup_metrics[subgroup] = {
+                    "sample_count": summary["count"],
+                    "sample_loss": summary["loss"],
+                    "sample_accuracy": summary["accuracy"],
+                    "video_count": 0,
+                    "video_loss": None,
+                    "video_accuracy": None,
+                }
+
         if grouped_logits:
             ordered_source_ids = sorted(grouped_logits)
+            video_subgroup_logits: Dict[str, List[torch.Tensor]] = {}
+            video_subgroup_labels: Dict[str, List[int]] = {}
             aggregated_logits = torch.stack(
                 [
                     torch.stack(grouped_logits[source_id], dim=0).mean(dim=0)
@@ -4168,12 +4626,54 @@ class TrainingService:
                 .mean()
                 .item()
             )
+
+            for row_index, source_id in enumerate(ordered_source_ids):
+                subgroup = self._infer_validation_subgroup_from_path(source_id)
+                video_subgroup_logits.setdefault(subgroup, []).append(
+                    aggregated_logits[row_index].detach().cpu()
+                )
+                video_subgroup_labels.setdefault(subgroup, []).append(
+                    int(aggregated_labels[row_index].item())
+                )
+
+            for subgroup, logits_list in video_subgroup_logits.items():
+                summary = self._summarize_logit_bucket(
+                    logits_list,
+                    video_subgroup_labels.get(subgroup, []),
+                    criterion,
+                    device,
+                )
+                if not summary:
+                    continue
+                subgroup_entry = subgroup_metrics.setdefault(
+                    subgroup,
+                    {
+                        "sample_count": 0,
+                        "sample_loss": None,
+                        "sample_accuracy": None,
+                    },
+                )
+                subgroup_entry["video_count"] = summary["count"]
+                subgroup_entry["video_loss"] = summary["loss"]
+                subgroup_entry["video_accuracy"] = summary["accuracy"]
+
+            subgroup_macro_accuracy = self._compute_subgroup_macro_accuracy(
+                subgroup_metrics
+            )
+            selection_score = (
+                subgroup_macro_accuracy
+                if subgroup_macro_accuracy is not None
+                else video_accuracy
+            )
             return {
                 "loss": video_loss,
                 "accuracy": video_accuracy,
                 "sample_loss": sample_loss,
                 "sample_accuracy": sample_accuracy,
                 "video_count": len(ordered_source_ids),
+                "subgroup_metrics": subgroup_metrics or None,
+                "subgroup_macro_accuracy": subgroup_macro_accuracy,
+                "selection_score": selection_score,
             }
 
         return {
@@ -4182,6 +4682,12 @@ class TrainingService:
             "sample_loss": sample_loss,
             "sample_accuracy": sample_accuracy,
             "video_count": total_samples,
+            "subgroup_metrics": subgroup_metrics or None,
+            "subgroup_macro_accuracy": self._compute_subgroup_macro_accuracy(
+                subgroup_metrics
+            ),
+            "selection_score": self._compute_subgroup_macro_accuracy(subgroup_metrics)
+            or sample_accuracy,
         }
 
     def _update_epoch_metrics(
@@ -4193,6 +4699,9 @@ class TrainingService:
         sample_accuracy: Optional[float] = None,
         sample_loss: Optional[float] = None,
         video_count: Optional[int] = None,
+        subgroup_metrics: Optional[Dict[str, Any]] = None,
+        subgroup_macro_accuracy: Optional[float] = None,
+        checkpoint_selection_score: Optional[float] = None,
         epoch: Optional[int] = None,
         total_epochs: Optional[int] = None,
         message: Optional[str] = None,
@@ -4222,6 +4731,12 @@ class TrainingService:
             active_update["val_sample_accuracy"] = sample_accuracy
         if video_count is not None:
             active_update["val_video_count"] = video_count
+        if subgroup_metrics is not None:
+            active_update["val_subgroup_metrics"] = subgroup_metrics
+        if subgroup_macro_accuracy is not None:
+            active_update["val_subgroup_macro_accuracy"] = subgroup_macro_accuracy
+        if checkpoint_selection_score is not None:
+            active_update["checkpoint_selection_score"] = checkpoint_selection_score
         if epoch is not None:
             active_update["current_epoch"] = epoch
         if total_epochs is not None:
@@ -4261,21 +4776,92 @@ class TrainingService:
         from app.schemas.training import TrainingParameters, TrainingResults
 
         active_meta = self._active_jobs.get(job.id, {})
+        epoch_history = self._read_epoch_metrics_payload(job.id)
+        latest_epoch_metric = None
+        best_epoch_metric = None
+        if epoch_history.get("metrics"):
+            latest_epoch_metric = epoch_history["metrics"][-1]
+        checkpoint_metadata = (
+            self._read_checkpoint_metadata(job.model_path)
+            if job.model_path and job.status == JobStatus.COMPLETED.value
+            else {}
+        )
+        checkpoint_parameters = checkpoint_metadata.get("parameters", {})
         training_device = active_meta.get("requested_device", settings.TRAINING_DEVICE)
         current_epoch = active_meta.get("current_epoch")
         total_epochs = active_meta.get("total_epochs", job.epochs)
         progress_message = active_meta.get("message")
-        validation_split = active_meta.get("validation_split", 0.2)
+        validation_split = active_meta.get(
+            "validation_split", checkpoint_parameters.get("validation_split", 0.2)
+        )
         early_stopping = active_meta.get("early_stopping", True)
         patience = active_meta.get("patience", 10)
         early_stopping_min_delta = active_meta.get("early_stopping_min_delta", 0.002)
         weight_decay = active_meta.get("weight_decay", 0.0001)
         label_smoothing = active_meta.get("label_smoothing", 0.05)
-        best_epoch = active_meta.get("best_epoch")
-        epochs_trained = active_meta.get("epochs_trained")
-        val_sample_accuracy = active_meta.get("val_sample_accuracy")
-        val_sample_loss = active_meta.get("val_sample_loss")
-        val_video_count = active_meta.get("val_video_count")
+        class_weight_strategy = active_meta.get(
+            "class_weight_strategy",
+            checkpoint_parameters.get("class_weight_strategy", "balanced"),
+        )
+        use_official_test_as_validation = active_meta.get(
+            "use_official_test_as_validation",
+            checkpoint_parameters.get("use_official_test_as_validation", False),
+        )
+        best_epoch = active_meta.get(
+            "best_epoch", checkpoint_parameters.get("best_epoch")
+        )
+        if best_epoch is not None and epoch_history.get("metrics"):
+            best_epoch_metric = next(
+                (
+                    metric
+                    for metric in epoch_history["metrics"]
+                    if int(metric.get("epoch", 0)) == int(best_epoch)
+                ),
+                None,
+            )
+        metric_snapshot = best_epoch_metric or latest_epoch_metric or {}
+        epochs_trained = active_meta.get(
+            "epochs_trained", checkpoint_parameters.get("epochs_trained")
+        )
+        val_sample_accuracy = active_meta.get(
+            "val_sample_accuracy",
+            metric_snapshot.get(
+                "val_sample_accuracy", checkpoint_parameters.get("val_sample_accuracy")
+            ),
+        )
+        val_sample_loss = active_meta.get(
+            "val_sample_loss",
+            metric_snapshot.get(
+                "val_sample_loss", checkpoint_parameters.get("val_sample_loss")
+            ),
+        )
+        val_video_count = active_meta.get(
+            "val_video_count",
+            metric_snapshot.get(
+                "val_video_count", checkpoint_parameters.get("val_video_count")
+            ),
+        )
+        val_subgroup_metrics = active_meta.get(
+            "val_subgroup_metrics",
+            metric_snapshot.get(
+                "val_subgroup_metrics",
+                checkpoint_parameters.get("val_subgroup_metrics"),
+            ),
+        )
+        val_subgroup_macro_accuracy = active_meta.get(
+            "val_subgroup_macro_accuracy",
+            metric_snapshot.get(
+                "val_subgroup_macro_accuracy",
+                checkpoint_parameters.get("val_subgroup_macro_accuracy"),
+            ),
+        )
+        checkpoint_selection_score = active_meta.get(
+            "checkpoint_selection_score",
+            metric_snapshot.get(
+                "checkpoint_selection_score",
+                checkpoint_parameters.get("checkpoint_selection_score"),
+            ),
+        )
         preprocessing_stage = active_meta.get("preprocessing_stage")
         preprocessing_progress = active_meta.get("preprocessing_progress")
         preprocessing_current = active_meta.get("preprocessing_current")
@@ -4311,6 +4897,8 @@ class TrainingService:
             early_stopping_min_delta=early_stopping_min_delta,
             weight_decay=weight_decay,
             label_smoothing=label_smoothing,
+            class_weight_strategy=class_weight_strategy,
+            use_official_test_as_validation=use_official_test_as_validation,
             training_device=training_device,
         )
 
@@ -4324,6 +4912,9 @@ class TrainingService:
                 val_sample_accuracy=val_sample_accuracy,
                 val_sample_loss=val_sample_loss,
                 val_video_count=val_video_count,
+                val_subgroup_metrics=val_subgroup_metrics,
+                val_subgroup_macro_accuracy=val_subgroup_macro_accuracy,
+                checkpoint_selection_score=checkpoint_selection_score,
                 epochs_trained=epochs_trained,
                 best_epoch=best_epoch,
                 model_path=job.model_path,
@@ -4449,8 +5040,18 @@ class TrainingService:
             "validation_split": checkpoint.get("validation_split"),
             "weight_decay": checkpoint.get("weight_decay"),
             "label_smoothing": checkpoint.get("label_smoothing"),
+            "class_weight_strategy": checkpoint.get("class_weight_strategy"),
             "class_weights": checkpoint.get("class_weights"),
             "majority_downsampling": checkpoint.get("majority_downsampling"),
+            "use_official_test_as_validation": checkpoint.get(
+                "use_official_test_as_validation"
+            ),
+            "split_strategy": checkpoint.get("split_strategy"),
+            "official_test_holdout_count": checkpoint.get(
+                "official_test_holdout_count"
+            ),
+            "train_subgroup_counts": checkpoint.get("train_subgroup_counts"),
+            "val_subgroup_counts": checkpoint.get("val_subgroup_counts"),
             "early_stopping": checkpoint.get("early_stopping"),
             "patience": checkpoint.get("patience"),
             "early_stopping_min_delta": checkpoint.get("early_stopping_min_delta"),
@@ -4470,6 +5071,11 @@ class TrainingService:
             "val_sample_accuracy": checkpoint.get("val_sample_accuracy"),
             "val_sample_loss": checkpoint.get("val_sample_loss"),
             "val_video_count": checkpoint.get("val_video_count"),
+            "val_subgroup_metrics": checkpoint.get("val_subgroup_metrics"),
+            "val_subgroup_macro_accuracy": checkpoint.get(
+                "val_subgroup_macro_accuracy"
+            ),
+            "checkpoint_selection_score": checkpoint.get("checkpoint_selection_score"),
         }
         filtered_parameters = {
             key: value for key, value in parameters.items() if value is not None
