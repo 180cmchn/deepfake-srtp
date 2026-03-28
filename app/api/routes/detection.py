@@ -19,6 +19,7 @@ import os
 import uuid
 from datetime import datetime
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.logging import logger
 from app.core.auth import get_current_user, get_optional_user
@@ -95,6 +96,53 @@ def parse_video_detection_request(
         return_frame_results=return_frame_results,
         preprocess=preprocess,
     )
+
+
+def _get_model_usable_for(model_type: str) -> List[str]:
+    return ["video"] if model_type == "lrcn" else ["image", "video"]
+
+
+def _build_registry_model_option(model: ModelRegistry):
+    return {
+        "id": model.id,
+        "name": model.name,
+        "label": f"{model.name} ({model.model_type.upper()})",
+        "model_type": model.model_type,
+        "source": "registry",
+        "status": model.status,
+        "is_default": bool(model.is_default),
+        "usable_for": _get_model_usable_for(model.model_type),
+        "is_ready": True,
+        "is_recommended": True,
+        "readiness": "ready",
+        "selection_policy": "primary",
+        "readiness_reason": (
+            f"Registry model is {model.status} and available for detection"
+        ),
+    }
+
+
+def _build_builtin_model_option(model_type: str, *, is_fallback_default: bool):
+    return {
+        "id": None,
+        "name": model_type,
+        "label": f"Built-in fallback {model_type.upper()}",
+        "model_type": model_type,
+        "source": "builtin",
+        "status": "builtin",
+        "is_default": False,
+        "usable_for": _get_model_usable_for(model_type),
+        "is_ready": False,
+        "is_recommended": False,
+        "readiness": "fallback_only",
+        "selection_policy": (
+            "fallback_default" if is_fallback_default else "fallback_only"
+        ),
+        "readiness_reason": (
+            "Built-in model types are exposed as fallback-only until a ready "
+            "or deployed registry model exists"
+        ),
+    }
 
 
 @router.post("/detect", response_model=DetectionResponse)
@@ -413,54 +461,73 @@ async def get_available_models(db: Session = Depends(get_db)):
                     [ModelStatus.READY.value, ModelStatus.DEPLOYED.value]
                 ),
             )
-            .order_by(ModelRegistry.is_default.desc(), ModelRegistry.created_at.desc())
+            .order_by(
+                ModelRegistry.is_default.desc(),
+                ModelRegistry.created_at.desc(),
+                ModelRegistry.id.desc(),
+            )
             .all()
         )
-        builtin_types = MLModelRegistry.list_models()
+        builtin_types = sorted(set(MLModelRegistry.list_models()))
+        default_builtin_type = (
+            settings.DEFAULT_MODEL_TYPE
+            if settings.DEFAULT_MODEL_TYPE in builtin_types
+            else (builtin_types[0] if builtin_types else settings.DEFAULT_MODEL_TYPE)
+        )
+        builtin_types = sorted(
+            builtin_types,
+            key=lambda model_type: (model_type != default_builtin_type, model_type),
+        )
 
         saved_models = [
-            {
-                "id": model.id,
-                "name": model.name,
-                "label": f"{model.name} ({model.model_type.upper()})",
-                "model_type": model.model_type,
-                "source": "registry",
-                "status": model.status,
-                "is_default": bool(model.is_default),
-                "usable_for": ["video"]
-                if model.model_type == "lrcn"
-                else ["image", "video"],
-            }
-            for model in registry_models
+            _build_registry_model_option(model) for model in registry_models
         ]
 
         saved_model_types = {model.model_type for model in registry_models}
         builtin_models = [
-            {
-                "id": None,
-                "name": model_type,
-                "label": f"Built-in {model_type.upper()}",
-                "model_type": model_type,
-                "source": "builtin",
-                "status": "builtin",
-                "is_default": False,
-                "usable_for": ["video"] if model_type == "lrcn" else ["image", "video"],
-            }
+            _build_builtin_model_option(
+                model_type,
+                is_fallback_default=model_type == default_builtin_type,
+            )
             for model_type in builtin_types
             if model_type not in saved_model_types
         ]
 
-        default_model = next(
-            (model for model in saved_models if model["is_default"]), None
-        ) or (saved_models[0] if saved_models else None)
-        default_value = (
-            {"model_id": default_model["id"], "model_type": default_model["model_type"]}
-            if default_model and default_model["source"] == "registry"
-            else {
-                "model_id": None,
-                "model_type": (default_model or {"model_type": "vgg"})["model_type"],
-            }
+        default_model = (
+            next((model for model in saved_models if model["is_default"]), None)
+            or (saved_models[0] if saved_models else None)
+            or (
+                next(
+                    (
+                        model
+                        for model in builtin_models
+                        if model["model_type"] == default_builtin_type
+                    ),
+                    None,
+                )
+                or (builtin_models[0] if builtin_models else None)
+            )
         )
+
+        default_value = {
+            "model_id": default_model["id"] if default_model else None,
+            "model_type": (
+                default_model["model_type"] if default_model else default_builtin_type
+            ),
+            "source": default_model["source"] if default_model else "builtin",
+            "is_ready": default_model["is_ready"] if default_model else False,
+            "is_recommended": (
+                default_model["is_recommended"] if default_model else False
+            ),
+            "readiness": (
+                default_model["readiness"] if default_model else "fallback_only"
+            ),
+            "selection_policy": (
+                default_model["selection_policy"]
+                if default_model
+                else "fallback_default"
+            ),
+        }
 
         return {
             "models": saved_models + builtin_models,
