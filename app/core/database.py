@@ -7,7 +7,7 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from contextlib import contextmanager
-from typing import Generator
+from typing import Any, Dict, Generator
 import time
 import sqlite3
 import pymysql
@@ -84,6 +84,28 @@ def test_connection() -> bool:
     except Exception as e:
         logger.error("Database connection test failed", error=str(e))
         return False
+
+
+def get_database_health_snapshot() -> Dict[str, Any]:
+    started_at = time.perf_counter()
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        response_time_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        return {
+            "healthy": True,
+            "status": "healthy",
+            "response_time_ms": response_time_ms,
+        }
+    except Exception as e:
+        response_time_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.error("Database health snapshot failed", error=str(e))
+        return {
+            "healthy": False,
+            "status": "unhealthy",
+            "response_time_ms": response_time_ms,
+            "error": str(e),
+        }
 
 
 def test_connection_with_retry(max_retries: int = 3, retry_delay: int = 1) -> bool:
@@ -177,6 +199,30 @@ def ensure_runtime_schema() -> bool:
         if "model_type" not in existing_columns:
             statements.append(
                 "ALTER TABLE detection_results ADD COLUMN model_type VARCHAR(50)"
+            )
+        if "source_total_frames" not in existing_columns:
+            statements.append(
+                "ALTER TABLE detection_results ADD COLUMN source_total_frames INTEGER"
+            )
+        if "source_fps" not in existing_columns:
+            statements.append(
+                "ALTER TABLE detection_results ADD COLUMN source_fps FLOAT"
+            )
+        if "source_duration_seconds" not in existing_columns:
+            statements.append(
+                "ALTER TABLE detection_results ADD COLUMN source_duration_seconds FLOAT"
+            )
+        if "sampled_frame_count" not in existing_columns:
+            statements.append(
+                "ALTER TABLE detection_results ADD COLUMN sampled_frame_count INTEGER"
+            )
+        if "analyzed_frame_count" not in existing_columns:
+            statements.append(
+                "ALTER TABLE detection_results ADD COLUMN analyzed_frame_count INTEGER"
+            )
+        if "sampled_duration_seconds" not in existing_columns:
+            statements.append(
+                "ALTER TABLE detection_results ADD COLUMN sampled_duration_seconds FLOAT"
             )
 
         if not statements:

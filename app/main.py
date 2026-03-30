@@ -2,8 +2,11 @@
 FastAPI application for deepfake detection platform
 """
 
+from datetime import datetime
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import structlog
 import os
@@ -17,6 +20,7 @@ from app.core.config import settings
 from app.core.database import (
     create_tables_with_retry,
     ensure_runtime_schema,
+    get_database_health_snapshot,
     test_connection,
 )
 from app.core.logging import logger
@@ -93,7 +97,7 @@ async def root():
     return {
         "message": f"{settings.PROJECT_NAME} API",
         "version": "1.0.0",
-        "docs_url": f"{settings.API_V1_STR}/docs",
+        "docs_url": "/docs",
         "supported_models": settings.SUPPORTED_MODELS,
     }
 
@@ -101,16 +105,22 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    db_status = "healthy" if test_connection() else "unhealthy"
-    return {
-        "status": "healthy",
-        "database": db_status,
+    db_health = get_database_health_snapshot()
+    payload = {
+        "status": db_health["status"],
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": db_health["status"],
+        "checks": {"database": db_health},
         "project": settings.PROJECT_NAME,
-        "version": "1.0.0",
+        "version": settings.APP_VERSION,
     }
+    return JSONResponse(
+        status_code=200 if db_health["healthy"] else 503,
+        content=payload,
+    )
 
 
 if __name__ == "__main__":
-    import uvicorn
+    from run import main as run_main
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    run_main()
