@@ -7,6 +7,7 @@ import time
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.logging import logger
 from app.models.database_models import ModelRegistry, TrainingJob
 from app.schemas.models import (
@@ -216,11 +217,13 @@ class ModelService:
 
             self.db.commit()
 
+            api_prefix = settings.API_V1_STR.rstrip("/")
+
             deployment = ModelDeployment(
                 model_id=model_id,
                 deployment_config=deployment_config,
-                endpoint_url=f"/api/v1/models/{model_id}/predict",
-                health_check_url=f"/api/v1/models/{model_id}/health",
+                endpoint_url=f"{api_prefix}/models/{model_id}/predict",
+                health_check_url=f"{api_prefix}/models/{model_id}/health",
                 deployment_status="deployed",
                 deployed_at=time.time(),
             )
@@ -323,7 +326,15 @@ class ModelService:
     def _db_to_response(self, model: ModelRegistry) -> ModelResponse:
         """Convert database model to response schema"""
         metrics = None
-        if model.accuracy is not None:
+        if any(
+            value is not None
+            for value in (
+                model.accuracy,
+                model.precision,
+                model.recall,
+                model.f1_score,
+            )
+        ):
             metrics = ModelMetrics(
                 accuracy=model.accuracy,
                 precision=model.precision,

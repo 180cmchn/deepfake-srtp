@@ -3,7 +3,7 @@ Configuration management for deepfake detection platform
 """
 
 from typing import List, Optional
-from pydantic import field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
 import os
@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     RELOAD: bool = False
 
     # API Settings
-    API_V1_STR: str = "/api/v1"
+    API_V1_STR: str = Field(
+        "/api/v1",
+        validation_alias=AliasChoices("API_V1_STR", "API_V1_PREFIX"),
+    )
     PROJECT_NAME: str = "Deepfake Detection Platform"
 
     # Security Settings

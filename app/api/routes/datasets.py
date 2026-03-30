@@ -37,6 +37,18 @@ MAX_IMAGE_SIZE = 50 * 1024 * 1024  # 50MB for images
 MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500MB for videos
 
 
+def _build_dataset_upload_path(
+    *, file_type: str, dataset_id: Optional[int] = None, file_extension: str
+) -> str:
+    type_prefix = "img" if file_type == "image" else "vid"
+    if dataset_id is None:
+        filename = f"{type_prefix}_{uuid.uuid4()}{file_extension}"
+    else:
+        filename = f"dataset_{dataset_id}_{type_prefix}_{uuid.uuid4()}{file_extension}"
+    os.makedirs(settings.DATA_DIR, exist_ok=True)
+    return os.path.join(settings.DATA_DIR, filename)
+
+
 def validate_file(file: UploadFile) -> tuple[str, str]:
     """Validate file type and size"""
     if not file.filename:
@@ -307,8 +319,8 @@ async def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
 async def upload_dataset(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    name: str = None,
-    description: str = None,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
     config: DatasetProcessingConfig = Depends(),
     db: Session = Depends(get_db),
 ):
@@ -321,12 +333,10 @@ async def upload_dataset(
         file_type, file_extension = validate_file(file)
 
         # Generate unique filename with type prefix
-        type_prefix = "img" if file_type == "image" else "vid"
-        unique_filename = f"{type_prefix}_{uuid.uuid4()}{file_extension}"
-        file_path = os.path.join("data", unique_filename)
-
-        # Ensure data directory exists
-        os.makedirs("data", exist_ok=True)
+        file_path = _build_dataset_upload_path(
+            file_type=file_type,
+            file_extension=file_extension,
+        )
 
         # Read file content with size check
         content = await file.read()
@@ -473,7 +483,7 @@ async def add_files_to_dataset(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     reprocess: bool = True,
-    description: str = None,
+    description: Optional[str] = None,
     config: DatasetProcessingConfig = Depends(),
     db: Session = Depends(get_db),
 ):
@@ -497,14 +507,11 @@ async def add_files_to_dataset(
             file_type, file_extension = validate_file(file)
 
             # Generate unique filename with dataset prefix
-            type_prefix = "img" if file_type == "image" else "vid"
-            unique_filename = (
-                f"dataset_{dataset_id}_{type_prefix}_{uuid.uuid4()}{file_extension}"
+            file_path = _build_dataset_upload_path(
+                file_type=file_type,
+                dataset_id=dataset_id,
+                file_extension=file_extension,
             )
-            file_path = os.path.join("data", unique_filename)
-
-            # Ensure data directory exists
-            os.makedirs("data", exist_ok=True)
 
             # Read file content
             content = await file.read()
