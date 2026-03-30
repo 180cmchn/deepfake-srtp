@@ -98,13 +98,27 @@ class TrainingResults(BaseModel):
     """Training results schema"""
 
     accuracy: Optional[float] = Field(
-        None, ge=0.0, le=1.0, description="Final accuracy"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Deprecated legacy alias of the persisted video-level validation accuracy summary.",
     )
-    loss: Optional[float] = Field(None, ge=0.0, description="Final loss")
+    loss: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="Deprecated legacy alias of the persisted video-level validation loss summary.",
+    )
     val_accuracy: Optional[float] = Field(
-        None, ge=0.0, le=1.0, description="Final validation accuracy"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Video-level validation accuracy summary returned for the completed training job.",
     )
-    val_loss: Optional[float] = Field(None, ge=0.0, description="Final validation loss")
+    val_loss: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="Video-level validation loss summary returned for the completed training job.",
+    )
     val_sample_accuracy: Optional[float] = Field(
         None, ge=0.0, le=1.0, description="Validation accuracy at sample or clip level"
     )
@@ -127,7 +141,7 @@ class TrainingResults(BaseModel):
         None,
         ge=0.0,
         le=1.0,
-        description="Score used to select the best checkpoint",
+        description="Score used to select the best checkpoint before val_accuracy/val_loss tie-breaks.",
     )
     training_time: Optional[float] = Field(
         None, ge=0.0, description="Training time in seconds"
@@ -135,7 +149,11 @@ class TrainingResults(BaseModel):
     epochs_trained: Optional[int] = Field(
         None, ge=0, description="Number of epochs actually trained"
     )
-    best_epoch: Optional[int] = Field(None, ge=0, description="Best epoch number")
+    best_epoch: Optional[int] = Field(
+        None,
+        ge=0,
+        description="Epoch selected by checkpoint_selection_score, then validation accuracy/loss tie-breaks.",
+    )
     model_path: Optional[str] = Field(None, description="Path to saved model")
 
 
@@ -150,7 +168,7 @@ class TrainingJobBase(BaseModel):
         ..., description="Model type (vgg, lrcn, swin, vit, resnet)"
     )
     dataset_path: str = Field(..., description="Path to dataset")
-    parameters: Optional[TrainingParameters] = Field(default_factory=TrainingParameters)
+    parameters: TrainingParameters = Field(default_factory=TrainingParameters)
 
     @validator("model_type")
     def validate_model_type(cls, v):

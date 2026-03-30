@@ -1989,9 +1989,9 @@ class TrainingService:
                     f"[{job.completed_at}] Training finished with status={job.status}"
                 )
             if job.accuracy is not None:
-                lines.append(f"Accuracy: {job.accuracy:.4f}")
+                lines.append(f"Best video validation accuracy: {job.accuracy:.4f}")
             if job.loss is not None:
-                lines.append(f"Loss: {job.loss:.4f}")
+                lines.append(f"Best video validation loss: {job.loss:.4f}")
             if job.error_message:
                 lines.append(f"Error: {job.error_message}")
 

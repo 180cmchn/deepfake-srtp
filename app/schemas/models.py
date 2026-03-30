@@ -59,13 +59,44 @@ class ModelUpdate(BaseModel):
 class ModelMetrics(BaseModel):
     """Schema for model performance metrics"""
 
-    accuracy: Optional[float] = Field(None, ge=0.0, le=1.0)
-    precision: Optional[float] = Field(None, ge=0.0, le=1.0)
-    recall: Optional[float] = Field(None, ge=0.0, le=1.0)
-    f1_score: Optional[float] = Field(None, ge=0.0, le=1.0)
-    auc_roc: Optional[float] = Field(None, ge=0.0, le=1.0)
-    confusion_matrix: Optional[Dict[str, Any]] = None
-    classification_report: Optional[Dict[str, Any]] = None
+    accuracy: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Primary accuracy metric stored for the registry model when available.",
+    )
+    precision: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Optional advanced metric. Present only when the backend has precision data for this model.",
+    )
+    recall: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Optional advanced metric. Present only when the backend has recall data for this model.",
+    )
+    f1_score: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Optional advanced metric. Present only when the backend has F1 data for this model.",
+    )
+    auc_roc: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Optional advanced metric. Legacy registry rows usually do not provide AUC-ROC.",
+    )
+    confusion_matrix: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Optional advanced report artifact. Present only when imported model metadata provides it.",
+    )
+    classification_report: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Optional advanced report artifact. Present only when imported model metadata provides it.",
+    )
 
 
 class ModelResponse(ModelInfo):
