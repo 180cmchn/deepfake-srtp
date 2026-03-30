@@ -5,10 +5,11 @@ Detection service for deepfake detection platform
 import os
 import time
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import and_, func, or_
 from fastapi import BackgroundTasks
 import torch
 import cv2
@@ -18,7 +19,12 @@ import numpy as np
 from app.core.database import get_db_session
 from app.core.logging import logger
 from app.core.config import settings
-from app.models.database_models import DetectionResult, ModelRegistry
+from app.models.database_models import (
+    AuditLog,
+    DetectionResult,
+    ModelRegistry,
+    ModelStatus,
+)
 from app.models.ml_models import ModelRegistry as MLModelRegistry, create_model
 from app.schemas.detection import (
     DetectionRequest,
@@ -32,6 +38,7 @@ from app.schemas.detection import (
     DetectionStatistics,
     DetectionResult as DetectionResultSchema,
     DetectionDecisionMetrics,
+    DetectionStatus,
     PredictionType,
     FileType,
 )
@@ -39,6 +46,11 @@ from app.schemas.detection import (
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+READY_MODEL_STATUSES = (ModelStatus.READY.value, ModelStatus.DEPLOYED.value)
+MODEL_UNAVAILABLE_ERROR_PREFIX = (
+    "No usable ready/deployed registry model is available for detection"
+)
+MODEL_UNAVAILABLE_ERROR_CODE = "model_unavailable"
 
 
 class DetectionService:
@@ -48,19 +60,106 @@ class DetectionService:
         self.db = db
         self._model_cache = {}
 
+    def _resolve_detection_status(
+        self, status_value: Optional[str], error_message: Optional[str]
+    ) -> DetectionStatus:
+        try:
+            return DetectionStatus(status_value)
+        except Exception:
+            return (
+                DetectionStatus.FAILED
+                if (error_message or "").strip()
+                else DetectionStatus.COMPLETED
+            )
+
+    def _resolve_prediction_type(
+        self, prediction_value: Optional[str]
+    ) -> Optional[PredictionType]:
+        try:
+            return PredictionType(prediction_value)
+        except Exception:
+            return None
+
+    def _resolve_error_code(self, error_message: Optional[str]) -> Optional[str]:
+        if isinstance(error_message, str) and error_message.startswith(
+            MODEL_UNAVAILABLE_ERROR_PREFIX
+        ):
+            return MODEL_UNAVAILABLE_ERROR_CODE
+        return None
+
+    def _apply_detection_result_filters(
+        self,
+        query,
+        *,
+        prediction: Optional[str] = None,
+        status: Optional[str] = None,
+        model_type: Optional[str] = None,
+        search: Optional[str] = None,
+    ):
+        if prediction:
+            query = query.filter(DetectionResult.prediction == prediction)
+
+        if status:
+            if status == DetectionStatus.FAILED.value:
+                query = query.filter(
+                    or_(
+                        DetectionResult.status == status,
+                        and_(
+                            DetectionResult.status.is_(None),
+                            DetectionResult.error_message.isnot(None),
+                            func.trim(DetectionResult.error_message) != "",
+                        ),
+                    )
+                )
+            elif status == DetectionStatus.COMPLETED.value:
+                query = query.filter(
+                    or_(
+                        DetectionResult.status == status,
+                        and_(
+                            DetectionResult.status.is_(None),
+                            or_(
+                                DetectionResult.error_message.is_(None),
+                                func.trim(DetectionResult.error_message) == "",
+                            ),
+                        ),
+                    )
+                )
+            else:
+                query = query.filter(DetectionResult.status == status)
+
+        if model_type:
+            query = query.outerjoin(ModelRegistry).filter(
+                or_(
+                    DetectionResult.model_type == model_type,
+                    ModelRegistry.model_type == model_type,
+                )
+            )
+
+        if search:
+            search_term = f"%{search}%"
+            query = query.filter(DetectionResult.file_name.ilike(search_term))
+
+        return query
+
     async def detect_file(
         self,
         file_path: str,
         request: DetectionRequest,
         background_tasks: BackgroundTasks,
+        original_file_name: Optional[str] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
+        audit_action: str = "detect",
     ) -> DetectionResponse:
         """Detect deepfake in a single file"""
         start_time = time.time()
+        stored_file_name = os.path.basename(file_path)
+        resolved_original_file_name = original_file_name or stored_file_name
+        file_type = self._get_file_type(file_path)
+        file_size = None
+        loaded_model = None
 
         try:
             # Get file info
-            file_name = os.path.basename(file_path)
-            file_type = self._get_file_type(file_path)
             file_size = os.path.getsize(file_path)
 
             # Load model
@@ -103,36 +202,43 @@ class DetectionService:
                 probabilities=probabilities,
                 decision_metrics=decision_metrics,
                 processing_time=processing_time,
-                model_info={
-                    "model_id": loaded_model.get("model_id"),
-                    "model_name": loaded_model.get("model_name"),
-                    "model_type": loaded_model["model_type"],
-                    "input_size": loaded_model.get(
-                        "input_size", settings.MODEL_INPUT_SIZE
-                    ),
-                    "source": loaded_model.get("source"),
-                },
+                model_info=self._build_model_info(loaded_model),
             )
 
             # Save to database
             db_result = await self._save_detection_result(
                 file_path=file_path,
-                file_name=file_name,
+                original_file_name=resolved_original_file_name,
                 file_type=file_type,
                 result=detection_result,
-                model_id=request.model_id,
+                file_size=file_size,
+                status="completed",
+                model_id=loaded_model.get("model_id"),
                 model_name=loaded_model.get("model_name"),
                 model_type=loaded_model.get("model_type"),
             )
-
-            # Schedule cleanup in background
-            background_tasks.add_task(self._cleanup_file, file_path)
+            self._write_detection_audit_log(
+                action=audit_action,
+                status="completed",
+                db_result=db_result,
+                file_path=file_path,
+                original_file_name=resolved_original_file_name,
+                file_type=file_type,
+                file_size=file_size,
+                model_id=loaded_model.get("model_id"),
+                model_name=loaded_model.get("model_name"),
+                model_type=loaded_model.get("model_type"),
+                prediction=detection_result.prediction,
+                confidence=detection_result.confidence,
+                processing_time=processing_time,
+                audit_context=audit_context,
+            )
 
             return DetectionResponse(
                 success=True,
                 record_id=db_result.id,
                 file_info={
-                    "name": file_name,
+                    "name": stored_file_name,
                     "type": file_type,
                     "size": file_size,
                     "resolution": f"{input_size}x{input_size}",
@@ -145,27 +251,62 @@ class DetectionService:
         except Exception as e:
             logger.error("Detection failed", error=str(e), file_path=file_path)
             processing_time = time.time() - start_time
+            error_message = str(e)
+            error_code = self._resolve_error_code(error_message)
+            db_result = await self._persist_failed_detection_result(
+                file_path=file_path,
+                original_file_name=resolved_original_file_name,
+                file_type=file_type,
+                file_size=file_size,
+                processing_time=processing_time,
+                error_message=error_message,
+                loaded_model=loaded_model,
+            )
+            self._write_detection_audit_log(
+                action=audit_action,
+                status="failed",
+                db_result=db_result,
+                file_path=file_path,
+                original_file_name=resolved_original_file_name,
+                file_type=file_type,
+                file_size=file_size,
+                model_id=(loaded_model or {}).get("model_id"),
+                model_name=(loaded_model or {}).get("model_name"),
+                model_type=(loaded_model or {}).get("model_type"),
+                prediction="failed",
+                confidence=0.0,
+                processing_time=processing_time,
+                error_message=error_message,
+                audit_context=audit_context,
+            )
 
             return DetectionResponse(
                 success=False,
-                record_id=None,
-                file_info={"name": os.path.basename(file_path)},
-                error_message=str(e),
+                record_id=db_result.id if db_result else None,
+                file_info={"name": stored_file_name},
+                error_message=error_message,
+                error_code=error_code,
                 processing_time=processing_time,
-                created_at=time.time(),
+                created_at=db_result.created_at if db_result else datetime.utcnow(),
             )
+        finally:
+            background_tasks.add_task(self._cleanup_file, file_path)
 
     async def detect_batch(
         self,
         file_paths: List[str],
         request: BatchDetectionRequest,
         background_tasks: BackgroundTasks,
+        original_file_names: Optional[Dict[str, str]] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
+        audit_action: str = "detect_batch",
     ) -> BatchDetectionResponse:
         """Detect deepfake in multiple files"""
         start_time = time.time()
         results = []
         processed_files = 0
         failed_files = 0
+        original_file_names = original_file_names or {}
 
         # Process files in parallel if enabled
         if request.parallel_processing:
@@ -174,7 +315,12 @@ class DetectionService:
             async def process_file(file_path):
                 async with semaphore:
                     return await self._detect_batch_file(
-                        file_path, request, background_tasks
+                        file_path,
+                        request,
+                        background_tasks,
+                        original_file_name=original_file_names.get(file_path),
+                        audit_context=audit_context,
+                        audit_action=audit_action,
                     )
 
             tasks = [process_file(path) for path in file_paths]
@@ -182,16 +328,42 @@ class DetectionService:
         else:
             # Process sequentially
             for file_path in file_paths:
-                result = await self._detect_batch_file(
-                    file_path, request, background_tasks
-                )
+                try:
+                    result = await self._detect_batch_file(
+                        file_path,
+                        request,
+                        background_tasks,
+                        original_file_name=original_file_names.get(file_path),
+                        audit_context=audit_context,
+                        audit_action=audit_action,
+                    )
+                except Exception as exc:
+                    result = self._build_batch_exception_response(
+                        file_path=file_path,
+                        original_file_name=original_file_names.get(file_path),
+                        error=exc,
+                    )
                 results.append(result)
+
+        normalized_results: List[DetectionResponse] = []
+        for index, result in enumerate(results):
+            if isinstance(result, Exception):
+                normalized_results.append(
+                    self._build_batch_exception_response(
+                        file_path=file_paths[index],
+                        original_file_name=original_file_names.get(file_paths[index]),
+                        error=result,
+                    )
+                )
+            else:
+                normalized_results.append(result)
+        results = normalized_results
 
         # Count results
         for result in results:
             if isinstance(result, Exception):
                 failed_files += 1
-            elif result.success:
+            elif isinstance(result, DetectionResponse) and result.success:
                 processed_files += 1
             else:
                 failed_files += 1
@@ -219,11 +391,41 @@ class DetectionService:
             created_at=time.time(),
         )
 
+    def _build_batch_exception_response(
+        self,
+        *,
+        file_path: str,
+        original_file_name: Optional[str],
+        error: Exception,
+    ) -> DetectionResponse:
+        error_message = str(error)
+        error_code = self._resolve_error_code(error_message)
+        file_name = original_file_name or os.path.basename(file_path)
+        file_type = self._get_file_type(file_path)
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else None
+
+        return DetectionResponse(
+            success=False,
+            record_id=None,
+            file_info={
+                "name": file_name,
+                "type": file_type,
+                "size": file_size,
+            },
+            error_message=error_message,
+            error_code=error_code,
+            processing_time=0.0,
+            created_at=datetime.utcnow(),
+        )
+
     async def _detect_batch_file(
         self,
         file_path: str,
         request: BatchDetectionRequest,
         background_tasks: BackgroundTasks,
+        original_file_name: Optional[str] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
+        audit_action: str = "detect_batch",
     ) -> DetectionResponse:
         """Detect a single file inside batch mode, including videos."""
         file_type = self._get_file_type(file_path)
@@ -236,7 +438,12 @@ class DetectionService:
                 preprocess=request.preprocess,
             )
             video_response = await self.detect_video(
-                file_path, video_request, background_tasks
+                file_path,
+                video_request,
+                background_tasks,
+                original_file_name=original_file_name,
+                audit_context=audit_context,
+                audit_action=audit_action,
             )
             return self._video_response_to_detection_response(video_response)
 
@@ -247,21 +454,43 @@ class DetectionService:
             return_probabilities=request.return_probabilities,
             preprocess=request.preprocess,
         )
-        return await self.detect_file(file_path, detection_request, background_tasks)
+        return await self.detect_file(
+            file_path,
+            detection_request,
+            background_tasks,
+            original_file_name=original_file_name,
+            audit_context=audit_context,
+            audit_action=audit_action,
+        )
 
     async def detect_video(
         self,
         video_path: str,
         request: VideoDetectionRequest,
         background_tasks: BackgroundTasks,
+        original_file_name: Optional[str] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
+        audit_action: str = "detect_video",
     ) -> VideoDetectionResponse:
         """Detect deepfake in video file"""
         start_time = time.time()
+        stored_file_name = os.path.basename(video_path)
+        resolved_original_file_name = original_file_name or stored_file_name
+        file_size = None
+        loaded_model = None
+        sampled_frame_count = None
+        analyzed_frame_count = None
+        sampled_duration_seconds = None
+        source_video_metadata = {
+            "source_total_frames": None,
+            "source_fps": None,
+            "source_duration_seconds": None,
+        }
 
         try:
             # Get video info
-            file_name = os.path.basename(video_path)
             file_size = os.path.getsize(video_path)
+            source_video_metadata = self._get_video_source_metadata(video_path)
 
             # Extract frames
             frames = await self._extract_frames(
@@ -354,24 +583,47 @@ class DetectionService:
             )
 
             processing_time = time.time() - start_time
+            sampled_frame_count = len(frames)
+            analyzed_frame_count = len(frame_probabilities)
+            sampled_duration_seconds = frames[-1][1] if frames else None
 
             # Create response
             video_info = {
-                "name": file_name,
+                "name": stored_file_name,
                 "size": file_size,
-                "total_frames": len(frames),
-                "processed_frames": len(frame_probabilities),
-                "duration": frames[-1][1] if frames else 0,
+                "source_total_frames": source_video_metadata.get("source_total_frames"),
+                "source_fps": source_video_metadata.get("source_fps"),
+                "source_duration_seconds": source_video_metadata.get(
+                    "source_duration_seconds"
+                ),
+                "sampled_frame_count": sampled_frame_count,
+                "analyzed_frame_count": analyzed_frame_count,
+                "sampled_duration_seconds": sampled_duration_seconds,
+                "total_frames": sampled_frame_count,
+                "processed_frames": analyzed_frame_count,
+                "duration": sampled_duration_seconds,
             }
 
             summary = {
-                "total_frames": len(frames),
-                "processed_frames": len(frame_probabilities),
+                "source_total_frames": source_video_metadata.get("source_total_frames"),
+                "source_fps": source_video_metadata.get("source_fps"),
+                "source_duration_seconds": source_video_metadata.get(
+                    "source_duration_seconds"
+                ),
+                "sampled_frame_count": sampled_frame_count,
+                "analyzed_frame_count": analyzed_frame_count,
+                "sampled_duration_seconds": sampled_duration_seconds,
+                "total_frames": sampled_frame_count,
+                "processed_frames": analyzed_frame_count,
+                "duration": sampled_duration_seconds,
                 "processed_clips": processed_clips,
-                "success_rate": len(frame_probabilities) / len(frames) if frames else 0,
+                "success_rate": analyzed_frame_count / sampled_frame_count
+                if sampled_frame_count
+                else 0,
                 "average_confidence": np.mean(confidences) if confidences else 0,
                 "prediction_distribution": self._count_predictions_list(predictions),
                 "temporal_strategy": temporal_strategy,
+                "aggregation_strategy": temporal_strategy,
             }
 
             detection_result = DetectionResultSchema(
@@ -380,25 +632,65 @@ class DetectionService:
                 probabilities=aggregated_probabilities,
                 decision_metrics=aggregated_decision_metrics,
                 processing_time=processing_time,
-                model_info={
-                    "model_id": loaded_model.get("model_id"),
-                    "model_name": loaded_model.get("model_name"),
-                    "model_type": loaded_model["model_type"],
-                    "input_size": loaded_model.get(
-                        "input_size", settings.MODEL_INPUT_SIZE
-                    ),
-                    "source": loaded_model.get("source"),
-                },
+                model_info=self._build_model_info(loaded_model),
             )
 
             db_result = await self._save_detection_result(
                 file_path=video_path,
-                file_name=file_name,
+                original_file_name=resolved_original_file_name,
                 file_type="video",
                 result=detection_result,
-                model_id=request.model_id,
+                file_size=file_size,
+                status="completed",
+                model_id=loaded_model.get("model_id"),
                 model_name=loaded_model.get("model_name"),
                 model_type=loaded_model.get("model_type"),
+                video_metadata={
+                    "source_total_frames": source_video_metadata.get(
+                        "source_total_frames"
+                    ),
+                    "source_fps": source_video_metadata.get("source_fps"),
+                    "source_duration_seconds": source_video_metadata.get(
+                        "source_duration_seconds"
+                    ),
+                    "sampled_frame_count": sampled_frame_count,
+                    "analyzed_frame_count": analyzed_frame_count,
+                    "sampled_duration_seconds": sampled_duration_seconds,
+                },
+            )
+            self._write_detection_audit_log(
+                action=audit_action,
+                status="completed",
+                db_result=db_result,
+                file_path=video_path,
+                original_file_name=resolved_original_file_name,
+                file_type="video",
+                file_size=file_size,
+                model_id=loaded_model.get("model_id"),
+                model_name=loaded_model.get("model_name"),
+                model_type=loaded_model.get("model_type"),
+                prediction=detection_result.prediction,
+                confidence=detection_result.confidence,
+                processing_time=processing_time,
+                audit_context=audit_context,
+                extra_details={
+                    "source_total_frames": source_video_metadata.get(
+                        "source_total_frames"
+                    ),
+                    "source_fps": source_video_metadata.get("source_fps"),
+                    "source_duration_seconds": source_video_metadata.get(
+                        "source_duration_seconds"
+                    ),
+                    "sampled_frame_count": sampled_frame_count,
+                    "analyzed_frame_count": analyzed_frame_count,
+                    "sampled_duration_seconds": sampled_duration_seconds,
+                    "total_frames": sampled_frame_count,
+                    "processed_frames": analyzed_frame_count,
+                    "duration": sampled_duration_seconds,
+                    "processed_clips": processed_clips,
+                    "temporal_strategy": temporal_strategy,
+                    "aggregation_strategy": temporal_strategy,
+                },
             )
 
             return VideoDetectionResponse(
@@ -419,14 +711,81 @@ class DetectionService:
         except Exception as e:
             logger.error("Video detection failed", error=str(e), video_path=video_path)
             processing_time = time.time() - start_time
+            error_message = str(e)
+            error_code = self._resolve_error_code(error_message)
+            db_result = await self._persist_failed_detection_result(
+                file_path=video_path,
+                original_file_name=resolved_original_file_name,
+                file_type="video",
+                file_size=file_size,
+                processing_time=processing_time,
+                error_message=error_message,
+                loaded_model=loaded_model,
+                video_metadata={
+                    "source_total_frames": source_video_metadata.get(
+                        "source_total_frames"
+                    ),
+                    "source_fps": source_video_metadata.get("source_fps"),
+                    "source_duration_seconds": source_video_metadata.get(
+                        "source_duration_seconds"
+                    ),
+                    "sampled_frame_count": sampled_frame_count,
+                    "analyzed_frame_count": analyzed_frame_count,
+                    "sampled_duration_seconds": sampled_duration_seconds,
+                },
+            )
+            self._write_detection_audit_log(
+                action=audit_action,
+                status="failed",
+                db_result=db_result,
+                file_path=video_path,
+                original_file_name=resolved_original_file_name,
+                file_type="video",
+                file_size=file_size,
+                model_id=(loaded_model or {}).get("model_id"),
+                model_name=(loaded_model or {}).get("model_name"),
+                model_type=(loaded_model or {}).get("model_type"),
+                prediction="failed",
+                confidence=0.0,
+                processing_time=processing_time,
+                error_message=error_message,
+                audit_context=audit_context,
+                extra_details={
+                    "source_total_frames": source_video_metadata.get(
+                        "source_total_frames"
+                    ),
+                    "source_fps": source_video_metadata.get("source_fps"),
+                    "source_duration_seconds": source_video_metadata.get(
+                        "source_duration_seconds"
+                    ),
+                    "sampled_frame_count": sampled_frame_count,
+                    "analyzed_frame_count": analyzed_frame_count,
+                    "sampled_duration_seconds": sampled_duration_seconds,
+                },
+            )
 
             return VideoDetectionResponse(
                 success=False,
-                record_id=None,
-                video_info={"name": os.path.basename(video_path)},
+                record_id=db_result.id if db_result else None,
+                video_info={
+                    "name": stored_file_name,
+                    "size": file_size,
+                    "source_total_frames": source_video_metadata.get(
+                        "source_total_frames"
+                    ),
+                    "source_fps": source_video_metadata.get("source_fps"),
+                    "source_duration_seconds": source_video_metadata.get(
+                        "source_duration_seconds"
+                    ),
+                    "sampled_frame_count": sampled_frame_count,
+                    "analyzed_frame_count": analyzed_frame_count,
+                    "sampled_duration_seconds": sampled_duration_seconds,
+                },
                 summary={},
+                error_message=error_message,
+                error_code=error_code,
                 processing_time=processing_time,
-                created_at=time.time(),
+                created_at=db_result.created_at if db_result else datetime.utcnow(),
             )
         finally:
             # Schedule cleanup
@@ -437,36 +796,21 @@ class DetectionService:
         skip: int = 0,
         limit: int = 100,
         prediction: Optional[str] = None,
+        status: Optional[str] = None,
         model_type: Optional[str] = None,
-        user_id: Optional[str] = None,
         search: Optional[str] = None,
         order_by: str = "created_at",
         order_desc: bool = True,
     ) -> DetectionHistoryList:
         """Get detection history with filtering, searching, and pagination"""
         try:
-            query = self.db.query(DetectionResult).filter(DetectionResult.del_flag == 0)
-
-            # Apply filters
-            if prediction:
-                query = query.filter(DetectionResult.prediction == prediction)
-
-            if model_type:
-                query = query.outerjoin(ModelRegistry).filter(
-                    or_(
-                        DetectionResult.model_type == model_type,
-                        ModelRegistry.model_type == model_type,
-                    )
-                )
-
-            # TODO: Add user_id filtering when DetectionResult model has user_id field
-            # if user_id:
-            #     query = query.filter(DetectionResult.user_id == user_id)
-
-            # Apply search
-            if search:
-                search_term = f"%{search}%"
-                query = query.filter(DetectionResult.file_name.ilike(search_term))
+            query = self._apply_detection_result_filters(
+                self.db.query(DetectionResult).filter(DetectionResult.del_flag == 0),
+                prediction=prediction,
+                status=status,
+                model_type=model_type,
+                search=search,
+            )
 
             # Apply ordering
             if hasattr(DetectionResult, order_by):
@@ -492,26 +836,50 @@ class DetectionService:
                 except Exception:
                     file_type_enum = FileType.IMAGE
 
-                try:
-                    prediction_enum = PredictionType(result.prediction)
-                except Exception:
-                    prediction_enum = PredictionType.FAKE
+                status_enum = self._resolve_detection_status(
+                    getattr(result, "status", None),
+                    getattr(result, "error_message", None),
+                )
+                prediction_enum = self._resolve_prediction_type(
+                    getattr(result, "prediction", None)
+                )
+                raw_confidence = getattr(result, "confidence", None)
+                confidence_value = (
+                    raw_confidence
+                    if prediction_enum is not None
+                    and status_enum != DetectionStatus.FAILED
+                    else None
+                )
 
                 detection = DetectionHistory(
                     id=result.id,
                     file_name=result.file_name,
+                    file_path=getattr(result, "file_path", None),
                     file_type=file_type_enum,
                     prediction=prediction_enum,
-                    confidence=result.confidence
-                    if result.confidence is not None
-                    else 0.0,
-                    processing_time=result.processing_time
-                    if result.processing_time is not None
-                    else 0.0,
+                    confidence=confidence_value,
+                    processing_time=getattr(result, "processing_time", None),
+                    source_total_frames=getattr(result, "source_total_frames", None),
+                    source_fps=getattr(result, "source_fps", None),
+                    source_duration_seconds=getattr(
+                        result, "source_duration_seconds", None
+                    ),
+                    sampled_frame_count=getattr(result, "sampled_frame_count", None),
+                    analyzed_frame_count=getattr(result, "analyzed_frame_count", None),
+                    sampled_duration_seconds=getattr(
+                        result, "sampled_duration_seconds", None
+                    ),
                     model_name=result.model_name
-                    or (result.model.name if result.model else "Built-in Model"),
+                    or (result.model.name if result.model else None)
+                    or (
+                        "No model loaded"
+                        if status_enum == DetectionStatus.FAILED
+                        else "Unknown model"
+                    ),
                     model_type=result.model_type
                     or (result.model.model_type if result.model else None),
+                    status=status_enum,
+                    error_message=getattr(result, "error_message", None) or None,
                     created_at=result.created_at,
                 )
                 detections.append(detection)
@@ -529,61 +897,64 @@ class DetectionService:
             raise
 
     async def get_statistics(self) -> DetectionStatistics:
+        return await self.get_statistics_filtered()
+
+    async def get_statistics_filtered(
+        self,
+        prediction: Optional[str] = None,
+        status: Optional[str] = None,
+        model_type: Optional[str] = None,
+        search: Optional[str] = None,
+    ) -> DetectionStatistics:
         """Get detection statistics"""
         try:
-            # Get total detections
-            total_detections = (
-                self.db.query(DetectionResult)
-                .filter(DetectionResult.del_flag == 0)
-                .count()
-            )
+            rows = self._apply_detection_result_filters(
+                self.db.query(DetectionResult).filter(DetectionResult.del_flag == 0),
+                prediction=prediction,
+                status=status,
+                model_type=model_type,
+                search=search,
+            ).all()
 
-            # Get predictions count
-            real_detections = (
-                self.db.query(DetectionResult)
-                .filter(
-                    DetectionResult.del_flag == 0, DetectionResult.prediction == "real"
+            total_detections = len(rows)
+            real_detections = 0
+            fake_detections = 0
+            failed_detections = 0
+            detections_by_model: Dict[str, int] = {}
+            detections_by_file_type: Dict[str, int] = {}
+            detections_by_status: Dict[str, int] = {}
+            daily_detections: Dict[str, int] = {}
+            confidence_values: List[float] = []
+            processing_time_values: List[float] = []
+            confidence_ranges = {
+                "0.0-0.2": 0,
+                "0.2-0.4": 0,
+                "0.4-0.6": 0,
+                "0.6-0.8": 0,
+                "0.8-1.0": 0,
+            }
+
+            for result in rows:
+                resolved_status = self._resolve_detection_status(
+                    getattr(result, "status", None),
+                    getattr(result, "error_message", None),
                 )
-                .count()
-            )
-
-            fake_detections = (
-                self.db.query(DetectionResult)
-                .filter(
-                    DetectionResult.del_flag == 0, DetectionResult.prediction == "fake"
+                resolved_prediction = self._resolve_prediction_type(
+                    getattr(result, "prediction", None)
                 )
-                .count()
-            )
 
-            # Calculate averages
-            avg_confidence = (
-                self.db.query(DetectionResult.confidence)
-                .filter(DetectionResult.del_flag == 0)
-                .all()
-            )
-            average_confidence = (
-                np.mean([c[0] for c in avg_confidence]) if avg_confidence else 0
-            )
+                detections_by_status[resolved_status.value] = (
+                    detections_by_status.get(resolved_status.value, 0) + 1
+                )
+                if resolved_status == DetectionStatus.FAILED:
+                    failed_detections += 1
+                elif resolved_prediction == PredictionType.REAL:
+                    real_detections += 1
+                elif resolved_prediction == PredictionType.FAKE:
+                    fake_detections += 1
+                else:
+                    failed_detections += 1
 
-            avg_processing_time = (
-                self.db.query(DetectionResult.processing_time)
-                .filter(DetectionResult.del_flag == 0)
-                .all()
-            )
-            average_processing_time = (
-                np.mean([t[0] for t in avg_processing_time])
-                if avg_processing_time
-                else 0
-            )
-
-            # Get detections by model
-            detections_by_model = {}
-            detection_model_rows = (
-                self.db.query(DetectionResult)
-                .filter(DetectionResult.del_flag == 0)
-                .all()
-            )
-            for result in detection_model_rows:
                 model_key = result.model_type or (
                     result.model.model_type if result.model else None
                 )
@@ -593,68 +964,58 @@ class DetectionService:
                     detections_by_model.get(model_key, 0) + 1
                 )
 
-            # Get detections by file type
-            detections_by_file_type = {}
-            for file_type in ["image", "video"]:
-                count = (
-                    self.db.query(DetectionResult)
-                    .filter(
-                        DetectionResult.del_flag == 0,
-                        DetectionResult.file_type == file_type,
-                    )
-                    .count()
+                file_type_key = getattr(result, "file_type", None) or "unknown"
+                detections_by_file_type[file_type_key] = (
+                    detections_by_file_type.get(file_type_key, 0) + 1
                 )
-                if count > 0:
-                    detections_by_file_type[file_type] = count
 
-            # Confidence distribution
-            confidence_ranges = {
-                "0.0-0.2": 0,
-                "0.2-0.4": 0,
-                "0.4-0.6": 0,
-                "0.6-0.8": 0,
-                "0.8-1.0": 0,
-            }
+                processing_time = getattr(result, "processing_time", None)
+                if processing_time is not None:
+                    processing_time_values.append(float(processing_time))
 
-            confidences = (
-                self.db.query(DetectionResult.confidence)
-                .filter(DetectionResult.del_flag == 0)
-                .all()
+                confidence = getattr(result, "confidence", None)
+                if (
+                    resolved_prediction is not None
+                    and resolved_status != DetectionStatus.FAILED
+                    and confidence is not None
+                ):
+                    confidence_value = float(confidence)
+                    confidence_values.append(confidence_value)
+                    if confidence_value < 0.2:
+                        confidence_ranges["0.0-0.2"] += 1
+                    elif confidence_value < 0.4:
+                        confidence_ranges["0.2-0.4"] += 1
+                    elif confidence_value < 0.6:
+                        confidence_ranges["0.4-0.6"] += 1
+                    elif confidence_value < 0.8:
+                        confidence_ranges["0.6-0.8"] += 1
+                    else:
+                        confidence_ranges["0.8-1.0"] += 1
+
+                created_at = getattr(result, "created_at", None)
+                if created_at:
+                    day_key = created_at.strftime("%Y-%m-%d")
+                    daily_detections[day_key] = daily_detections.get(day_key, 0) + 1
+
+            average_confidence = (
+                float(np.mean(confidence_values)) if confidence_values else 0.0
             )
-
-            for conf in confidences:
-                value = conf[0]
-                if value < 0.2:
-                    confidence_ranges["0.0-0.2"] += 1
-                elif value < 0.4:
-                    confidence_ranges["0.2-0.4"] += 1
-                elif value < 0.6:
-                    confidence_ranges["0.4-0.6"] += 1
-                elif value < 0.8:
-                    confidence_ranges["0.6-0.8"] += 1
-                else:
-                    confidence_ranges["0.8-1.0"] += 1
-
-            daily_detections: Dict[str, int] = {}
-            detection_dates = (
-                self.db.query(DetectionResult.created_at)
-                .filter(DetectionResult.del_flag == 0)
-                .all()
+            average_processing_time = (
+                float(np.mean(processing_time_values))
+                if processing_time_values
+                else 0.0
             )
-            for (created_at,) in detection_dates:
-                if not created_at:
-                    continue
-                day_key = created_at.strftime("%Y-%m-%d")
-                daily_detections[day_key] = daily_detections.get(day_key, 0) + 1
 
             return DetectionStatistics(
                 total_detections=total_detections,
                 real_detections=real_detections,
                 fake_detections=fake_detections,
+                failed_detections=failed_detections,
                 average_confidence=average_confidence,
                 average_processing_time=average_processing_time,
                 detections_by_model=detections_by_model,
                 detections_by_file_type=detections_by_file_type,
+                detections_by_status=detections_by_status,
                 confidence_distribution=confidence_ranges,
                 daily_detections=daily_detections,
             )
@@ -663,7 +1024,12 @@ class DetectionService:
             logger.error("Failed to get detection statistics", error=str(e))
             raise
 
-    async def delete_detection_record(self, detection_id: int) -> bool:
+    async def delete_detection_record(
+        self,
+        detection_id: int,
+        audit_context: Optional[Dict[str, Any]] = None,
+        audit_action: str = "delete_detection_result",
+    ) -> bool:
         """Delete detection record"""
         try:
             result = (
@@ -679,6 +1045,25 @@ class DetectionService:
 
             result.del_flag = 1
             self.db.commit()
+            self._write_audit_log(
+                action=audit_action,
+                resource_type="detection_result",
+                resource_id=result.id,
+                details=self._build_detection_audit_details(
+                    status="deleted",
+                    file_path=result.file_path,
+                    original_file_name=result.file_name,
+                    file_type=result.file_type,
+                    file_size=result.file_size,
+                    model_id=result.model_id,
+                    model_name=result.model_name,
+                    model_type=result.model_type,
+                    prediction=result.prediction,
+                    confidence=result.confidence,
+                    processing_time=result.processing_time,
+                ),
+                audit_context=audit_context,
+            )
 
             logger.info("Detection record deleted", detection_id=detection_id)
             return True
@@ -709,83 +1094,243 @@ class DetectionService:
 
     async def _load_model(self, model_id: Optional[int], model_type: Optional[str]):
         """Load model for inference"""
-        cache_key = f"{model_id}_{model_type}"
+        requested_model = None
+        requested_model_status = None
+        requested_failure_reason = None
+        attempted_requested_ids = set()
+        fallback_errors = []
 
-        if cache_key in self._model_cache:
-            return self._model_cache[cache_key]
-
-        if model_id:
-            model_record = (
+        if model_id is not None:
+            requested_model = (
                 self.db.query(ModelRegistry)
                 .filter(ModelRegistry.id == model_id, ModelRegistry.del_flag == 0)
                 .first()
             )
 
-            if not model_record:
-                raise ValueError(f"Model with ID {model_id} not found")
+            if not requested_model:
+                requested_model_status = "missing"
+                requested_failure_reason = (
+                    f"Requested registry model id={model_id} was not found"
+                )
+            elif requested_model.status not in READY_MODEL_STATUSES:
+                requested_model_status = requested_model.status
+                requested_failure_reason = (
+                    f"Requested registry model id={model_id} "
+                    f"({requested_model.name}) is {requested_model.status}, "
+                    "not ready/deployed"
+                )
+            else:
+                requested_model_status = requested_model.status
+                attempted_requested_ids.add(requested_model.id)
+                try:
+                    loaded_requested = dict(
+                        self._load_registry_model_record(requested_model)
+                    )
+                except Exception as exc:
+                    requested_failure_reason = (
+                        f"Requested registry model id={model_id} "
+                        f"({requested_model.name}) could not be loaded: {exc}"
+                    )
+                    logger.warning(
+                        "Requested registry model unavailable for inference",
+                        requested_model_id=model_id,
+                        requested_model_type=model_type,
+                        requested_model_name=requested_model.name,
+                        error=str(exc),
+                    )
+                else:
+                    loaded_requested.update(
+                        {
+                            "requested_model_id": model_id,
+                            "requested_model_type": model_type,
+                            "requested_model_status": requested_model.status,
+                            "readiness": "ready",
+                            "selection_policy": "primary",
+                        }
+                    )
+                    return loaded_requested
+        elif model_type:
+            requested_model_status = "fallback_only"
+            requested_failure_reason = (
+                f"Requested built-in fallback model_type='{model_type}' cannot run "
+                "inference without a ready/deployed registry model"
+            )
 
-            model_type = model_record.model_type
-            checkpoint = self._load_checkpoint(model_record.file_path)
-            model = self._build_model_from_checkpoint(
-                model_type, checkpoint, model_record
+        ready_registry_models = self._get_ready_registry_models()
+        for fallback_model in ready_registry_models:
+            if fallback_model.id in attempted_requested_ids:
+                continue
+            try:
+                loaded_fallback = dict(self._load_registry_model_record(fallback_model))
+            except Exception as exc:
+                fallback_errors.append(
+                    f"id={fallback_model.id} ({fallback_model.name}, "
+                    f"status={fallback_model.status}) failed to load: {exc}"
+                )
+                logger.warning(
+                    "Ready registry model unavailable for deterministic fallback",
+                    fallback_model_id=fallback_model.id,
+                    fallback_model_name=fallback_model.name,
+                    fallback_model_status=fallback_model.status,
+                    error=str(exc),
+                )
+                continue
+
+            if requested_failure_reason:
+                logger.warning(
+                    "Detection model request falling back to ready registry default",
+                    requested_model_id=model_id,
+                    requested_model_type=model_type,
+                    requested_model_status=requested_model_status,
+                    fallback_model_id=fallback_model.id,
+                    fallback_model_name=fallback_model.name,
+                    reason=requested_failure_reason,
+                )
+
+            loaded_fallback.update(
+                {
+                    "requested_model_id": model_id,
+                    "requested_model_type": model_type,
+                    "requested_model_status": requested_model_status,
+                    "readiness": "ready",
+                    "selection_policy": (
+                        "fallback_default" if requested_failure_reason else "primary"
+                    ),
+                    "fallback_reason": requested_failure_reason,
+                }
             )
-            state_dict = checkpoint.get("model_state_dict")
-            if not state_dict:
-                raise ValueError("Checkpoint does not contain model_state_dict")
-            self._load_model_state(
-                model,
-                state_dict,
-                allow_partial=bool(
-                    checkpoint.get("video_temporal_enabled") or model_type == "lrcn"
-                ),
+            return loaded_fallback
+
+        raise ValueError(
+            self._build_no_usable_model_error(
+                model_id=model_id,
+                model_type=model_type,
+                requested_failure_reason=requested_failure_reason,
+                fallback_errors=fallback_errors,
             )
-            loaded = {
-                "model": model,
-                "model_id": model_record.id,
-                "model_name": model_record.name,
-                "model_type": model_type,
-                "input_size": checkpoint.get(
-                    "input_size", model_record.input_size or settings.MODEL_INPUT_SIZE
-                ),
-                "sequence_length": checkpoint.get(
-                    "sequence_length",
-                    (model_record.parameters or {}).get("sequence_length", 16),
-                ),
-                "frame_stride": checkpoint.get(
-                    "frame_stride",
-                    (model_record.parameters or {}).get("frame_stride", 1),
-                ),
-                "video_temporal_enabled": bool(
-                    checkpoint.get("video_temporal_enabled")
-                ),
-                "training_mode": checkpoint.get("training_mode"),
-                "source": "registry",
-            }
+        )
+
+    def _build_model_info(self, loaded_model: Dict[str, Any]) -> Dict[str, Any]:
+        model_info = {
+            "model_id": loaded_model.get("model_id"),
+            "model_name": loaded_model.get("model_name"),
+            "model_type": loaded_model["model_type"],
+            "input_size": loaded_model.get("input_size", settings.MODEL_INPUT_SIZE),
+            "source": loaded_model.get("source"),
+        }
+        for key in (
+            "status",
+            "weight_state",
+            "readiness",
+            "selection_policy",
+            "requested_model_id",
+            "requested_model_type",
+            "requested_model_status",
+            "fallback_reason",
+        ):
+            if key in loaded_model and loaded_model.get(key) is not None:
+                model_info[key] = loaded_model.get(key)
+        return model_info
+
+    def _get_ready_registry_models(self) -> List[ModelRegistry]:
+        return (
+            self.db.query(ModelRegistry)
+            .filter(
+                ModelRegistry.del_flag == 0,
+                ModelRegistry.status.in_(READY_MODEL_STATUSES),
+            )
+            .order_by(
+                ModelRegistry.is_default.desc(),
+                ModelRegistry.created_at.desc(),
+                ModelRegistry.id.desc(),
+            )
+            .all()
+        )
+
+    def _build_no_usable_model_error(
+        self,
+        model_id: Optional[int],
+        model_type: Optional[str],
+        requested_failure_reason: Optional[str],
+        fallback_errors: List[str],
+    ) -> str:
+        request_parts = []
+        if model_id is not None:
+            request_parts.append(f"model_id={model_id}")
+        if model_type:
+            request_parts.append(f"model_type='{model_type}'")
+        request_context = (
+            ", ".join(request_parts) if request_parts else "no explicit model request"
+        )
+
+        message_parts = [
+            "No usable ready/deployed registry model is available for detection",
+            f"({request_context}).",
+        ]
+        if requested_failure_reason:
+            message_parts.append(
+                f"Requested model decision: {requested_failure_reason}."
+            )
+        if fallback_errors:
+            message_parts.append(
+                "Deterministic registry fallback candidates failed in order: "
+                + "; ".join(fallback_errors)
+                + "."
+            )
         else:
-            model_type = model_type or settings.DEFAULT_MODEL_TYPE
-            model = create_model(model_type)
-            loaded = {
-                "model": model,
-                "model_id": None,
-                "model_name": model_type,
-                "model_type": model_type,
-                "input_size": settings.MODEL_INPUT_SIZE,
-                "sequence_length": 16,
-                "frame_stride": 1,
-                "video_temporal_enabled": model_type == "lrcn",
-                "training_mode": "builtin_sequence"
-                if model_type == "lrcn"
-                else "builtin_image",
-                "source": "builtin",
-            }
+            message_parts.append(
+                "No ready/deployed registry fallback candidate could be selected."
+            )
+        message_parts.append(
+            "Built-in fallback inference is disabled until a vetted registry model is ready or deployed."
+        )
+        return " ".join(message_parts)
 
+    def _load_registry_model_record(
+        self, model_record: ModelRegistry
+    ) -> Dict[str, Any]:
+        cache_key = f"registry_{model_record.id}"
+        if cache_key in self._model_cache:
+            return self._model_cache[cache_key]
+
+        checkpoint = self._load_checkpoint(model_record.file_path)
+        model = self._build_model_from_checkpoint(
+            model_record.model_type, checkpoint, model_record
+        )
+        state_dict = checkpoint.get("model_state_dict")
+        if not state_dict:
+            raise ValueError("Checkpoint does not contain model_state_dict")
+        self._load_model_state(model, state_dict)
+
+        loaded = {
+            "model": model,
+            "model_id": model_record.id,
+            "model_name": model_record.name,
+            "model_type": model_record.model_type,
+            "input_size": checkpoint.get(
+                "input_size", model_record.input_size or settings.MODEL_INPUT_SIZE
+            ),
+            "sequence_length": checkpoint.get(
+                "sequence_length",
+                (model_record.parameters or {}).get("sequence_length", 16),
+            ),
+            "frame_stride": checkpoint.get(
+                "frame_stride",
+                (model_record.parameters or {}).get("frame_stride", 1),
+            ),
+            "video_temporal_enabled": bool(checkpoint.get("video_temporal_enabled")),
+            "training_mode": checkpoint.get("training_mode"),
+            "source": "registry",
+            "status": model_record.status,
+            "weight_state": "checkpoint_loaded",
+        }
         loaded["model"].eval()
-
         self._model_cache[cache_key] = loaded
-
         return loaded
 
-    def _preprocess_image(self, image_path: str, input_size: int = None) -> np.ndarray:
+    def _preprocess_image(
+        self, image_path: str, input_size: Optional[int] = None
+    ) -> np.ndarray:
         """Preprocess image for inference"""
         target_size = input_size or settings.MODEL_INPUT_SIZE
         with Image.open(image_path) as image:
@@ -795,7 +1340,7 @@ class DetectionService:
         return self._normalize_image_array(image_array)
 
     def _preprocess_frame(
-        self, frame: np.ndarray, input_size: int = None
+        self, frame: np.ndarray, input_size: Optional[int] = None
     ) -> np.ndarray:
         """Preprocess video frame for inference"""
         target_size = input_size or settings.MODEL_INPUT_SIZE
@@ -814,7 +1359,7 @@ class DetectionService:
         self,
         frames: List[tuple],
         sequence_length: int,
-        input_size: int = None,
+        input_size: Optional[int] = None,
         clip_indices: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """Preprocess extracted video frames into a fixed-length clip tensor."""
@@ -840,7 +1385,7 @@ class DetectionService:
         self,
         image_path: str,
         sequence_length: int,
-        input_size: int = None,
+        input_size: Optional[int] = None,
     ) -> torch.Tensor:
         """Repeat a single image into a fixed-length clip tensor."""
         frame_tensor = self._preprocess_image(
@@ -911,6 +1456,38 @@ class DetectionService:
 
             return frames
 
+        finally:
+            cap.release()
+
+    def _get_video_source_metadata(self, video_path: str) -> Dict[str, Optional[float]]:
+        cap = cv2.VideoCapture(video_path)
+
+        try:
+            if hasattr(cap, "isOpened") and not cap.isOpened():
+                return {
+                    "source_total_frames": None,
+                    "source_fps": None,
+                    "source_duration_seconds": None,
+                }
+
+            raw_total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            raw_fps = cap.get(cv2.CAP_PROP_FPS)
+            source_total_frames = (
+                int(raw_total_frames)
+                if raw_total_frames and raw_total_frames > 0
+                else None
+            )
+            source_fps = float(raw_fps) if raw_fps and raw_fps > 0 else None
+            source_duration_seconds = (
+                float(source_total_frames / source_fps)
+                if source_total_frames is not None and source_fps is not None
+                else None
+            )
+            return {
+                "source_total_frames": source_total_frames,
+                "source_fps": source_fps,
+                "source_duration_seconds": source_duration_seconds,
+            }
         finally:
             cap.release()
 
@@ -1077,15 +1654,19 @@ class DetectionService:
     ) -> DetectionDecisionMetrics:
         fake_probability = float(probabilities.get("fake", 0.0))
         real_probability = float(probabilities.get("real", 0.0))
-        predicted_probability = (
-            fake_probability if prediction == "fake" else real_probability
+        predicted_probability = float(confidence)
+        other_probability = (
+            real_probability if prediction == "fake" else fake_probability
         )
         return DetectionDecisionMetrics(
             confidence_threshold=confidence_threshold,
             fake_probability=max(0.0, min(1.0, fake_probability)),
             real_probability=max(0.0, min(1.0, real_probability)),
             predicted_probability=max(0.0, min(1.0, predicted_probability)),
-            decision_margin=max(-1.0, min(1.0, fake_probability - real_probability)),
+            decision_margin=max(
+                -1.0,
+                min(1.0, predicted_probability - other_probability),
+            ),
             threshold_gap=max(-1.0, min(1.0, fake_probability - confidence_threshold)),
             threshold_applied_to_fake=True,
         )
@@ -1095,12 +1676,158 @@ class DetectionService:
         probabilities: Dict[str, float],
         confidence_threshold: float = 0.5,
     ) -> tuple:
-        fake_probability = probabilities.get("fake", 0.0)
-        real_probability = probabilities.get("real", 0.0)
-        confidence = max(fake_probability, real_probability)
+        fake_probability = max(0.0, min(1.0, float(probabilities.get("fake", 0.0))))
+        real_probability = max(0.0, min(1.0, float(probabilities.get("real", 0.0))))
         if fake_probability >= confidence_threshold:
-            return "fake", confidence
-        return "real", confidence
+            return "fake", fake_probability
+        return "real", real_probability
+
+    def _coerce_audit_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: self._coerce_audit_value(item)
+                for key, item in value.items()
+                if item is not None
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._coerce_audit_value(item) for item in value]
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, np.floating):
+            return float(value)
+        if isinstance(value, np.integer):
+            return int(value)
+        return value
+
+    def _build_detection_audit_details(
+        self,
+        *,
+        status: str,
+        file_path: str,
+        original_file_name: Optional[str],
+        file_type: str,
+        file_size: Optional[int],
+        model_id: Optional[int],
+        model_name: Optional[str],
+        model_type: Optional[str],
+        prediction: Optional[str] = None,
+        confidence: Optional[float] = None,
+        processing_time: Optional[float] = None,
+        error_message: Optional[str] = None,
+        extra_details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        details: Dict[str, Any] = {
+            "status": status,
+            "file_name": original_file_name or os.path.basename(file_path),
+            "stored_file_name": os.path.basename(file_path),
+            "file_type": file_type,
+        }
+
+        if file_size is not None:
+            details["file_size"] = int(file_size)
+        if model_id is not None:
+            details["model_id"] = int(model_id)
+        if model_name:
+            details["model_name"] = model_name
+        if model_type:
+            details["model_type"] = model_type
+        if prediction:
+            details["prediction"] = prediction
+        if confidence is not None:
+            details["confidence"] = float(confidence)
+        if processing_time is not None:
+            details["processing_time"] = float(processing_time)
+        if error_message:
+            details["error_message"] = error_message
+        if extra_details:
+            details.update(self._coerce_audit_value(extra_details))
+
+        return details
+
+    def _write_audit_log(
+        self,
+        *,
+        action: str,
+        resource_type: str,
+        resource_id: Optional[Any],
+        details: Dict[str, Any],
+        audit_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self.db is None:
+            return
+
+        add = getattr(self.db, "add", None)
+        commit = getattr(self.db, "commit", None)
+        rollback = getattr(self.db, "rollback", None)
+        if not callable(add) or not callable(commit):
+            return
+
+        resolved_context = audit_context or {}
+        audit_log = AuditLog(
+            user_id=resolved_context.get("user_id"),
+            action=action,
+            resource_type=resource_type,
+            resource_id=str(resource_id) if resource_id is not None else None,
+            details=self._coerce_audit_value(details),
+            ip_address=resolved_context.get("ip_address"),
+            user_agent=resolved_context.get("user_agent"),
+        )
+
+        try:
+            add(audit_log)
+            commit()
+        except Exception as audit_error:
+            if callable(rollback):
+                rollback()
+            logger.warning(
+                "Audit log write failed",
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                error=str(audit_error),
+            )
+
+    def _write_detection_audit_log(
+        self,
+        *,
+        action: str,
+        status: str,
+        db_result: Optional[DetectionResult],
+        file_path: str,
+        original_file_name: Optional[str],
+        file_type: str,
+        file_size: Optional[int],
+        model_id: Optional[int],
+        model_name: Optional[str],
+        model_type: Optional[str],
+        audit_context: Optional[Dict[str, Any]] = None,
+        prediction: Optional[str] = None,
+        confidence: Optional[float] = None,
+        processing_time: Optional[float] = None,
+        error_message: Optional[str] = None,
+        extra_details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._write_audit_log(
+            action=action,
+            resource_type="detection_result",
+            resource_id=db_result.id if db_result else None,
+            details=self._build_detection_audit_details(
+                status=status,
+                file_path=file_path,
+                original_file_name=original_file_name,
+                file_type=file_type,
+                file_size=file_size,
+                model_id=model_id,
+                model_name=model_name,
+                model_type=model_type,
+                prediction=prediction,
+                confidence=confidence,
+                processing_time=processing_time,
+                error_message=error_message,
+                extra_details=extra_details,
+            ),
+            audit_context=audit_context,
+        )
 
     def _build_frame_results_from_probabilities(
         self,
@@ -1133,9 +1860,7 @@ class DetectionService:
                         ).model_dump(),
                         "processing_time": 0.0,
                         "model_info": {
-                            "model_id": loaded_model.get("model_id"),
-                            "model_name": loaded_model.get("model_name"),
-                            "model_type": loaded_model["model_type"],
+                            **self._build_model_info(loaded_model),
                         },
                     },
                 }
@@ -1219,31 +1944,86 @@ class DetectionService:
     async def _save_detection_result(
         self,
         file_path: str,
-        file_name: str,
+        original_file_name: Optional[str],
         file_type: str,
-        result: DetectionResultSchema,
-        model_id: Optional[int],
+        result: Optional[DetectionResultSchema],
+        file_size: Optional[int],
+        status: str,
+        model_id: Optional[int] = None,
+        error_message: Optional[str] = None,
+        processing_time: Optional[float] = None,
         model_name: Optional[str] = None,
         model_type: Optional[str] = None,
+        video_metadata: Optional[Dict[str, Any]] = None,
     ) -> DetectionResult:
-        """Save detection result to database"""
+        video_metadata = video_metadata or {}
         db_result = DetectionResult(
             file_path=file_path,
-            file_name=file_name,
+            file_name=original_file_name or os.path.basename(file_path),
             file_type=file_type,
-            prediction=result.prediction,
-            confidence=result.confidence,
-            processing_time=result.processing_time,
+            prediction=result.prediction if result else "failed",
+            confidence=result.confidence if result else 0.0,
+            processing_time=(result.processing_time if result else processing_time),
+            file_size=file_size,
             model_id=model_id,
             model_name=model_name,
             model_type=model_type,
+            status=status,
+            error_message=error_message,
+            source_total_frames=video_metadata.get("source_total_frames"),
+            source_fps=video_metadata.get("source_fps"),
+            source_duration_seconds=video_metadata.get("source_duration_seconds"),
+            sampled_frame_count=video_metadata.get("sampled_frame_count"),
+            analyzed_frame_count=video_metadata.get("analyzed_frame_count"),
+            sampled_duration_seconds=video_metadata.get("sampled_duration_seconds"),
         )
 
         self.db.add(db_result)
-        self.db.commit()
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
         self.db.refresh(db_result)
 
         return db_result
+
+    async def _persist_failed_detection_result(
+        self,
+        *,
+        file_path: str,
+        original_file_name: Optional[str],
+        file_type: str,
+        file_size: Optional[int],
+        processing_time: float,
+        error_message: str,
+        loaded_model: Optional[Dict[str, Any]] = None,
+        video_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[DetectionResult]:
+        try:
+            return await self._save_detection_result(
+                file_path=file_path,
+                original_file_name=original_file_name,
+                file_type=file_type,
+                result=None,
+                file_size=file_size,
+                status="failed",
+                error_message=error_message,
+                processing_time=processing_time,
+                model_id=(loaded_model or {}).get("model_id"),
+                model_name=(loaded_model or {}).get("model_name"),
+                model_type=(loaded_model or {}).get("model_type"),
+                video_metadata=video_metadata,
+            )
+        except Exception as persistence_error:
+            logger.warning(
+                "Failed to persist failed detection result",
+                file_path=file_path,
+                original_file_name=original_file_name,
+                error=str(persistence_error),
+                detection_error=error_message,
+            )
+            return None
 
     def _video_response_to_detection_response(
         self, response: VideoDetectionResponse
@@ -1261,12 +2041,23 @@ class DetectionService:
                 "type": "video",
                 "size": response.video_info.get("size"),
                 "resolution": None,
+                "source_total_frames": response.video_info.get("source_total_frames"),
+                "source_fps": response.video_info.get("source_fps"),
+                "source_duration_seconds": response.video_info.get(
+                    "source_duration_seconds"
+                ),
+                "sampled_frame_count": response.video_info.get("sampled_frame_count"),
+                "analyzed_frame_count": response.video_info.get("analyzed_frame_count"),
+                "sampled_duration_seconds": response.video_info.get(
+                    "sampled_duration_seconds"
+                ),
                 "total_frames": response.video_info.get("total_frames"),
                 "processed_frames": response.video_info.get("processed_frames"),
                 "duration": response.video_info.get("duration"),
             },
             result=detection_result,
-            error_message=None if response.success else "Video detection failed",
+            error_message=response.error_message if not response.success else None,
+            error_code=response.error_code if not response.success else None,
             processing_time=response.processing_time,
             created_at=response.created_at,
         )
@@ -1371,22 +2162,17 @@ class DetectionService:
         kwargs["pretrained"] = False
         return create_model(model_type, **kwargs)
 
-    def _load_model_state(
-        self,
-        model,
-        state_dict: Dict[str, Any],
-        allow_partial: bool = False,
-    ) -> None:
-        """Load a checkpoint with an optional compatibility fallback."""
+    def _load_model_state(self, model, state_dict: Dict[str, Any]) -> None:
         try:
             model.load_state_dict(state_dict)
         except RuntimeError as exc:
-            if not allow_partial:
-                raise
-            load_result = model.load_state_dict(state_dict, strict=False)
-            logger.warning(
-                "Checkpoint loaded with partial compatibility",
-                missing_keys=list(load_result.missing_keys),
-                unexpected_keys=list(load_result.unexpected_keys),
-                error=str(exc),
-            )
+            error_message = str(exc)
+            if (
+                "Missing key(s) in state_dict" in error_message
+                or "Unexpected key(s) in state_dict" in error_message
+            ):
+                raise ValueError(
+                    "Checkpoint is not fully compatible with the inference model architecture; partial weight loading is rejected to avoid random-init inference. "
+                    + error_message
+                ) from exc
+            raise

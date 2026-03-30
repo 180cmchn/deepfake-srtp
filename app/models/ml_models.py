@@ -3,6 +3,7 @@ Machine Learning Models for Deepfake Detection
 """
 
 import os
+from typing import Any, Dict, Optional
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
@@ -23,39 +24,120 @@ from app.core.logging import logger
 
 
 FRAME_BACKBONE_TYPES = {"vgg", "swin", "vit", "resnet"}
+BUILTIN_MODEL_SOURCE = "builtin"
+BUILTIN_MODEL_READINESS = "fallback_only"
+BUILTIN_MODEL_SELECTION_POLICY = "fallback_only"
+BUILTIN_MODEL_STATUS_PRETRAINED = "builtin_pretrained"
+BUILTIN_MODEL_STATUS_RANDOM_INIT = "builtin_random_init"
+BUILTIN_MODEL_STATUS_RANDOM_INIT_FALLBACK = "builtin_random_init_fallback"
+BUILTIN_MODEL_STATUS_UNKNOWN = "builtin_unknown"
+BUILTIN_MODEL_WEIGHT_STATE_PRETRAINED = "framework_pretrained"
+BUILTIN_MODEL_WEIGHT_STATE_RANDOM_INIT = "random_init"
+BUILTIN_MODEL_WEIGHT_STATE_RANDOM_INIT_FALLBACK = "random_init_fallback"
+BUILTIN_MODEL_WEIGHT_STATE_UNKNOWN = "unknown"
+MODEL_PROVENANCE_ATTR = "_model_provenance"
+
+
+def _attach_builtin_model_provenance(
+    model: nn.Module,
+    *,
+    status: str,
+    weight_state: str,
+    fallback_reason: Optional[str] = None,
+) -> nn.Module:
+    provenance: Dict[str, Any] = {
+        "source": BUILTIN_MODEL_SOURCE,
+        "status": status,
+        "weight_state": weight_state,
+        "readiness": BUILTIN_MODEL_READINESS,
+        "selection_policy": BUILTIN_MODEL_SELECTION_POLICY,
+    }
+    if fallback_reason:
+        provenance["fallback_reason"] = fallback_reason
+    setattr(model, MODEL_PROVENANCE_ATTR, provenance)
+    return model
+
+
+def _inherit_builtin_model_provenance(
+    model: nn.Module,
+    component: nn.Module,
+) -> nn.Module:
+    component_provenance = getattr(component, MODEL_PROVENANCE_ATTR, None)
+    if component_provenance:
+        setattr(model, MODEL_PROVENANCE_ATTR, dict(component_provenance))
+        return model
+    return _attach_builtin_model_provenance(
+        model,
+        status=BUILTIN_MODEL_STATUS_UNKNOWN,
+        weight_state=BUILTIN_MODEL_WEIGHT_STATE_UNKNOWN,
+    )
+
+
+def get_model_provenance(model: nn.Module) -> Optional[Dict[str, Any]]:
+    provenance = getattr(model, MODEL_PROVENANCE_ATTR, None)
+    if provenance is None:
+        return None
+    return dict(provenance)
 
 
 def _load_torchvision_model(factory, weights, model_name: str, pretrained: bool):
-    """Load a torchvision model and optionally fall back to random init offline."""
-    requested_weights = weights if pretrained else None
+    if not pretrained:
+        return _attach_builtin_model_provenance(
+            factory(weights=None),
+            status=BUILTIN_MODEL_STATUS_RANDOM_INIT,
+            weight_state=BUILTIN_MODEL_WEIGHT_STATE_RANDOM_INIT,
+        )
+
     try:
-        return factory(weights=requested_weights)
+        return _attach_builtin_model_provenance(
+            factory(weights=weights),
+            status=BUILTIN_MODEL_STATUS_PRETRAINED,
+            weight_state=BUILTIN_MODEL_WEIGHT_STATE_PRETRAINED,
+        )
     except Exception as exc:
-        if not pretrained or not settings.MODEL_ALLOW_RANDOM_INIT_FALLBACK:
+        if not settings.MODEL_ALLOW_RANDOM_INIT_FALLBACK:
             raise
         logger.warning(
-            "Failed to load pretrained torchvision weights; falling back to random initialization",
+            "Failed to load pretrained torchvision weights; built-in model stays fallback-only with random initialization",
             model_name=model_name,
             error=str(exc),
         )
-        return factory(weights=None)
+        return _attach_builtin_model_provenance(
+            factory(weights=None),
+            status=BUILTIN_MODEL_STATUS_RANDOM_INIT_FALLBACK,
+            weight_state=BUILTIN_MODEL_WEIGHT_STATE_RANDOM_INIT_FALLBACK,
+            fallback_reason=str(exc),
+        )
 
 
 def _load_timm_model(model_name: str, num_classes: int, pretrained: bool):
-    """Load a timm model and optionally fall back to random init offline."""
+    if not pretrained:
+        return _attach_builtin_model_provenance(
+            timm.create_model(model_name, pretrained=False, num_classes=num_classes),
+            status=BUILTIN_MODEL_STATUS_RANDOM_INIT,
+            weight_state=BUILTIN_MODEL_WEIGHT_STATE_RANDOM_INIT,
+        )
+
     try:
-        return timm.create_model(
-            model_name, pretrained=pretrained, num_classes=num_classes
+        return _attach_builtin_model_provenance(
+            timm.create_model(model_name, pretrained=True, num_classes=num_classes),
+            status=BUILTIN_MODEL_STATUS_PRETRAINED,
+            weight_state=BUILTIN_MODEL_WEIGHT_STATE_PRETRAINED,
         )
     except Exception as exc:
-        if not pretrained or not settings.MODEL_ALLOW_RANDOM_INIT_FALLBACK:
+        if not settings.MODEL_ALLOW_RANDOM_INIT_FALLBACK:
             raise
         logger.warning(
-            "Failed to load pretrained timm weights; falling back to random initialization",
+            "Failed to load pretrained timm weights; built-in model stays fallback-only with random initialization",
             model_name=model_name,
             error=str(exc),
         )
-        return timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+        return _attach_builtin_model_provenance(
+            timm.create_model(model_name, pretrained=False, num_classes=num_classes),
+            status=BUILTIN_MODEL_STATUS_RANDOM_INIT_FALLBACK,
+            weight_state=BUILTIN_MODEL_WEIGHT_STATE_RANDOM_INIT_FALLBACK,
+            fallback_reason=str(exc),
+        )
 
 
 class CustomVGG(nn.Module):
@@ -85,6 +167,8 @@ class CustomVGG(nn.Module):
         for param in self.img_model.classifier.parameters():
             param.requires_grad = True
 
+        _inherit_builtin_model_provenance(self, self.img_model)
+
     def extract_features(self, x):
         x = self.img_model.features(x)
         x = self.img_model.avgpool(x)
@@ -110,6 +194,8 @@ class PretrainedVGG(nn.Module):
         # Freeze feature extraction parameters
         for param in self.features.parameters():
             param.requires_grad = False
+
+        _inherit_builtin_model_provenance(self, pretrained_cnn)
 
     def forward(self, x):
         x = self.features(x)
@@ -160,6 +246,8 @@ class LRCN(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(fusion_hidden, num_classes),
         )
+
+        _inherit_builtin_model_provenance(self, self.pretrained_cnn)
 
     def forward(self, x):
         batch_size, seq_length, channels, height, width = x.size()
@@ -257,6 +345,8 @@ class VideoTemporalHybridModel(nn.Module):
             nn.Linear(fusion_hidden, num_classes),
         )
 
+        _inherit_builtin_model_provenance(self, self.frame_encoder)
+
     def forward(self, x):
         batch_size, seq_length, channels, height, width = x.size()
         x = x.view(batch_size * seq_length, channels, height, width)
@@ -305,6 +395,8 @@ class SwinModel(nn.Module):
         self.feature_dim = num_features
         self.swin.head = nn.Linear(num_features, num_classes)
 
+        _inherit_builtin_model_provenance(self, self.swin)
+
     def extract_features(self, x):
         x = self.swin.features(x)
         x = self.swin.norm(x)
@@ -332,6 +424,8 @@ class ViTModel(nn.Module):
 
         # Replace classification head
         self.vit.head = nn.Linear(self.vit.head.in_features, num_classes)
+
+        _inherit_builtin_model_provenance(self, self.vit)
 
     def extract_features(self, x):
         features = self.vit.forward_features(x)
@@ -369,6 +463,8 @@ class ResNet(nn.Module):
         # Enable training for new layer
         for param in self.img_model.fc.parameters():
             param.requires_grad = True
+
+        _inherit_builtin_model_provenance(self, self.img_model)
 
     def extract_features(self, x):
         x = self.img_model.conv1(x)

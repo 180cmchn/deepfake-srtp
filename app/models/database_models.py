@@ -151,6 +151,12 @@ class DetectionResult(Base):
     file_size = Column(Integer)  # in bytes
     model_name = Column(String(255))
     model_type = Column(String(50))
+    source_total_frames = Column(Integer)
+    source_fps = Column(Float)
+    source_duration_seconds = Column(Float)
+    sampled_frame_count = Column(Integer)
+    analyzed_frame_count = Column(Integer)
+    sampled_duration_seconds = Column(Float)
 
     # Status
     status = Column(String(20), default=DetectionStatus.COMPLETED.value)

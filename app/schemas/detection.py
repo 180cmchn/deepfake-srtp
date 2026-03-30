@@ -42,7 +42,10 @@ class DetectionRequest(BaseModel):
     return_probabilities: bool = Field(
         default=False, description="Return class probabilities"
     )
-    preprocess: bool = Field(default=True, description="Apply preprocessing")
+    preprocess: bool = Field(
+        default=True,
+        description="Deprecated and currently ignored; detection inference always applies preprocessing.",
+    )
 
     @validator("model_type")
     def validate_model_type(cls, v):
@@ -53,17 +56,78 @@ class DetectionRequest(BaseModel):
         return v
 
 
-class DetectionResult(BaseModel):
-    """Schema for single detection result"""
+class DetectionModelInfo(BaseModel):
+    model_config = ConfigDict(protected_namespaces=(), extra="allow")
+
+    model_id: Optional[int] = Field(
+        None, description="Registry model ID when inference used a saved model record"
+    )
+    model_name: Optional[str] = Field(None, description="Resolved model display name")
+    model_type: Optional[str] = Field(None, description="Resolved model family/type")
+    input_size: Optional[int] = Field(None, description="Effective model input size")
+    source: Optional[str] = Field(
+        None, description="Effective model source, for example registry or builtin"
+    )
+    status: Optional[str] = Field(
+        None,
+        description="Model lifecycle status or built-in provenance status",
+    )
+    weight_state: Optional[str] = Field(
+        None,
+        description="Actual weight state used by the resolved model selection",
+    )
+    readiness: Optional[str] = Field(
+        None, description="Operational readiness of the resolved model selection"
+    )
+    selection_policy: Optional[str] = Field(
+        None, description="Why this model was selected for inference"
+    )
+    requested_model_id: Optional[int] = Field(
+        None, description="Original requested registry model ID, if any"
+    )
+    requested_model_type: Optional[str] = Field(
+        None, description="Original requested model type, if any"
+    )
+    requested_model_status: Optional[str] = Field(
+        None,
+        description="Status observed for the originally requested model selection",
+    )
+    fallback_reason: Optional[str] = Field(
+        None, description="Why the request fell back or could not use the request"
+    )
 
 
 class DetectionDecisionMetrics(BaseModel):
-    confidence_threshold: float = Field(..., ge=0.0, le=1.0)
-    fake_probability: float = Field(..., ge=0.0, le=1.0)
-    real_probability: float = Field(..., ge=0.0, le=1.0)
-    predicted_probability: float = Field(..., ge=0.0, le=1.0)
-    decision_margin: float = Field(..., ge=-1.0, le=1.0)
-    threshold_gap: float = Field(..., ge=-1.0, le=1.0)
+    confidence_threshold: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Decision threshold applied to the fake-class probability",
+    )
+    fake_probability: float = Field(
+        ..., ge=0.0, le=1.0, description="Probability assigned to the fake class"
+    )
+    real_probability: float = Field(
+        ..., ge=0.0, le=1.0, description="Probability assigned to the real class"
+    )
+    predicted_probability: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Probability of the returned prediction class; mirrors DetectionResult.confidence",
+    )
+    decision_margin: float = Field(
+        ...,
+        ge=-1.0,
+        le=1.0,
+        description="Signed gap between the predicted-class probability and the other class",
+    )
+    threshold_gap: float = Field(
+        ...,
+        ge=-1.0,
+        le=1.0,
+        description="Signed gap between fake_probability and confidence_threshold",
+    )
     threshold_applied_to_fake: bool = Field(
         default=True, description="Whether the fake-class threshold controls prediction"
     )
@@ -73,7 +137,12 @@ class DetectionResult(BaseModel):
     """Schema for single detection result"""
 
     prediction: PredictionType
-    confidence: float = Field(..., ge=0.0, le=1.0)
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Probability of the predicted class returned in prediction",
+    )
     probabilities: Optional[Dict[str, float]] = Field(
         None, description="Class probabilities"
     )
@@ -83,7 +152,7 @@ class DetectionResult(BaseModel):
     processing_time: float = Field(
         ..., ge=0.0, description="Processing time in seconds"
     )
-    model_info: Optional[Dict[str, Any]] = Field(
+    model_info: Optional[DetectionModelInfo] = Field(
         None, description="Model information used"
     )
 
@@ -104,6 +173,7 @@ class DetectionResponse(BaseModel):
     file_info: Dict[str, Any]
     result: Optional[DetectionResult] = None
     error_message: Optional[str] = None
+    error_code: Optional[str] = None
     processing_time: float = Field(..., ge=0.0)
     created_at: datetime
 
@@ -130,7 +200,10 @@ class BatchDetectionRequest(BaseModel):
     return_probabilities: bool = Field(
         default=False, description="Return class probabilities"
     )
-    preprocess: bool = Field(default=True, description="Apply preprocessing")
+    preprocess: bool = Field(
+        default=True,
+        description="Deprecated and currently ignored; detection inference always applies preprocessing.",
+    )
     parallel_processing: bool = Field(
         default=True, description="Enable parallel processing"
     )
@@ -181,7 +254,10 @@ class VideoDetectionRequest(BaseModel):
     return_frame_results: bool = Field(
         default=False, description="Return individual frame results"
     )
-    preprocess: bool = Field(default=True, description="Apply preprocessing")
+    preprocess: bool = Field(
+        default=True,
+        description="Deprecated and currently ignored; video detection always applies preprocessing before inference.",
+    )
 
     @validator("model_type")
     def validate_model_type(cls, v):
@@ -205,10 +281,18 @@ class VideoDetectionResponse(BaseModel):
 
     success: bool
     record_id: Optional[int] = None
-    video_info: Dict[str, Any]
+    video_info: Dict[str, Any] = Field(
+        ...,
+        description="Video metadata. Prefer explicit source_* and sampled_* fields; legacy total_frames/processed_frames/duration remain sampled-analysis aliases for compatibility.",
+    )
     aggregated_result: Optional[DetectionResult] = None
     frame_results: Optional[List[FrameDetectionResult]] = None
-    summary: Dict[str, Any]
+    summary: Dict[str, Any] = Field(
+        ...,
+        description="Aggregated video analysis summary with explicit source_* and sampled_* metadata plus aggregation strategy.",
+    )
+    error_message: Optional[str] = None
+    error_code: Optional[str] = None
     processing_time: float = Field(..., ge=0.0)
     created_at: datetime
 
@@ -218,12 +302,33 @@ class DetectionHistory(BaseModel):
 
     id: int
     file_name: str
+    file_path: Optional[str] = None
     file_type: FileType
-    prediction: PredictionType
-    confidence: float
-    processing_time: float
+    prediction: Optional[PredictionType] = None
+    confidence: Optional[float] = Field(
+        None,
+        description="Probability of the predicted class; null when detection failed or no prediction was produced",
+    )
+    processing_time: Optional[float] = Field(
+        None,
+        description="Observed processing time in seconds when available",
+    )
+    source_total_frames: Optional[int] = None
+    source_fps: Optional[float] = None
+    source_duration_seconds: Optional[float] = None
+    sampled_frame_count: Optional[int] = None
+    analyzed_frame_count: Optional[int] = None
+    sampled_duration_seconds: Optional[float] = None
     model_name: str
     model_type: Optional[str] = None
+    status: DetectionStatus = Field(
+        default=DetectionStatus.COMPLETED,
+        description="Persisted detection lifecycle status",
+    )
+    error_message: Optional[str] = Field(
+        None,
+        description="Persisted failure reason when the detection did not complete",
+    )
     created_at: datetime
 
     class Config:
@@ -246,10 +351,12 @@ class DetectionStatistics(BaseModel):
     total_detections: int
     real_detections: int
     fake_detections: int
+    failed_detections: int
     average_confidence: float
     average_processing_time: float
     detections_by_model: Dict[str, int]
     detections_by_file_type: Dict[str, int]
+    detections_by_status: Dict[str, int]
     confidence_distribution: Dict[str, int]
     daily_detections: Dict[str, int]
 

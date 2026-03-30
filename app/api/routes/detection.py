@@ -14,7 +14,7 @@ from fastapi import (
     Query,
 )
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import Dict, List, Optional
 import os
 import uuid
 from datetime import datetime
@@ -40,12 +40,37 @@ from app.schemas.detection import (
 router = APIRouter()
 
 
+def _build_upload_path(file_name: str) -> str:
+    file_extension = os.path.splitext(file_name)[1].lower()
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    return os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{file_extension}")
+
+
+def _raise_if_model_unavailable(response, *, file_name: Optional[str]) -> None:
+    if getattr(response, "error_code", None) != "model_unavailable":
+        return
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": getattr(response, "error_message", None)
+            or "No usable ready/deployed registry model is available for detection",
+            "error_code": "model_unavailable",
+            "record_id": getattr(response, "record_id", None),
+            "file_name": file_name,
+        },
+    )
+
+
 def parse_detection_request(
     model_id: Optional[int] = Form(None),
     model_type: Optional[str] = Form(None),
     confidence_threshold: float = Form(0.5),
     return_probabilities: bool = Form(False),
-    preprocess: bool = Form(True),
+    preprocess: bool = Form(
+        True,
+        description="Deprecated and currently ignored; detection inference always applies preprocessing.",
+    ),
 ) -> DetectionRequest:
     return DetectionRequest(
         model_id=model_id,
@@ -61,7 +86,10 @@ def parse_batch_detection_request(
     model_type: Optional[str] = Form(None),
     confidence_threshold: float = Form(0.5),
     return_probabilities: bool = Form(False),
-    preprocess: bool = Form(True),
+    preprocess: bool = Form(
+        True,
+        description="Deprecated and currently ignored; detection inference always applies preprocessing.",
+    ),
     parallel_processing: bool = Form(True),
     max_workers: int = Form(4),
 ) -> BatchDetectionRequest:
@@ -84,7 +112,10 @@ def parse_video_detection_request(
     max_frames: int = Form(20),
     aggregate_results: bool = Form(True),
     return_frame_results: bool = Form(False),
-    preprocess: bool = Form(True),
+    preprocess: bool = Form(
+        True,
+        description="Deprecated and currently ignored; video detection always applies preprocessing before inference.",
+    ),
 ) -> VideoDetectionRequest:
     return VideoDetectionRequest(
         model_id=model_id,
@@ -145,6 +176,60 @@ def _build_builtin_model_option(model_type: str, *, is_fallback_default: bool):
     }
 
 
+def _build_default_model_payload(default_model, default_builtin_type: Optional[str]):
+    if not default_model:
+        return {
+            "model_id": None,
+            "model_type": None,
+            "source": None,
+            "is_ready": False,
+            "is_recommended": False,
+            "readiness": "explicit_selection_required",
+            "selection_policy": "explicit_ready_model_required",
+            "fallback_model_type": default_builtin_type,
+        }
+
+    return {
+        "model_id": default_model["id"],
+        "model_type": default_model["model_type"],
+        "source": default_model["source"],
+        "is_ready": default_model["is_ready"],
+        "is_recommended": default_model["is_recommended"],
+        "readiness": default_model["readiness"],
+        "selection_policy": default_model["selection_policy"],
+        "fallback_model_type": default_builtin_type,
+    }
+
+
+def _resolve_audit_ip(
+    x_forwarded_for: Optional[str], x_real_ip: Optional[str]
+) -> Optional[str]:
+    if not isinstance(x_forwarded_for, str):
+        x_forwarded_for = None
+    if not isinstance(x_real_ip, str):
+        x_real_ip = None
+
+    if x_forwarded_for:
+        forwarded_ip = x_forwarded_for.split(",", maxsplit=1)[0].strip()
+        if forwarded_ip:
+            return forwarded_ip
+    return x_real_ip.strip() if x_real_ip else None
+
+
+def _build_audit_context(
+    *,
+    user_id: Optional[str],
+    user_agent: Optional[str],
+    x_forwarded_for: Optional[str],
+    x_real_ip: Optional[str],
+) -> Dict[str, Optional[str]]:
+    return {
+        "user_id": user_id if isinstance(user_id, str) else None,
+        "ip_address": _resolve_audit_ip(x_forwarded_for, x_real_ip),
+        "user_agent": user_agent if isinstance(user_agent, str) else None,
+    }
+
+
 @router.post("/detect", response_model=DetectionResponse)
 async def detect_deepfake(
     background_tasks: BackgroundTasks,
@@ -152,6 +237,9 @@ async def detect_deepfake(
     request: DetectionRequest = Depends(parse_detection_request),
     db: Session = Depends(get_db),
     current_user: str = Depends(get_current_user),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
+    x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For"),
+    x_real_ip: Optional[str] = Header(None, alias="X-Real-IP"),
 ):
     """
     Detect deepfake in uploaded file
@@ -166,17 +254,21 @@ async def detect_deepfake(
 
         # Generate unique filename
         file_extension = os.path.splitext(file.filename)[1].lower()
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
-        file_path = os.path.join("uploads", unique_filename)
+        file_path = _build_upload_path(file.filename)
 
         # Save uploaded file
-        os.makedirs("uploads", exist_ok=True)
         with open(file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
 
         # Initialize detection service
         detection_service = DetectionService(db)
+        audit_context = _build_audit_context(
+            user_id=current_user,
+            user_agent=user_agent,
+            x_forwarded_for=x_forwarded_for,
+            x_real_ip=x_real_ip,
+        )
 
         # Route video uploads through the dedicated video pipeline while
         # preserving the generic /detect response shape for the frontend.
@@ -192,6 +284,9 @@ async def detect_deepfake(
                 video_path=file_path,
                 request=video_request,
                 background_tasks=background_tasks,
+                original_file_name=file.filename,
+                audit_context=audit_context,
+                audit_action="detect",
             )
 
             detection_result = video_result.aggregated_result
@@ -204,25 +299,52 @@ async def detect_deepfake(
                 "type": "video",
                 "size": os.path.getsize(file_path),
                 "resolution": None,
+                "source_total_frames": video_result.video_info.get(
+                    "source_total_frames"
+                ),
+                "source_fps": video_result.video_info.get("source_fps"),
+                "source_duration_seconds": video_result.video_info.get(
+                    "source_duration_seconds"
+                ),
+                "sampled_frame_count": video_result.video_info.get(
+                    "sampled_frame_count"
+                ),
+                "analyzed_frame_count": video_result.video_info.get(
+                    "analyzed_frame_count"
+                ),
+                "sampled_duration_seconds": video_result.video_info.get(
+                    "sampled_duration_seconds"
+                ),
                 "total_frames": video_result.video_info.get("total_frames"),
                 "processed_frames": video_result.video_info.get("processed_frames"),
                 "duration": video_result.video_info.get("duration"),
             }
 
-            return DetectionResponse(
+            response_payload = DetectionResponse(
                 success=video_result.success,
+                record_id=video_result.record_id,
                 file_info=file_info,
                 result=detection_result,
-                error_message=None
-                if video_result.success
-                else "Video detection failed",
+                error_message=video_result.error_message
+                if not video_result.success
+                else None,
+                error_code=video_result.error_code
+                if not video_result.success
+                else None,
                 processing_time=video_result.processing_time,
                 created_at=video_result.created_at,
             )
+            _raise_if_model_unavailable(response_payload, file_name=file.filename)
+            return response_payload
 
         # Perform detection
         result = await detection_service.detect_file(
-            file_path=file_path, request=request, background_tasks=background_tasks
+            file_path=file_path,
+            request=request,
+            background_tasks=background_tasks,
+            original_file_name=file.filename,
+            audit_context=audit_context,
+            audit_action="detect",
         )
 
         if result.success and result.result:
@@ -241,6 +363,8 @@ async def detect_deepfake(
                 error_message=result.error_message,
                 user=current_user,
             )
+
+        _raise_if_model_unavailable(result, file_name=file.filename)
 
         return result
 
@@ -283,10 +407,15 @@ async def detect_deepfake_batch(
     files: List[UploadFile] = File(...),
     request: BatchDetectionRequest = Depends(parse_batch_detection_request),
     db: Session = Depends(get_db),
+    current_user: Optional[str] = Depends(get_optional_user),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
+    x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For"),
+    x_real_ip: Optional[str] = Header(None, alias="X-Real-IP"),
 ):
     """
     Detect deepfake in multiple files
     """
+    file_paths = []
     try:
         from app.services.detection_service import DetectionService
 
@@ -294,28 +423,36 @@ async def detect_deepfake_batch(
             raise HTTPException(status_code=400, detail="Maximum 100 files allowed")
 
         # Save uploaded files
-        file_paths = []
+        original_file_names = {}
         for file in files:
             if not file.filename:
                 continue
 
-            file_extension = os.path.splitext(file.filename)[1].lower()
-            unique_filename = f"{uuid.uuid4()}{file_extension}"
-            file_path = os.path.join("uploads", unique_filename)
-
-            os.makedirs("uploads", exist_ok=True)
+            file_path = _build_upload_path(file.filename)
             with open(file_path, "wb") as buffer:
                 content = await file.read()
                 buffer.write(content)
 
             file_paths.append(file_path)
+            original_file_names[file_path] = file.filename
 
         # Initialize detection service
         detection_service = DetectionService(db)
+        audit_context = _build_audit_context(
+            user_id=current_user,
+            user_agent=user_agent,
+            x_forwarded_for=x_forwarded_for,
+            x_real_ip=x_real_ip,
+        )
 
         # Perform batch detection
         result = await detection_service.detect_batch(
-            file_paths=file_paths, request=request, background_tasks=background_tasks
+            file_paths=file_paths,
+            request=request,
+            background_tasks=background_tasks,
+            original_file_names=original_file_names,
+            audit_context=audit_context,
+            audit_action="detect_batch",
         )
 
         logger.info(
@@ -324,12 +461,51 @@ async def detect_deepfake_batch(
             processed_files=result.processed_files,
         )
 
+        failure_results = [
+            item for item in result.results if isinstance(item, DetectionResponse)
+        ]
+        if (
+            failure_results
+            and all(item.error_code == "model_unavailable" for item in failure_results)
+            and result.processed_files == 0
+            and len(failure_results) == len(result.results)
+        ):
+            _raise_if_model_unavailable(
+                failure_results[0],
+                file_name=files[0].filename if files and files[0].filename else None,
+            )
+
         return result
 
     except HTTPException:
+        for file_path in file_paths:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.info("Cleaned up uploaded batch file", file_path=file_path)
+                except Exception as cleanup_error:
+                    logger.error(
+                        "Failed to clean up batch file",
+                        file_path=file_path,
+                        error=str(cleanup_error),
+                    )
         raise
     except Exception as e:
         logger.error("Batch detection failed", error=str(e))
+        for file_path in file_paths:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.info(
+                        "Cleaned up uploaded batch file after error",
+                        file_path=file_path,
+                    )
+                except Exception as cleanup_error:
+                    logger.error(
+                        "Failed to clean up batch file after error",
+                        file_path=file_path,
+                        error=str(cleanup_error),
+                    )
         raise HTTPException(status_code=500, detail="Batch detection failed")
 
 
@@ -339,10 +515,15 @@ async def detect_deepfake_video(
     file: UploadFile = File(...),
     request: VideoDetectionRequest = Depends(parse_video_detection_request),
     db: Session = Depends(get_db),
+    current_user: Optional[str] = Depends(get_optional_user),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
+    x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For"),
+    x_real_ip: Optional[str] = Header(None, alias="X-Real-IP"),
 ):
     """
     Detect deepfake in video file
     """
+    file_path = None
     try:
         from app.services.detection_service import DetectionService
 
@@ -355,21 +536,30 @@ async def detect_deepfake_video(
             raise HTTPException(status_code=400, detail="Invalid video format")
 
         # Generate unique filename
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
-        file_path = os.path.join("uploads", unique_filename)
+        file_path = _build_upload_path(file.filename)
 
         # Save uploaded file
-        os.makedirs("uploads", exist_ok=True)
         with open(file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
 
         # Initialize detection service
         detection_service = DetectionService(db)
+        audit_context = _build_audit_context(
+            user_id=current_user,
+            user_agent=user_agent,
+            x_forwarded_for=x_forwarded_for,
+            x_real_ip=x_real_ip,
+        )
 
         # Perform video detection
         result = await detection_service.detect_video(
-            video_path=file_path, request=request, background_tasks=background_tasks
+            video_path=file_path,
+            request=request,
+            background_tasks=background_tasks,
+            original_file_name=file.filename,
+            audit_context=audit_context,
+            audit_action="detect_video",
         )
 
         logger.info(
@@ -378,12 +568,36 @@ async def detect_deepfake_video(
             frames_analyzed=len(result.frame_results) if result.frame_results else 0,
         )
 
+        _raise_if_model_unavailable(result, file_name=file.filename)
+
         return result
 
     except HTTPException:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info("Cleaned up uploaded video file", file_path=file_path)
+            except Exception as cleanup_error:
+                logger.error(
+                    "Failed to clean up video file",
+                    file_path=file_path,
+                    error=str(cleanup_error),
+                )
         raise
     except Exception as e:
         logger.error("Video detection failed", error=str(e), file_name=file.filename)
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(
+                    "Cleaned up uploaded video file after error", file_path=file_path
+                )
+            except Exception as cleanup_error:
+                logger.error(
+                    "Failed to clean up video file after error",
+                    file_path=file_path,
+                    error=str(cleanup_error),
+                )
         raise HTTPException(status_code=500, detail="Video detection failed")
 
 
@@ -393,9 +607,13 @@ async def get_detection_history(
     limit: int = Query(
         100, ge=1, le=1000, description="Maximum number of records to return"
     ),
-    prediction: Optional[str] = Query(None, description="Filter by prediction result"),
+    prediction: Optional[str] = Query(
+        None, description="Filter by prediction result (real or fake)"
+    ),
+    status: Optional[str] = Query(
+        None, description="Filter by persisted or legacy-derived detection status"
+    ),
     model_type: Optional[str] = Query(None, description="Filter by model type"),
-    user_id: Optional[str] = Query(None, description="Filter by user ID"),
     search: Optional[str] = Query(None, description="Search in filename"),
     order_by: str = Query("created_at", description="Field to order by"),
     order_desc: bool = Query(True, description="Order in descending order"),
@@ -413,8 +631,8 @@ async def get_detection_history(
             skip=skip,
             limit=limit,
             prediction=prediction,
+            status=status,
             model_type=model_type,
-            user_id=user_id,
             search=search,
             order_by=order_by,
             order_desc=order_desc,
@@ -427,7 +645,17 @@ async def get_detection_history(
 
 
 @router.get("/statistics", response_model=DetectionStatistics)
-async def get_detection_statistics(db: Session = Depends(get_db)):
+async def get_detection_statistics(
+    prediction: Optional[str] = Query(
+        None, description="Filter by prediction result (real or fake)"
+    ),
+    status: Optional[str] = Query(
+        None, description="Filter by persisted or legacy-derived detection status"
+    ),
+    model_type: Optional[str] = Query(None, description="Filter by model type"),
+    search: Optional[str] = Query(None, description="Search in filename"),
+    db: Session = Depends(get_db),
+):
     """
     Get detection statistics
     """
@@ -435,7 +663,12 @@ async def get_detection_statistics(db: Session = Depends(get_db)):
         from app.services.detection_service import DetectionService
 
         detection_service = DetectionService(db)
-        stats = await detection_service.get_statistics()
+        stats = await detection_service.get_statistics_filtered(
+            prediction=prediction,
+            status=status,
+            model_type=model_type,
+            search=search,
+        )
         return stats
 
     except Exception as e:
@@ -493,41 +726,16 @@ async def get_available_models(db: Session = Depends(get_db)):
             if model_type not in saved_model_types
         ]
 
-        default_model = (
-            next((model for model in saved_models if model["is_default"]), None)
-            or (saved_models[0] if saved_models else None)
-            or (
-                next(
-                    (
-                        model
-                        for model in builtin_models
-                        if model["model_type"] == default_builtin_type
-                    ),
-                    None,
-                )
-                or (builtin_models[0] if builtin_models else None)
-            )
+        default_model = next(
+            (model for model in saved_models if model["is_default"]), None
         )
+        if default_model is None and saved_models:
+            default_model = saved_models[0]
 
-        default_value = {
-            "model_id": default_model["id"] if default_model else None,
-            "model_type": (
-                default_model["model_type"] if default_model else default_builtin_type
-            ),
-            "source": default_model["source"] if default_model else "builtin",
-            "is_ready": default_model["is_ready"] if default_model else False,
-            "is_recommended": (
-                default_model["is_recommended"] if default_model else False
-            ),
-            "readiness": (
-                default_model["readiness"] if default_model else "fallback_only"
-            ),
-            "selection_policy": (
-                default_model["selection_policy"]
-                if default_model
-                else "fallback_default"
-            ),
-        }
+        default_value = _build_default_model_payload(
+            default_model,
+            default_builtin_type,
+        )
 
         return {
             "models": saved_models + builtin_models,
@@ -541,7 +749,14 @@ async def get_available_models(db: Session = Depends(get_db)):
 
 
 @router.delete("/history/{detection_id}")
-async def delete_detection_record(detection_id: int, db: Session = Depends(get_db)):
+async def delete_detection_record(
+    detection_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[str] = Depends(get_optional_user),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
+    x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For"),
+    x_real_ip: Optional[str] = Header(None, alias="X-Real-IP"),
+):
     """
     Delete detection record
     """
@@ -549,7 +764,17 @@ async def delete_detection_record(detection_id: int, db: Session = Depends(get_d
         from app.services.detection_service import DetectionService
 
         detection_service = DetectionService(db)
-        success = await detection_service.delete_detection_record(detection_id)
+        audit_context = _build_audit_context(
+            user_id=current_user,
+            user_agent=user_agent,
+            x_forwarded_for=x_forwarded_for,
+            x_real_ip=x_real_ip,
+        )
+        success = await detection_service.delete_detection_record(
+            detection_id,
+            audit_context=audit_context,
+            audit_action="delete_detection_result",
+        )
 
         if not success:
             raise HTTPException(status_code=404, detail="Detection record not found")
