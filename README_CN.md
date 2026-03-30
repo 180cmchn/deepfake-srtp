@@ -182,7 +182,7 @@ ssh -p 13114 -L 8000:127.0.0.1:8000 root@connect.westd.seetacloud.com
 ### 健康检查端点
 - **应用状态**: `http://localhost:8000/`
 - **基础健康检查**: `http://localhost:8000/health`
-- **详细健康检查**: `http://localhost:8000/api/v1/health/health`
+- **详细系统状态**: `http://localhost:8000/api/v1/health/status`
 
 ## 🔧 配置说明
 
@@ -197,7 +197,7 @@ ssh -p 13114 -L 8000:127.0.0.1:8000 root@connect.westd.seetacloud.com
 | `PORT` | 服务器端口 | `8000` | - |
 | `DATABASE_URL` | 数据库连接字符串 | `sqlite:///./deepfake_detection.db` | 生产环境建议使用PostgreSQL/MySQL |
 | `SECRET_KEY` | 应用密钥 | 需要更改 | 生产环境必须更改 |
-| `DEFAULT_MODEL_TYPE` | 默认检测模型 | `vgg` | - |
+| `DEFAULT_MODEL_TYPE` | 默认的 fallback 模型类型提示；真正检测仍要求存在 ready/deployed 的已登记模型 | `vgg` | - |
 | `MODEL_INPUT_SIZE` | 模型输入图像尺寸 | `224` | - |
 | `MAX_CONCURRENT_TRAINING_JOBS` | 最大并发训练任务数 | `2` | 根据GPU内存调整 |
 | `GPU_ENABLED` | 启用GPU加速 | `True` | 根据硬件配置 |
@@ -265,7 +265,7 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/0
 - `POST /detect` - 单文件深度伪造检测
 - `POST /detect/batch` - 批量检测
 - `POST /detect/video` - 视频检测
-- `GET /models` - 获取已保留模型和内置后备模型
+- `GET /models` - 获取 ready/deployed 的已保留模型，以及明确标记为 fallback-only 的内置模型类型
 - `GET /history` - 检测历史记录
 - `GET /statistics` - 检测统计信息
 
@@ -501,8 +501,8 @@ with open('test_video.mp4', 'rb') as f:
 if response.status_code == 200:
     result = response.json()
     print(f"视频检测结果: {result['aggregated_result']['prediction']}")
-    print(f"处理帧数: {result['summary']['frames_analyzed']}")
-    print(f"平均置信度: {result['aggregated_result']['confidence']:.4f}")
+    print(f"分析帧数: {result['summary']['analyzed_frame_count']}")
+    print(f"预测结果置信度: {result['aggregated_result']['confidence']:.4f}")
     print(f"处理时间: {result['processing_time']:.2f}s")
 else:
     print(f"视频检测失败: {response.text}")
@@ -530,9 +530,9 @@ if response.status_code == 200:
     print(f"批量检测完成，处理了 {len(results['results'])} 个文件")
     for result in results['results']:
         if result.get('result'):
-            print(f"文件: {result['file_info']['file_name']}, 结果: {result['result']['prediction']}, 置信度: {result['result']['confidence']:.4f}")
+            print(f"文件: {result['file_info']['name']}, 结果: {result['result']['prediction']}, 置信度: {result['result']['confidence']:.4f}")
         else:
-            print(f"文件: {result['file_info']['file_name']}, 检测失败: {result.get('error_message')}")
+            print(f"文件: {result['file_info']['name']}, 检测失败: {result.get('error_message')}")
 else:
     print(f"批量检测失败: {response.text}")
 
@@ -602,8 +602,8 @@ for _, file_obj in files:
 # 应用健康状态
 curl http://localhost:8000/health
 
-# 详细健康状态
-curl http://localhost:8000/api/v1/health/health
+# 详细系统状态
+curl http://localhost:8000/api/v1/health/status
 
 # 数据库连接状态
 python test_db_connection.py

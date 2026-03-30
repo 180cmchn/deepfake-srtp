@@ -4,10 +4,10 @@
 
 ## 主要改进内容
 
-### 1. 用户认证和权限管理 ✅
+### 1. 轻量级用户认证和权限控制 ✅
 - **新增文件**: `app/core/auth.py`
 - **功能**:
-  - 基于Header的简单认证机制 (X-User-ID)
+  - 基于 Header 的轻量级认证机制 (X-User-ID)
   - 可选用户认证 (`get_optional_user`)
   - 管理员权限验证 (`require_admin`)
   - 开发环境默认用户支持
@@ -53,7 +53,7 @@
 - **功能**:
   - 支持高级过滤和搜索
   - 灵活的排序选项
-  - 用户ID过滤支持 (预留)
+  - 状态、模型类型、文件名搜索等过滤支持
   - 改进的查询性能
 
 ### 7. 依赖管理 ✅
@@ -69,7 +69,7 @@
 - `POST /detect/video` - 视频检测
 - `GET /history` - 检测历史 (支持过滤、搜索、分页)
 - `GET /statistics` - 检测统计
-- `GET /models` - 可用模型列表
+- `GET /models` - ready/deployed 的已保留模型列表 + fallback-only 内置模型类型
 - `DELETE /history/{detection_id}` - 删除检测记录
 
 ### 训练API (`/api/v1/training`)
@@ -114,12 +114,11 @@ X-User-ID: your-user-id
 - `search`: 在文件名中搜索
 - `status`: 按状态过滤
 - `model_type`: 按模型类型过滤
-- `created_by`: 按创建者过滤
 - `prediction`: 按预测结果过滤
 
 ## 错误处理改进
 
-1. **统一的错误响应格式**
+1. **更一致的错误响应格式（兼容期内仍保留部分字符串/对象 detail 差异）**
 2. **详细的错误日志记录**
 3. **文件清理机制**
 4. **用户上下文记录**
@@ -180,7 +179,7 @@ curl -X GET "http://localhost:8000/api/v1/training/jobs?search=fake&status=runni
 
 ### 健康检查
 ```bash
-curl -X GET "http://localhost:8000/api/v1/health/health"
+curl -X GET "http://localhost:8000/api/v1/health/status"
 ```
 
 ## 部署注意事项
@@ -195,7 +194,7 @@ curl -X GET "http://localhost:8000/api/v1/health/health"
 
 通过参考 `ai-manager-plateform` 项目的最佳实践，`deepfake-srtp` 项目的API现在具备了：
 
-- ✅ 完整的用户认证和权限管理
+- ✅ 轻量级的用户认证和权限控制
 - ✅ 高级查询、过滤和搜索功能
 - ✅ 全面的健康检查和监控
 - ✅ 改进的错误处理和日志记录

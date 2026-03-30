@@ -183,7 +183,7 @@ python run.py
 
 ### Production Mode
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+HOST=0.0.0.0 PORT=8000 WORKERS=4 python run.py
 ```
 
 ### Using Docker
@@ -215,12 +215,13 @@ Key environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DATABASE_URL` | Database connection string | `sqlite:///./deepfake_detection.db` |
-| `DEFAULT_MODEL_TYPE` | Default model for detection | `vgg` |
+| `DEFAULT_MODEL_TYPE` | Preferred fallback model-type hint when no explicit model is requested; detection still requires a ready/deployed registry model | `vgg` |
 | `MODEL_INPUT_SIZE` | Input image size for models | `224` |
 | `MAX_CONCURRENT_TRAINING_JOBS` | Max concurrent training jobs | `2` |
 | `GPU_ENABLED` | Enable GPU acceleration | `True` |
 | `HOST` | Server host address | `0.0.0.0` |
 | `PORT` | Server port | `8000` |
+| `API_V1_STR` | API v1 prefix | `/api/v1` |
 | `DEBUG` | Enable debug mode | `False` |
 | `LOG_LEVEL` | Logging level | `INFO` |
 
@@ -282,7 +283,7 @@ dataset/
 - `POST /api/v1/detection/detect` - Detect deepfake in single file
 - `POST /api/v1/detection/detect/batch` - Batch detection
 - `POST /api/v1/detection/detect/video` - Video detection
-- `GET /api/v1/detection/models` - Get retained models plus builtin fallback models
+- `GET /api/v1/detection/models` - Get ready/deployed retained models plus explicitly marked fallback-only builtin model types
 - `GET /api/v1/detection/history` - Detection history
 - `GET /api/v1/detection/statistics` - Detection statistics
 
