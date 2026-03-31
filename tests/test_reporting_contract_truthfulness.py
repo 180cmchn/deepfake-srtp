@@ -1,5 +1,10 @@
+import os
 import inspect
+import tempfile
 import unittest
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from app.api.routes import detection as detection_routes
 from app.schemas.detection import (
@@ -9,6 +14,15 @@ from app.schemas.detection import (
 )
 from app.schemas.models import ModelMetrics
 from app.schemas.training import TrainingResults
+from app.services.detection_service import DetectionService
+
+
+class DummyBackgroundTasks:
+    def __init__(self):
+        self.tasks = []
+
+    def add_task(self, func, *args, **kwargs):
+        self.tasks.append((func, args, kwargs))
 
 
 class ReportingContractTruthfulnessTests(unittest.TestCase):
@@ -94,6 +108,72 @@ class ReportingContractTruthfulnessTests(unittest.TestCase):
             "Optional advanced report artifact",
             ModelMetrics.model_fields["confusion_matrix"].description,
         )
+
+
+class ReportingContractRuntimeBehaviorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_detect_file_still_applies_preprocessing_when_request_flag_is_false(
+        self,
+    ):
+        service = DetectionService(db=None)
+        background_tasks = DummyBackgroundTasks()
+        persisted_result = SimpleNamespace(
+            id=1,
+            created_at=datetime(2026, 3, 31, 10, 30, 0),
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+            temp_file.write(b"reporting-contract-image")
+            file_path = temp_file.name
+
+        try:
+            with (
+                patch.object(
+                    service,
+                    "_load_model",
+                    new=AsyncMock(
+                        return_value={
+                            "model": object(),
+                            "model_id": 7,
+                            "model_name": "registry-vit",
+                            "model_type": "vit",
+                            "input_size": 224,
+                        }
+                    ),
+                ),
+                patch.object(
+                    service,
+                    "_preprocess_image",
+                    return_value=object(),
+                ) as preprocess_image_mock,
+                patch.object(
+                    service,
+                    "_predict_tensor",
+                    new=AsyncMock(
+                        return_value={"probabilities": {"fake": 0.8, "real": 0.2}}
+                    ),
+                ),
+                patch.object(
+                    service,
+                    "_save_detection_result",
+                    new=AsyncMock(return_value=persisted_result),
+                ),
+                patch.object(service, "_write_detection_audit_log"),
+            ):
+                response = await service.detect_file(
+                    file_path=file_path,
+                    request=DetectionRequest(model_type="vit", preprocess=False),
+                    background_tasks=background_tasks,
+                    original_file_name="preprocess-false.png",
+                )
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+        preprocess_image_mock.assert_called_once_with(file_path, input_size=224)
+        self.assertTrue(response.success)
+        self.assertEqual(response.record_id, 1)
+        self.assertEqual(response.file_info["resolution"], "224x224")
+        self.assertEqual(len(background_tasks.tasks), 1)
 
 
 if __name__ == "__main__":
