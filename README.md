@@ -57,7 +57,7 @@ deepfake-srtp/
 ## 💻 System Requirements
 
 ### Minimum Requirements
-- **Python**: 3.8 or higher
+- **Python**: 3.9 or higher
 - **RAM**: 8GB (16GB recommended for training)
 - **Storage**: 10GB free space (more for datasets and models)
 - **Accelerator**: Optional, but recommended for training (Apple Silicon MPS or NVIDIA CUDA)
@@ -74,6 +74,8 @@ deepfake-srtp/
 - Ubuntu 18.04+ / CentOS 7+
 
 ## 🛠️ Installation
+
+> For a full blank-Ubuntu remote deployment guide covering backend setup, frontend static hosting, Nginx, systemd, health checks, and test commands, see [docs/ubuntu-remote-deployment.md](docs/ubuntu-remote-deployment.md).
 
 1. **Clone the repository**
    ```bash
@@ -107,8 +109,8 @@ deepfake-srtp/
 
 5. **Initialize database**
    ```bash
-   # Create database tables
-   python -c "from app.core.database import create_tables; create_tables()"
+   # Recommended: Alembic-first initialization helper
+   python init_db.py
    
    # Or use Alembic for migrations
    alembic upgrade head
@@ -183,14 +185,20 @@ python run.py
 
 ### Production Mode
 ```bash
-HOST=0.0.0.0 PORT=8000 WORKERS=4 python run.py
+HOST=127.0.0.1 PORT=8000 WORKERS=1 RELOAD=False python run.py
 ```
 
-### Using Docker
+For a same-host production deployment behind Nginx, see [docs/ubuntu-remote-deployment.md](docs/ubuntu-remote-deployment.md).
+
+### Docker / Compose Notes
+
+The repository currently includes `docker-compose.yml` for a MySQL helper service, but it does not ship a full application `Dockerfile` yet.
+
 ```bash
-docker build -t deepfake-detection .
-docker run -p 8000:8000 deepfake-detection
+docker compose up -d mysql
 ```
+
+For the supported non-container Ubuntu deployment flow, see [docs/ubuntu-remote-deployment.md](docs/ubuntu-remote-deployment.md).
 
 ### Connect Local Frontend to Remote Backend
 If the backend runs on the remote cloud host while the frontend runs locally, create an SSH tunnel on your local machine to forward local port `8000` to the remote backend:
@@ -352,7 +360,22 @@ For very large datasets, copy/sync the folder to the server first (`rsync`, `scp
 ## 🧪 Testing
 
 ```bash
-# Run all tests
+# Run the built-in unittest suite
+python -m unittest discover -s tests -p "test_*.py"
+
+# Run a specific unittest module
+python -m unittest tests.test_health_truthfulness
+
+# Syntax-check key backend modules
+python -m py_compile app/main.py app/core/config.py app/core/database.py run.py
+```
+
+If you prefer the optional pytest flow, install the extra test packages first:
+
+```bash
+pip install pytest pytest-asyncio httpx pytest-cov
+
+# Run all tests with pytest
 pytest
 
 # Run with coverage

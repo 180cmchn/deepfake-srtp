@@ -67,9 +67,11 @@ deepfake-srtp/
 
 ## 🛠️ 安装指南
 
+> 若需把后端、前端、Nginx、systemd 和测试命令整理成一套完整的 Ubuntu 空白远程机部署流程，请查看 [docs/ubuntu-remote-deployment.md](docs/ubuntu-remote-deployment.md)。
+
 ### 前置要求
 
-- Python 3.8+
+- Python 3.9+
 - pip 或 conda
 - 可选：Apple Silicon（MPS）或 CUDA GPU（用于加速）
 
@@ -91,7 +93,7 @@ venv\Scripts\activate
 source venv/bin/activate
 
 # 或使用conda
-conda create -n deepfake-env python=3.8
+conda create -n deepfake-env python=3.10
 conda activate deepfake-env
 ```
 
@@ -116,14 +118,14 @@ cp .env.example .env
 
 ### 5. 数据库初始化
 ```bash
-# 测试数据库连接
-python test_db_connection.py
-
-# 初始化数据库表
+# 推荐：优先使用带 Alembic 的初始化脚本
 python init_db.py
 
 # 或使用Alembic进行迁移
 alembic upgrade head
+
+# 初始化完成后测试数据库连接
+python test_db_connection.py
 ```
 
 ### 6. Apple Silicon / MPS 检查
@@ -146,21 +148,21 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ### 生产模式
 ```bash
-# 使用多worker
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
-
-# 或使用启动脚本
-python run.py  # 需要在.env中设置RELOAD=False, WORKERS=4
+# 推荐同机配合 Nginx 的部署方式
+HOST=127.0.0.1 PORT=8000 WORKERS=1 RELOAD=False python run.py
 ```
 
-### Docker部署
+完整的生产部署命令、systemd 和 Nginx 配置请查看 [docs/ubuntu-remote-deployment.md](docs/ubuntu-remote-deployment.md)。
+
+### Docker / Compose 说明
+
+当前仓库包含的是 MySQL 辅助用的 `docker-compose.yml`，并未提供完整应用镜像的 `Dockerfile`。
+
 ```bash
-# 构建镜像
-docker build -t deepfake-detection .
-
-# 运行容器
-docker run -p 8000:8000 -v $(pwd)/data:/app/data deepfake-detection
+docker compose up -d mysql
 ```
+
+如果你要按仓库当前支持的方式部署完整应用，请参考 [docs/ubuntu-remote-deployment.md](docs/ubuntu-remote-deployment.md)。
 
 ### 本地前端联动远程后端
 如果后端部署在远程云主机、本地只运行前端，可在本地建立 SSH 隧道，把本地 `8000` 转发到远程后端：
@@ -191,7 +193,7 @@ ssh -p 13114 -L 8000:127.0.0.1:8000 root@connect.westd.seetacloud.com
 | 变量名 | 描述 | 默认值 | 推荐设置 |
 |----------|-------------|---------|---------|
 | `APP_NAME` | 应用名称 | Deepfake Detection Platform | - |
-| `DEBUG` | 调试模式 | `True` | 生产环境设为`False` |
+| `DEBUG` | 调试模式 | `False` | 生产环境设为`False` |
 | `ENVIRONMENT` | 环境类型 | `development` | 生产环境设为`production` |
 | `HOST` | 服务器主机 | `0.0.0.0` | - |
 | `PORT` | 服务器端口 | `8000` | - |
@@ -355,23 +357,24 @@ curl -X POST "http://localhost:8000/api/v1/datasets/" \
 
 ### 运行测试
 ```bash
-# 运行所有测试
-pytest
+# 运行仓库当前内置的 unittest 测试套件
+python -m unittest discover -s tests -p "test_*.py"
 
-# 运行带覆盖率的测试
-pytest --cov=app --cov-report=html
+# 运行指定模块
+python -m unittest tests.test_health_truthfulness
 
-# 运行特定测试文件
-pytest -k detection -v
+# 语法检查关键后端模块
+python -m py_compile app/main.py app/core/config.py app/core/database.py run.py
 ```
 
 ### 测试配置
 ```bash
-# 安装测试依赖
-pip install pytest pytest-asyncio httpx
+# 若你想按 pytest 方式运行，请先安装额外测试依赖
+pip install pytest pytest-asyncio httpx pytest-cov
 
-# 运行性能测试
-pytest tests/test_performance.py -v
+# 然后再执行 pytest
+pytest
+pytest --cov=app --cov-report=html
 ```
 
 ## 📝 开发指南
@@ -412,14 +415,14 @@ alembic current
 
 ### 日志查看
 ```bash
-# 查看应用日志
+# systemd 部署时，优先查看服务日志
+journalctl -u deepfake-backend -f
+
+# 如果你另外配置了文件日志，再查看 logs/app.log
 tail -f logs/app.log
 
-# 查看结构化日志（JSON格式）
-cat logs/app.log | jq
-
-# 查看错误日志
-grep "ERROR" logs/app.log
+# 查看 nginx 错误日志
+sudo tail -f /var/log/nginx/error.log
 ```
 
 ## 🎯 使用示例
