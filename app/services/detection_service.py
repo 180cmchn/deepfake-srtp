@@ -19,6 +19,8 @@ import numpy as np
 from app.core.database import get_db_session
 from app.core.logging import logger
 from app.core.config import settings
+from app.core.video_aggregation import aggregate_probability_sequence
+from app.core.video_face_roi import SingleFaceRoiProcessor
 from app.models.database_models import (
     AuditLog,
     DetectionResult,
@@ -59,6 +61,7 @@ class DetectionService:
     def __init__(self, db: Session):
         self.db = db
         self._model_cache = {}
+        self._face_roi_processor = SingleFaceRoiProcessor()
 
     def _resolve_detection_status(
         self, status_value: Optional[str], error_message: Optional[str]
@@ -165,6 +168,7 @@ class DetectionService:
             # Load model
             loaded_model = await self._load_model(request.model_id, request.model_type)
             model = loaded_model["model"]
+            face_roi_policy = self._resolve_face_roi_policy(loaded_model)
 
             if loaded_model["model_type"] == "lrcn":
                 raise ValueError("LRCN models only support video detection")
@@ -175,9 +179,14 @@ class DetectionService:
                     file_path,
                     sequence_length=loaded_model.get("sequence_length", 8),
                     input_size=input_size,
+                    face_roi_policy=face_roi_policy,
                 )
             else:
-                image = self._preprocess_image(file_path, input_size=input_size)
+                image = self._preprocess_image(
+                    file_path,
+                    input_size=input_size,
+                    face_roi_policy=face_roi_policy,
+                )
 
             inference_result = await self._predict_tensor(model, image)
             raw_probabilities = inference_result["probabilities"]
@@ -480,6 +489,7 @@ class DetectionService:
         loaded_model = None
         sampled_frame_count = None
         analyzed_frame_count = None
+        fallback_filled_frame_count = 0
         sampled_duration_seconds = None
         source_video_metadata = {
             "source_total_frames": None,
@@ -503,6 +513,8 @@ class DetectionService:
             # Load model
             loaded_model = await self._load_model(request.model_id, request.model_type)
             model = loaded_model["model"]
+            face_roi_policy = self._resolve_face_roi_policy(loaded_model)
+            aggregation_policy = self._resolve_video_aggregation_policy(loaded_model)
 
             if loaded_model["model_type"] == "lrcn" or loaded_model.get(
                 "video_temporal_enabled"
@@ -514,7 +526,10 @@ class DetectionService:
                     model,
                     frames,
                     loaded_model,
+                    face_roi_policy,
                 )
+                analyzed_frame_count = len(frames)
+                fallback_filled_frame_count = 0
                 temporal_strategy = "clip_temporal_fusion"
             else:
                 raw_frame_probabilities = []
@@ -527,6 +542,7 @@ class DetectionService:
                                 input_size=loaded_model.get(
                                     "input_size", settings.MODEL_INPUT_SIZE
                                 ),
+                                face_roi_policy=face_roi_policy,
                             ),
                         )
                         raw_frame_probabilities.append(prediction["probabilities"])
@@ -541,12 +557,18 @@ class DetectionService:
                 if not valid_probabilities:
                     raise ValueError("No frames could be processed successfully")
 
+                analyzed_frame_count = len(valid_probabilities)
+                fallback_filled_frame_count = max(
+                    0, len(raw_frame_probabilities) - analyzed_frame_count
+                )
+
                 smoothed_probabilities = self._smooth_probability_sequence(
                     valid_probabilities
                 )
                 _, _, fallback_probabilities, _ = self._aggregate_probability_sequence(
                     smoothed_probabilities,
                     confidence_threshold=request.confidence_threshold,
+                    aggregation_policy=aggregation_policy,
                 )
                 smoothed_index = 0
                 for probabilities in raw_frame_probabilities:
@@ -580,11 +602,13 @@ class DetectionService:
             ) = self._aggregate_probability_sequence(
                 frame_probabilities,
                 confidence_threshold=request.confidence_threshold,
+                aggregation_policy=aggregation_policy,
             )
 
             processing_time = time.time() - start_time
             sampled_frame_count = len(frames)
-            analyzed_frame_count = len(frame_probabilities)
+            if analyzed_frame_count is None:
+                analyzed_frame_count = len(frame_probabilities)
             sampled_duration_seconds = frames[-1][1] if frames else None
 
             # Create response
@@ -598,6 +622,7 @@ class DetectionService:
                 ),
                 "sampled_frame_count": sampled_frame_count,
                 "analyzed_frame_count": analyzed_frame_count,
+                "fallback_filled_frame_count": fallback_filled_frame_count,
                 "sampled_duration_seconds": sampled_duration_seconds,
                 "total_frames": sampled_frame_count,
                 "processed_frames": analyzed_frame_count,
@@ -612,6 +637,7 @@ class DetectionService:
                 ),
                 "sampled_frame_count": sampled_frame_count,
                 "analyzed_frame_count": analyzed_frame_count,
+                "fallback_filled_frame_count": fallback_filled_frame_count,
                 "sampled_duration_seconds": sampled_duration_seconds,
                 "total_frames": sampled_frame_count,
                 "processed_frames": analyzed_frame_count,
@@ -623,7 +649,16 @@ class DetectionService:
                 "average_confidence": np.mean(confidences) if confidences else 0,
                 "prediction_distribution": self._count_predictions_list(predictions),
                 "temporal_strategy": temporal_strategy,
-                "aggregation_strategy": temporal_strategy,
+                "aggregation_strategy": "weighted_topk_persistence",
+                "face_roi_enabled": face_roi_policy["face_roi_enabled"],
+                "face_roi_effective_enabled": face_roi_policy[
+                    "face_roi_effective_enabled"
+                ],
+                "face_roi_policy_version": face_roi_policy["face_roi_policy_version"],
+                "face_roi_selection_policy": face_roi_policy[
+                    "face_roi_selection_policy"
+                ],
+                "video_aggregation_topk_ratio": aggregation_policy["topk_ratio"],
             }
 
             detection_result = DetectionResultSchema(
@@ -655,6 +690,7 @@ class DetectionService:
                     ),
                     "sampled_frame_count": sampled_frame_count,
                     "analyzed_frame_count": analyzed_frame_count,
+                    "fallback_filled_frame_count": fallback_filled_frame_count,
                     "sampled_duration_seconds": sampled_duration_seconds,
                 },
             )
@@ -683,13 +719,14 @@ class DetectionService:
                     ),
                     "sampled_frame_count": sampled_frame_count,
                     "analyzed_frame_count": analyzed_frame_count,
+                    "fallback_filled_frame_count": fallback_filled_frame_count,
                     "sampled_duration_seconds": sampled_duration_seconds,
                     "total_frames": sampled_frame_count,
                     "processed_frames": analyzed_frame_count,
                     "duration": sampled_duration_seconds,
                     "processed_clips": processed_clips,
                     "temporal_strategy": temporal_strategy,
-                    "aggregation_strategy": temporal_strategy,
+                    "aggregation_strategy": "weighted_topk_persistence",
                 },
             )
 
@@ -731,6 +768,7 @@ class DetectionService:
                     ),
                     "sampled_frame_count": sampled_frame_count,
                     "analyzed_frame_count": analyzed_frame_count,
+                    "fallback_filled_frame_count": fallback_filled_frame_count,
                     "sampled_duration_seconds": sampled_duration_seconds,
                 },
             )
@@ -760,6 +798,7 @@ class DetectionService:
                     ),
                     "sampled_frame_count": sampled_frame_count,
                     "analyzed_frame_count": analyzed_frame_count,
+                    "fallback_filled_frame_count": fallback_filled_frame_count,
                     "sampled_duration_seconds": sampled_duration_seconds,
                 },
             )
@@ -1227,10 +1266,67 @@ class DetectionService:
             "requested_model_type",
             "requested_model_status",
             "fallback_reason",
+            "face_roi_enabled",
+            "face_roi_confidence_threshold",
+            "face_roi_crop_padding",
+            "face_roi_policy_version",
+            "face_roi_selection_policy",
+            "video_aggregation_topk_ratio",
+            "video_aggregation_mean_weight",
+            "video_aggregation_peak_weight",
+            "video_aggregation_persistence_weight",
+            "temporal_bidirectional",
+            "temporal_attention_pooling",
         ):
             if key in loaded_model and loaded_model.get(key) is not None:
                 model_info[key] = loaded_model.get(key)
         return model_info
+
+    def _resolve_face_roi_policy(
+        self, loaded_model: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        parameters = dict((loaded_model or {}).get("parameters") or {})
+        for key in (
+            "face_roi_enabled",
+            "yolo_face_model_path",
+            "face_roi_confidence_threshold",
+            "face_roi_crop_padding",
+            "face_roi_policy_version",
+            "face_roi_selection_policy",
+        ):
+            if loaded_model and loaded_model.get(key) is not None:
+                parameters[key] = loaded_model.get(key)
+        return self._face_roi_processor.build_policy(parameters)
+
+    def _resolve_video_aggregation_policy(
+        self, loaded_model: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, float]:
+        parameters = dict((loaded_model or {}).get("parameters") or {})
+
+        def get_value(key: str, default: float) -> float:
+            loaded_value = (loaded_model or {}).get(key) if loaded_model else None
+            if loaded_value is not None:
+                return float(loaded_value)
+            parameter_value = parameters.get(key)
+            if parameter_value is not None:
+                return float(parameter_value)
+            return float(default)
+
+        return {
+            "topk_ratio": get_value(
+                "video_aggregation_topk_ratio", settings.VIDEO_AGGREGATION_TOPK_RATIO
+            ),
+            "mean_weight": get_value(
+                "video_aggregation_mean_weight", settings.VIDEO_AGGREGATION_MEAN_WEIGHT
+            ),
+            "peak_weight": get_value(
+                "video_aggregation_peak_weight", settings.VIDEO_AGGREGATION_PEAK_WEIGHT
+            ),
+            "persistence_weight": get_value(
+                "video_aggregation_persistence_weight",
+                settings.VIDEO_AGGREGATION_PERSISTENCE_WEIGHT,
+            ),
+        }
 
     def _get_ready_registry_models(self) -> List[ModelRegistry]:
         return (
@@ -1323,27 +1419,90 @@ class DetectionService:
             "source": "registry",
             "status": model_record.status,
             "weight_state": "checkpoint_loaded",
+            "parameters": dict(model_record.parameters or {}),
+            "face_roi_enabled": checkpoint.get(
+                "face_roi_enabled",
+                (model_record.parameters or {}).get("face_roi_enabled"),
+            ),
+            "yolo_face_model_path": checkpoint.get(
+                "yolo_face_model_path",
+                (model_record.parameters or {}).get("yolo_face_model_path"),
+            ),
+            "face_roi_confidence_threshold": checkpoint.get(
+                "face_roi_confidence_threshold",
+                (model_record.parameters or {}).get("face_roi_confidence_threshold"),
+            ),
+            "face_roi_crop_padding": checkpoint.get(
+                "face_roi_crop_padding",
+                (model_record.parameters or {}).get("face_roi_crop_padding"),
+            ),
+            "face_roi_policy_version": checkpoint.get(
+                "face_roi_policy_version",
+                (model_record.parameters or {}).get("face_roi_policy_version"),
+            ),
+            "face_roi_selection_policy": checkpoint.get(
+                "face_roi_selection_policy",
+                (model_record.parameters or {}).get("face_roi_selection_policy"),
+            ),
+            "video_aggregation_topk_ratio": checkpoint.get(
+                "video_aggregation_topk_ratio",
+                (model_record.parameters or {}).get("video_aggregation_topk_ratio"),
+            ),
+            "video_aggregation_mean_weight": checkpoint.get(
+                "video_aggregation_mean_weight",
+                (model_record.parameters or {}).get("video_aggregation_mean_weight"),
+            ),
+            "video_aggregation_peak_weight": checkpoint.get(
+                "video_aggregation_peak_weight",
+                (model_record.parameters or {}).get("video_aggregation_peak_weight"),
+            ),
+            "video_aggregation_persistence_weight": checkpoint.get(
+                "video_aggregation_persistence_weight",
+                (model_record.parameters or {}).get(
+                    "video_aggregation_persistence_weight"
+                ),
+            ),
+            "temporal_bidirectional": checkpoint.get(
+                "temporal_bidirectional",
+                (model_record.parameters or {}).get("temporal_bidirectional"),
+            ),
+            "temporal_attention_pooling": checkpoint.get(
+                "temporal_attention_pooling",
+                (model_record.parameters or {}).get("temporal_attention_pooling"),
+            ),
         }
         loaded["model"].eval()
         self._model_cache[cache_key] = loaded
         return loaded
 
     def _preprocess_image(
-        self, image_path: str, input_size: Optional[int] = None
+        self,
+        image_path: str,
+        input_size: Optional[int] = None,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         """Preprocess image for inference"""
         target_size = input_size or settings.MODEL_INPUT_SIZE
         with Image.open(image_path) as image:
             rgb_image = image.convert("RGB")
+            if face_roi_policy:
+                rgb_image, _ = self._face_roi_processor.crop_pil(
+                    rgb_image, face_roi_policy
+                )
             rgb_image = rgb_image.resize((target_size, target_size))
             image_array = np.array(rgb_image, dtype=np.float32) / 255.0
         return self._normalize_image_array(image_array)
 
     def _preprocess_frame(
-        self, frame: np.ndarray, input_size: Optional[int] = None
+        self,
+        frame: np.ndarray,
+        input_size: Optional[int] = None,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         """Preprocess video frame for inference"""
         target_size = input_size or settings.MODEL_INPUT_SIZE
+        if face_roi_policy:
+            frame, _ = self._face_roi_processor.crop_frame(frame, face_roi_policy)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(frame_rgb).resize((target_size, target_size))
         image_array = np.array(image, dtype=np.float32) / 255.0
@@ -1361,6 +1520,7 @@ class DetectionService:
         sequence_length: int,
         input_size: Optional[int] = None,
         clip_indices: Optional[List[int]] = None,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """Preprocess extracted video frames into a fixed-length clip tensor."""
         if not frames:
@@ -1376,7 +1536,11 @@ class DetectionService:
             selected_frames.append(selected_frames[-1])
 
         processed_frames = [
-            self._preprocess_frame(frame, input_size=input_size).squeeze(0)
+            self._preprocess_frame(
+                frame,
+                input_size=input_size,
+                face_roi_policy=face_roi_policy,
+            ).squeeze(0)
             for frame in selected_frames
         ]
         return torch.stack(processed_frames, dim=0).unsqueeze(0)
@@ -1386,10 +1550,13 @@ class DetectionService:
         image_path: str,
         sequence_length: int,
         input_size: Optional[int] = None,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """Repeat a single image into a fixed-length clip tensor."""
         frame_tensor = self._preprocess_image(
-            image_path, input_size=input_size
+            image_path,
+            input_size=input_size,
+            face_roi_policy=face_roi_policy,
         ).squeeze(0)
         clip = frame_tensor.unsqueeze(0).repeat(max(1, sequence_length), 1, 1, 1)
         return clip.unsqueeze(0)
@@ -1546,6 +1713,7 @@ class DetectionService:
         model,
         frames: List[tuple],
         loaded_model: Dict[str, Any],
+        face_roi_policy: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """Infer clip-level predictions and project them back to frame timeline."""
         sequence_length = max(1, int(loaded_model.get("sequence_length", 8)))
@@ -1565,6 +1733,7 @@ class DetectionService:
                 sequence_length=sequence_length,
                 input_size=input_size,
                 clip_indices=clip_indices,
+                face_roi_policy=face_roi_policy,
             )
             prediction = await self._predict_tensor(model, processed_clip)
             weights = self._clip_frame_weights(len(clip_indices))
@@ -1600,10 +1769,13 @@ class DetectionService:
                         sequence_length=sequence_length,
                         input_size=input_size,
                         clip_indices=[frame_index] * sequence_length,
+                        face_roi_policy=face_roi_policy,
                     )
                 else:
                     fallback_tensor = self._preprocess_frame(
-                        frame, input_size=input_size
+                        frame,
+                        input_size=input_size,
+                        face_roi_policy=face_roi_policy,
                     )
                 frame_prediction = await self._predict_tensor(
                     model,
@@ -1871,6 +2043,7 @@ class DetectionService:
         self,
         frame_probabilities: List[Dict[str, float]],
         confidence_threshold: float = 0.5,
+        aggregation_policy: Optional[Dict[str, float]] = None,
     ) -> tuple:
         """Aggregate a probability timeline into a video-level prediction."""
         if not frame_probabilities:
@@ -1887,14 +2060,17 @@ class DetectionService:
                 ),
             )
 
-        fake_probability = sum(item["fake"] for item in frame_probabilities) / len(
-            frame_probabilities
+        aggregation_policy = (
+            aggregation_policy or self._resolve_video_aggregation_policy()
         )
-        fake_probability = max(0.0, min(1.0, fake_probability))
-        probabilities = {
-            "fake": fake_probability,
-            "real": max(0.0, 1.0 - fake_probability),
-        }
+        probabilities, aggregation_details = aggregate_probability_sequence(
+            frame_probabilities,
+            confidence_threshold=confidence_threshold,
+            topk_ratio=aggregation_policy["topk_ratio"],
+            mean_weight=aggregation_policy["mean_weight"],
+            peak_weight=aggregation_policy["peak_weight"],
+            persistence_weight=aggregation_policy["persistence_weight"],
+        )
         prediction, confidence = self._probabilities_to_prediction(
             probabilities,
             confidence_threshold=confidence_threshold,
@@ -1905,6 +2081,8 @@ class DetectionService:
             prediction,
             confidence,
         )
+        for key, value in aggregation_details.items():
+            setattr(decision_metrics, key, value)
         return prediction, confidence, probabilities, decision_metrics
 
     def _aggregate_results(
@@ -2137,6 +2315,20 @@ class DetectionService:
                     "feature_projection_size": checkpoint.get(
                         "feature_projection_size",
                         parameters.get("feature_projection_size", 256),
+                    ),
+                    "temporal_bidirectional": checkpoint.get(
+                        "temporal_bidirectional",
+                        parameters.get(
+                            "temporal_bidirectional",
+                            settings.TEMPORAL_BIDIRECTIONAL,
+                        ),
+                    ),
+                    "temporal_attention_pooling": checkpoint.get(
+                        "temporal_attention_pooling",
+                        parameters.get(
+                            "temporal_attention_pooling",
+                            settings.TEMPORAL_ATTENTION_POOLING,
+                        ),
                     ),
                 }
             )

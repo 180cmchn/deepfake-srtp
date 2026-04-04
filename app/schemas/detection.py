@@ -131,6 +131,36 @@ class DetectionDecisionMetrics(BaseModel):
     threshold_applied_to_fake: bool = Field(
         default=True, description="Whether the fake-class threshold controls prediction"
     )
+    mean_fake_probability: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Average fake-class probability across the sampled frame or clip timeline.",
+    )
+    topk_fake_probability: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Average fake-class probability across the strongest top-k portion of the timeline.",
+    )
+    positive_ratio: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of sampled probabilities whose fake score met or exceeded the confidence threshold.",
+    )
+    longest_positive_run_ratio: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Longest consecutive run of fake-above-threshold samples divided by sampled timeline length.",
+    )
+    aggregated_fake_probability: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Final fake probability returned after weighted video-level aggregation.",
+    )
 
 
 class DetectionResult(BaseModel):

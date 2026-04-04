@@ -169,7 +169,10 @@ class ReportingContractRuntimeBehaviorTests(unittest.IsolatedAsyncioTestCase):
             if os.path.exists(file_path):
                 os.remove(file_path)
 
-        preprocess_image_mock.assert_called_once_with(file_path, input_size=224)
+        preprocess_image_mock.assert_called_once()
+        self.assertEqual(preprocess_image_mock.call_args.args[0], file_path)
+        self.assertEqual(preprocess_image_mock.call_args.kwargs["input_size"], 224)
+        self.assertIn("face_roi_policy", preprocess_image_mock.call_args.kwargs)
         self.assertTrue(response.success)
         self.assertEqual(response.record_id, 1)
         self.assertEqual(response.file_info["resolution"], "224x224")
