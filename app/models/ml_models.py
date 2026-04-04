@@ -287,6 +287,8 @@ class VideoTemporalHybridModel(nn.Module):
         num_classes: int = 2,
         pretrained: bool = True,
         feature_projection_size: int = 256,
+        temporal_bidirectional: bool = True,
+        temporal_attention_pooling: bool = True,
     ):
         super(VideoTemporalHybridModel, self).__init__()
         if backbone_type not in FRAME_BACKBONE_TYPES:
@@ -308,6 +310,8 @@ class VideoTemporalHybridModel(nn.Module):
             )
 
         self.feature_dim = feature_dim
+        self.temporal_bidirectional = temporal_bidirectional
+        self.temporal_attention_pooling = temporal_attention_pooling
         self.feature_projection_size = max(
             32, min(feature_projection_size, feature_dim)
         )
@@ -321,6 +325,10 @@ class VideoTemporalHybridModel(nn.Module):
             temporal_hidden_size,
             temporal_num_layers,
             batch_first=True,
+            bidirectional=temporal_bidirectional,
+        )
+        temporal_output_size = (
+            temporal_hidden_size * 2 if temporal_bidirectional else temporal_hidden_size
         )
         frame_hidden = max(
             64, min(temporal_hidden_size, self.feature_projection_size * 2)
@@ -331,11 +339,20 @@ class VideoTemporalHybridModel(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(frame_hidden, num_classes),
         )
-        self.temporal_classifier = nn.Linear(temporal_hidden_size, num_classes)
-        fusion_hidden = max(temporal_hidden_size, self.feature_projection_size)
+        if temporal_attention_pooling:
+            attention_hidden = max(32, temporal_output_size // 2)
+            self.temporal_attention = nn.Sequential(
+                nn.Linear(temporal_output_size, attention_hidden),
+                nn.Tanh(),
+                nn.Linear(attention_hidden, 1),
+            )
+        else:
+            self.temporal_attention = None
+        self.temporal_classifier = nn.Linear(temporal_output_size, num_classes)
+        fusion_hidden = max(temporal_output_size, self.feature_projection_size)
         fusion_input_size = (
             (self.feature_projection_size * 2)
-            + temporal_hidden_size
+            + temporal_output_size
             + (num_classes * 2)
         )
         self.fusion_head = nn.Sequential(
@@ -367,7 +384,15 @@ class VideoTemporalHybridModel(nn.Module):
         frame_logits = self.frame_classifier(frame_summary)
 
         temporal_output, _ = self.lstm(projected_features)
-        temporal_features = temporal_output[:, -1, :]
+        if self.temporal_attention is not None:
+            attention_scores = torch.softmax(
+                self.temporal_attention(temporal_output).squeeze(-1), dim=1
+            )
+            temporal_features = torch.sum(
+                temporal_output * attention_scores.unsqueeze(-1), dim=1
+            )
+        else:
+            temporal_features = temporal_output[:, -1, :]
         temporal_logits = self.temporal_classifier(temporal_features)
 
         fusion_input = torch.cat(
@@ -512,6 +537,13 @@ class ModelRegistry:
                 num_classes=kwargs.get("num_classes", 2),
                 pretrained=pretrained,
                 feature_projection_size=kwargs.get("feature_projection_size", 256),
+                temporal_bidirectional=kwargs.get(
+                    "temporal_bidirectional", settings.TEMPORAL_BIDIRECTIONAL
+                ),
+                temporal_attention_pooling=kwargs.get(
+                    "temporal_attention_pooling",
+                    settings.TEMPORAL_ATTENTION_POOLING,
+                ),
             )
 
         model_class = cls._models[model_type]
