@@ -63,6 +63,86 @@ class TrainingParameters(BaseModel):
     training_device: str = Field(
         default="auto", description="Training device: auto, mps, cuda, cpu"
     )
+    sequence_length: int = Field(
+        default=8,
+        ge=2,
+        le=64,
+        description="Clip length used when temporal video training is enabled",
+    )
+    frame_stride: int = Field(
+        default=2,
+        ge=1,
+        le=16,
+        description="Temporal stride between frames inside a training clip",
+    )
+    temporal_hidden_size: int = Field(
+        default=256,
+        ge=32,
+        le=1024,
+        description="Hidden size of the temporal fusion backbone",
+    )
+    temporal_num_layers: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description="Number of recurrent temporal layers used by the hybrid video backbone",
+    )
+    feature_projection_size: int = Field(
+        default=256,
+        ge=32,
+        le=1024,
+        description="Projected frame-feature size before temporal fusion",
+    )
+    face_roi_enabled: bool = Field(
+        default=True,
+        description="Enable shared single-face ROI preprocessing for both training and inference metadata.",
+    )
+    face_roi_confidence_threshold: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Confidence threshold used by the YOLO-based single-face ROI detector.",
+    )
+    face_roi_crop_padding: float = Field(
+        default=0.18,
+        ge=0.0,
+        le=1.0,
+        description="Padding ratio applied when expanding the selected face ROI crop.",
+    )
+    temporal_bidirectional: bool = Field(
+        default=True,
+        description="Enable bidirectional temporal fusion in the hybrid video backbone.",
+    )
+    temporal_attention_pooling: bool = Field(
+        default=True,
+        description="Enable attention pooling over temporal features instead of using only the final recurrent state.",
+    )
+    train_clip_overlap_ratio: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=0.95,
+        description="Overlap ratio used when sampling training clips from videos.",
+    )
+    val_clip_overlap_ratio: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=0.95,
+        description="Overlap ratio used when sampling validation clips from videos.",
+    )
+    temporal_clip_filter_enabled: bool = Field(
+        default=True,
+        description="Filter low-information temporal clips before training to reduce blank/static video noise.",
+    )
+    temporal_clip_min_frame_std: float = Field(
+        default=6.0,
+        ge=0.0,
+        description="Minimum average grayscale frame standard deviation required for a training clip to be kept.",
+    )
+    temporal_clip_min_motion_delta: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="Minimum average grayscale frame-to-frame delta required for a training clip to be kept.",
+    )
 
     @validator("validation_split")
     def validate_validation_split(cls, v):

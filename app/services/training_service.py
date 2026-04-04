@@ -17,6 +17,7 @@ import re
 from typing import List, Optional, Dict, Any, Tuple, Callable
 
 import cv2
+import numpy as np
 import torch
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
 from torch import nn
@@ -29,6 +30,8 @@ from fastapi import BackgroundTasks
 from app.core.database import get_db_session
 from app.core.logging import logger
 from app.core.config import settings
+from app.core.video_aggregation import aggregate_logit_sequence
+from app.core.video_face_roi import SingleFaceRoiProcessor
 from app.models.database_models import ModelRegistry, TrainingJob
 from app.schemas.models import ModelStatus
 from app.schemas.training import (
@@ -93,6 +96,7 @@ class TemporalClipSample:
     frame_paths: List[str]
     label: int
     source_id: str
+    roi_materialized: bool = False
 
 
 class TrainingCancelledError(Exception):
@@ -107,10 +111,14 @@ class ImageClassificationDataset(Dataset):
         samples: List[MediaClassificationSample],
         transform=None,
         include_source_id: bool = False,
+        roi_processor: Optional[SingleFaceRoiProcessor] = None,
+        roi_policy: Optional[Dict[str, Any]] = None,
     ):
         self.samples = samples
         self.transform = transform
         self.include_source_id = include_source_id
+        self.roi_processor = roi_processor
+        self.roi_policy = roi_policy
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -124,6 +132,9 @@ class ImageClassificationDataset(Dataset):
                 image = img.convert("RGB")
         else:
             image = self._load_video_frame(sample.path, sample.frame_index)
+
+        if self.roi_processor and self.roi_policy:
+            image, _ = self.roi_processor.crop_pil(image, self.roi_policy)
 
         if self.transform:
             image = self.transform(image)
@@ -208,11 +219,15 @@ class SequenceClassificationDataset(Dataset):
         transform=None,
         augment: bool = False,
         include_source_id: bool = False,
+        roi_processor: Optional[SingleFaceRoiProcessor] = None,
+        roi_policy: Optional[Dict[str, Any]] = None,
     ):
         self.samples = samples
         self.transform = transform
         self.augment = augment
         self.include_source_id = include_source_id
+        self.roi_processor = roi_processor
+        self.roi_policy = roi_policy
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -226,6 +241,8 @@ class SequenceClassificationDataset(Dataset):
         for frame_path in frame_paths:
             with Image.open(frame_path) as img:
                 image = img.convert("RGB")
+            if self.roi_processor and self.roi_policy and not sample.roi_materialized:
+                image, _ = self.roi_processor.crop_pil(image, self.roi_policy)
             frames.append(image)
 
         if self.augment and frames:
@@ -298,6 +315,107 @@ class TrainingService:
     def __init__(self, db: Session):
         self.db = db
         self._active_jobs = self._shared_active_jobs
+        self._face_roi_processor = SingleFaceRoiProcessor()
+
+    def _build_face_roi_policy(
+        self, parameters: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        return self._face_roi_processor.build_policy(parameters or {})
+
+    def _estimate_temporal_clip_quality(
+        self, frame_paths: List[str]
+    ) -> Optional[Dict[str, float]]:
+        if not frame_paths:
+            return None
+
+        grayscale_frames: List[np.ndarray] = []
+        for frame_path in frame_paths:
+            try:
+                with Image.open(frame_path) as image:
+                    grayscale = image.convert("L").resize((48, 48), Image.BILINEAR)
+                    grayscale_frames.append(np.array(grayscale, dtype=np.float32))
+            except Exception:
+                return None
+
+        if not grayscale_frames:
+            return None
+
+        frame_stds = [float(frame.std()) for frame in grayscale_frames]
+        average_frame_std = float(sum(frame_stds) / len(frame_stds))
+
+        if len(grayscale_frames) == 1:
+            average_motion_delta = 0.0
+        else:
+            motion_deltas = [
+                float(np.mean(np.abs(current - previous)))
+                for previous, current in zip(grayscale_frames, grayscale_frames[1:])
+            ]
+            average_motion_delta = float(sum(motion_deltas) / len(motion_deltas))
+
+        return {
+            "average_frame_std": average_frame_std,
+            "average_motion_delta": average_motion_delta,
+        }
+
+    def _filter_temporal_clip_samples(
+        self,
+        samples: List[TemporalClipSample],
+        *,
+        min_frame_std: float,
+        min_motion_delta: float,
+        progress_callback: Optional[
+            Callable[[float, str, Optional[Dict[str, Any]]], None]
+        ] = None,
+        progress_label: str = "正在过滤低质量时序片段",
+    ) -> Tuple[List[TemporalClipSample], Dict[str, Any]]:
+        if not samples:
+            return [], {"kept": 0, "dropped": 0}
+
+        kept_samples: List[TemporalClipSample] = []
+        dropped_count = 0
+        total_samples = len(samples)
+        progress_interval = max(1, total_samples // 20)
+
+        for index, sample in enumerate(samples, start=1):
+            quality = self._estimate_temporal_clip_quality(sample.frame_paths)
+            keep_sample = True
+            if quality is None:
+                keep_sample = False
+            else:
+                average_frame_std = quality["average_frame_std"]
+                average_motion_delta = quality["average_motion_delta"]
+                keep_sample = (
+                    average_frame_std >= min_frame_std
+                    and average_motion_delta >= min_motion_delta
+                )
+
+            if keep_sample:
+                kept_samples.append(sample)
+            else:
+                dropped_count += 1
+
+            if progress_callback and (
+                index == 1 or index % progress_interval == 0 or index == total_samples
+            ):
+                self._report_indexed_progress(
+                    progress_callback,
+                    index,
+                    total_samples,
+                    f"{progress_label}：{index}/{total_samples}",
+                    stage="filter_temporal_clips",
+                    unit="clips",
+                )
+
+        if not kept_samples:
+            kept_samples = list(samples)
+            dropped_count = 0
+
+        return kept_samples, {
+            "kept": len(kept_samples),
+            "dropped": dropped_count,
+            "min_frame_std": float(min_frame_std),
+            "min_motion_delta": float(min_motion_delta),
+        }
 
     def _resolve_training_device(
         self, requested_device: Optional[str] = None
@@ -1446,11 +1564,15 @@ class TrainingService:
         frame_index: int,
         cache_root: Path,
         input_size: int,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
     ) -> str:
         source_path = Path(video_path).expanduser().resolve()
         source_stat = source_path.stat()
+        policy_fingerprint = self._face_roi_processor.get_policy_fingerprint(
+            face_roi_policy
+        )
         cache_key = hashlib.sha1(
-            f"{source_path}:{source_stat.st_mtime_ns}:{source_stat.st_size}:{frame_index}:{input_size}".encode(
+            f"{source_path}:{source_stat.st_mtime_ns}:{source_stat.st_size}:{frame_index}:{input_size}:{policy_fingerprint}".encode(
                 "utf-8"
             )
         ).hexdigest()
@@ -1463,6 +1585,10 @@ class TrainingService:
         frame_image = ImageClassificationDataset._load_video_frame(
             str(source_path), frame_index
         )
+        if face_roi_policy:
+            frame_image, _ = self._face_roi_processor.crop_pil(
+                frame_image, face_roi_policy
+            )
         resized_frame = frame_image.resize((input_size, input_size), Image.BILINEAR)
         temp_path = cached_frame_path.with_suffix(".tmp")
         resized_frame.save(temp_path, format="JPEG", quality=95)
@@ -1521,6 +1647,18 @@ class TrainingService:
                     "class_weight_strategy": parameters.class_weight_strategy,
                     "use_official_test_as_validation": parameters.use_official_test_as_validation,
                     "requested_device": parameters.training_device,
+                    "sequence_length": parameters.sequence_length,
+                    "frame_stride": parameters.frame_stride,
+                    "temporal_hidden_size": parameters.temporal_hidden_size,
+                    "temporal_num_layers": parameters.temporal_num_layers,
+                    "feature_projection_size": parameters.feature_projection_size,
+                    "face_roi_enabled": parameters.face_roi_enabled,
+                    "face_roi_confidence_threshold": parameters.face_roi_confidence_threshold,
+                    "face_roi_crop_padding": parameters.face_roi_crop_padding,
+                    "temporal_bidirectional": parameters.temporal_bidirectional,
+                    "temporal_attention_pooling": parameters.temporal_attention_pooling,
+                    "train_clip_overlap_ratio": parameters.train_clip_overlap_ratio,
+                    "val_clip_overlap_ratio": parameters.val_clip_overlap_ratio,
                 },
             )
 
@@ -2276,6 +2414,60 @@ class TrainingService:
             feature_projection_size = int(
                 parameters.get("feature_projection_size", 256)
             )
+            face_roi_enabled = bool(parameters.get("face_roi_enabled", True))
+            face_roi_confidence_threshold = float(
+                parameters.get(
+                    "face_roi_confidence_threshold",
+                    settings.YOLO_FACE_CONFIDENCE_THRESHOLD,
+                )
+            )
+            face_roi_crop_padding = float(
+                parameters.get(
+                    "face_roi_crop_padding",
+                    settings.YOLO_FACE_CROP_PADDING,
+                )
+            )
+            temporal_bidirectional = bool(
+                parameters.get(
+                    "temporal_bidirectional", settings.TEMPORAL_BIDIRECTIONAL
+                )
+            )
+            temporal_attention_pooling = bool(
+                parameters.get(
+                    "temporal_attention_pooling",
+                    settings.TEMPORAL_ATTENTION_POOLING,
+                )
+            )
+            train_clip_overlap_ratio = float(
+                parameters.get(
+                    "train_clip_overlap_ratio",
+                    settings.TEMPORAL_TRAIN_CLIP_OVERLAP_RATIO,
+                )
+            )
+            val_clip_overlap_ratio = float(
+                parameters.get(
+                    "val_clip_overlap_ratio",
+                    settings.TEMPORAL_VAL_CLIP_OVERLAP_RATIO,
+                )
+            )
+            temporal_clip_filter_enabled = bool(
+                parameters.get(
+                    "temporal_clip_filter_enabled",
+                    settings.TEMPORAL_CLIP_FILTER_ENABLED,
+                )
+            )
+            temporal_clip_min_frame_std = float(
+                parameters.get(
+                    "temporal_clip_min_frame_std",
+                    settings.TEMPORAL_CLIP_MIN_FRAME_STD,
+                )
+            )
+            temporal_clip_min_motion_delta = float(
+                parameters.get(
+                    "temporal_clip_min_motion_delta",
+                    settings.TEMPORAL_CLIP_MIN_MOTION_DELTA,
+                )
+            )
             training_device = str(
                 parameters.get("training_device", settings.TRAINING_DEVICE)
             )
@@ -2285,6 +2477,14 @@ class TrainingService:
         temporal_hidden_size = max(32, temporal_hidden_size)
         temporal_num_layers = max(1, temporal_num_layers)
         feature_projection_size = max(32, feature_projection_size)
+        face_roi_confidence_threshold = min(
+            1.0, max(0.0, face_roi_confidence_threshold)
+        )
+        face_roi_crop_padding = min(1.0, max(0.0, face_roi_crop_padding))
+        train_clip_overlap_ratio = min(0.95, max(0.0, train_clip_overlap_ratio))
+        val_clip_overlap_ratio = min(0.95, max(0.0, val_clip_overlap_ratio))
+        temporal_clip_min_frame_std = max(0.0, temporal_clip_min_frame_std)
+        temporal_clip_min_motion_delta = max(0.0, temporal_clip_min_motion_delta)
         uses_temporal_context = self._dataset_has_temporal_media(dataset_path)
         training_mode = "video_hybrid" if uses_temporal_context else "image"
         preprocessing_progress_end = 25.0
@@ -2310,8 +2510,32 @@ class TrainingService:
                 "label_smoothing": label_smoothing,
                 "class_weight_strategy": class_weight_strategy,
                 "use_official_test_as_validation": use_official_test_as_validation,
+                "face_roi_enabled": face_roi_enabled,
+                "face_roi_confidence_threshold": face_roi_confidence_threshold,
+                "face_roi_crop_padding": face_roi_crop_padding,
+                "temporal_bidirectional": temporal_bidirectional,
+                "temporal_attention_pooling": temporal_attention_pooling,
+                "train_clip_overlap_ratio": train_clip_overlap_ratio,
+                "val_clip_overlap_ratio": val_clip_overlap_ratio,
+                "temporal_clip_filter_enabled": temporal_clip_filter_enabled,
+                "temporal_clip_min_frame_std": temporal_clip_min_frame_std,
+                "temporal_clip_min_motion_delta": temporal_clip_min_motion_delta,
             },
         )
+
+        face_roi_policy = self._build_face_roi_policy(
+            {
+                "face_roi_enabled": face_roi_enabled,
+                "face_roi_confidence_threshold": face_roi_confidence_threshold,
+                "face_roi_crop_padding": face_roi_crop_padding,
+            }
+        )
+        aggregation_policy = {
+            "video_aggregation_topk_ratio": settings.VIDEO_AGGREGATION_TOPK_RATIO,
+            "video_aggregation_mean_weight": settings.VIDEO_AGGREGATION_MEAN_WEIGHT,
+            "video_aggregation_peak_weight": settings.VIDEO_AGGREGATION_PEAK_WEIGHT,
+            "video_aggregation_persistence_weight": settings.VIDEO_AGGREGATION_PERSISTENCE_WEIGHT,
+        }
 
         device = self._resolve_training_device(training_device)
         self._configure_acceleration_backend(device)
@@ -2353,6 +2577,12 @@ class TrainingService:
                     frame_stride,
                     class_weight_strategy=class_weight_strategy,
                     use_official_test_as_validation=use_official_test_as_validation,
+                    face_roi_policy=face_roi_policy,
+                    train_clip_overlap_ratio=train_clip_overlap_ratio,
+                    val_clip_overlap_ratio=val_clip_overlap_ratio,
+                    temporal_clip_filter_enabled=temporal_clip_filter_enabled,
+                    temporal_clip_min_frame_std=temporal_clip_min_frame_std,
+                    temporal_clip_min_motion_delta=temporal_clip_min_motion_delta,
                     progress_callback=preprocessing_reporter,
                 )
             )
@@ -2364,6 +2594,8 @@ class TrainingService:
                 temporal_hidden_size=temporal_hidden_size,
                 temporal_num_layers=temporal_num_layers,
                 feature_projection_size=feature_projection_size,
+                temporal_bidirectional=temporal_bidirectional,
+                temporal_attention_pooling=temporal_attention_pooling,
             ).to(device)
         else:
             preprocessing_reporter(
@@ -2378,6 +2610,7 @@ class TrainingService:
                     validation_split,
                     class_weight_strategy=class_weight_strategy,
                     use_official_test_as_validation=use_official_test_as_validation,
+                    face_roi_policy=face_roi_policy,
                     progress_callback=preprocessing_reporter,
                 )
             )
@@ -2386,6 +2619,8 @@ class TrainingService:
                 num_classes=2,
                 pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
             ).to(device)
+
+        setattr(model, "video_aggregation_policy", aggregation_policy)
 
         preprocessing_reporter(
             1.0,
@@ -2414,6 +2649,7 @@ class TrainingService:
                 ),
                 "train_subgroup_counts": split_metadata.get("train_subgroup_counts"),
                 "val_subgroup_counts": split_metadata.get("val_subgroup_counts"),
+                "train_clip_filter": split_metadata.get("train_clip_filter"),
             },
         )
         optimizer = self._build_training_optimizer(
@@ -2644,8 +2880,42 @@ class TrainingService:
                             "temporal_hidden_size": temporal_hidden_size,
                             "temporal_num_layers": temporal_num_layers,
                             "feature_projection_size": feature_projection_size,
+                            "temporal_bidirectional": temporal_bidirectional,
+                            "temporal_attention_pooling": temporal_attention_pooling,
                         }
                     )
+                checkpoint_payload.update(
+                    {
+                        "face_roi_enabled": face_roi_enabled,
+                        "yolo_face_model_path": settings.YOLO_FACE_MODEL_PATH,
+                        "face_roi_confidence_threshold": face_roi_confidence_threshold,
+                        "face_roi_crop_padding": face_roi_crop_padding,
+                        "face_roi_policy_version": face_roi_policy[
+                            "face_roi_policy_version"
+                        ],
+                        "face_roi_selection_policy": face_roi_policy[
+                            "face_roi_selection_policy"
+                        ],
+                        "video_aggregation_topk_ratio": aggregation_policy[
+                            "video_aggregation_topk_ratio"
+                        ],
+                        "video_aggregation_mean_weight": aggregation_policy[
+                            "video_aggregation_mean_weight"
+                        ],
+                        "video_aggregation_peak_weight": aggregation_policy[
+                            "video_aggregation_peak_weight"
+                        ],
+                        "video_aggregation_persistence_weight": aggregation_policy[
+                            "video_aggregation_persistence_weight"
+                        ],
+                        "train_clip_overlap_ratio": train_clip_overlap_ratio,
+                        "val_clip_overlap_ratio": val_clip_overlap_ratio,
+                        "train_clip_filter": split_metadata.get("train_clip_filter"),
+                        "temporal_clip_filter_enabled": temporal_clip_filter_enabled,
+                        "temporal_clip_min_frame_std": temporal_clip_min_frame_std,
+                        "temporal_clip_min_motion_delta": temporal_clip_min_motion_delta,
+                    }
+                )
                 torch.save(checkpoint_payload, str(best_checkpoint_path))
             else:
                 epochs_without_improvement += 1
@@ -2740,6 +3010,49 @@ class TrainingService:
             hidden_size = int(parameters.get("hidden_size", 256))
             num_layers = int(parameters.get("num_layers", 1))
             frame_projection_size = int(parameters.get("frame_projection_size", 128))
+            face_roi_enabled = bool(parameters.get("face_roi_enabled", True))
+            face_roi_confidence_threshold = float(
+                parameters.get(
+                    "face_roi_confidence_threshold",
+                    settings.YOLO_FACE_CONFIDENCE_THRESHOLD,
+                )
+            )
+            face_roi_crop_padding = float(
+                parameters.get(
+                    "face_roi_crop_padding",
+                    settings.YOLO_FACE_CROP_PADDING,
+                )
+            )
+            train_clip_overlap_ratio = float(
+                parameters.get(
+                    "train_clip_overlap_ratio",
+                    settings.TEMPORAL_TRAIN_CLIP_OVERLAP_RATIO,
+                )
+            )
+            val_clip_overlap_ratio = float(
+                parameters.get(
+                    "val_clip_overlap_ratio",
+                    settings.TEMPORAL_VAL_CLIP_OVERLAP_RATIO,
+                )
+            )
+            temporal_clip_filter_enabled = bool(
+                parameters.get(
+                    "temporal_clip_filter_enabled",
+                    settings.TEMPORAL_CLIP_FILTER_ENABLED,
+                )
+            )
+            temporal_clip_min_frame_std = float(
+                parameters.get(
+                    "temporal_clip_min_frame_std",
+                    settings.TEMPORAL_CLIP_MIN_FRAME_STD,
+                )
+            )
+            temporal_clip_min_motion_delta = float(
+                parameters.get(
+                    "temporal_clip_min_motion_delta",
+                    settings.TEMPORAL_CLIP_MIN_MOTION_DELTA,
+                )
+            )
             training_device = str(
                 parameters.get("training_device", settings.TRAINING_DEVICE)
             )
@@ -2751,6 +3064,14 @@ class TrainingService:
         hidden_size = max(64, hidden_size)
         num_layers = max(1, num_layers)
         frame_projection_size = max(32, frame_projection_size)
+        face_roi_confidence_threshold = min(
+            1.0, max(0.0, face_roi_confidence_threshold)
+        )
+        face_roi_crop_padding = min(1.0, max(0.0, face_roi_crop_padding))
+        train_clip_overlap_ratio = min(0.95, max(0.0, train_clip_overlap_ratio))
+        val_clip_overlap_ratio = min(0.95, max(0.0, val_clip_overlap_ratio))
+        temporal_clip_min_frame_std = max(0.0, temporal_clip_min_frame_std)
+        temporal_clip_min_motion_delta = max(0.0, temporal_clip_min_motion_delta)
         preprocessing_progress_end = 25.0
         training_progress_span = 99.0 - preprocessing_progress_end
         preprocessing_reporter = self._create_phase_progress_reporter(
@@ -2774,8 +3095,29 @@ class TrainingService:
                 "label_smoothing": label_smoothing,
                 "class_weight_strategy": class_weight_strategy,
                 "use_official_test_as_validation": use_official_test_as_validation,
+                "face_roi_enabled": face_roi_enabled,
+                "face_roi_confidence_threshold": face_roi_confidence_threshold,
+                "face_roi_crop_padding": face_roi_crop_padding,
+                "train_clip_overlap_ratio": train_clip_overlap_ratio,
+                "val_clip_overlap_ratio": val_clip_overlap_ratio,
+                "temporal_clip_filter_enabled": temporal_clip_filter_enabled,
+                "temporal_clip_min_frame_std": temporal_clip_min_frame_std,
+                "temporal_clip_min_motion_delta": temporal_clip_min_motion_delta,
             },
         )
+        face_roi_policy = self._build_face_roi_policy(
+            {
+                "face_roi_enabled": face_roi_enabled,
+                "face_roi_confidence_threshold": face_roi_confidence_threshold,
+                "face_roi_crop_padding": face_roi_crop_padding,
+            }
+        )
+        aggregation_policy = {
+            "video_aggregation_topk_ratio": settings.VIDEO_AGGREGATION_TOPK_RATIO,
+            "video_aggregation_mean_weight": settings.VIDEO_AGGREGATION_MEAN_WEIGHT,
+            "video_aggregation_peak_weight": settings.VIDEO_AGGREGATION_PEAK_WEIGHT,
+            "video_aggregation_persistence_weight": settings.VIDEO_AGGREGATION_PERSISTENCE_WEIGHT,
+        }
         preprocessing_reporter(
             0.05,
             f"正在准备视频片段（长度 {sequence_length}，步长 {frame_stride}）",
@@ -2810,6 +3152,12 @@ class TrainingService:
                 frame_stride,
                 class_weight_strategy=class_weight_strategy,
                 use_official_test_as_validation=use_official_test_as_validation,
+                face_roi_policy=face_roi_policy,
+                train_clip_overlap_ratio=train_clip_overlap_ratio,
+                val_clip_overlap_ratio=val_clip_overlap_ratio,
+                temporal_clip_filter_enabled=temporal_clip_filter_enabled,
+                temporal_clip_min_frame_std=temporal_clip_min_frame_std,
+                temporal_clip_min_motion_delta=temporal_clip_min_motion_delta,
                 progress_callback=preprocessing_reporter,
             )
         )
@@ -2833,6 +3181,7 @@ class TrainingService:
             frame_projection_size=frame_projection_size,
             pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
         ).to(device)
+        setattr(model, "video_aggregation_policy", aggregation_policy)
         amp_enabled = device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
         criterion = self._build_training_criterion(
@@ -2851,6 +3200,7 @@ class TrainingService:
                 ),
                 "train_subgroup_counts": split_metadata.get("train_subgroup_counts"),
                 "val_subgroup_counts": split_metadata.get("val_subgroup_counts"),
+                "train_clip_filter": split_metadata.get("train_clip_filter"),
             },
         )
         optimizer = self._build_training_optimizer(
@@ -3079,6 +3429,34 @@ class TrainingService:
                         "frame_stride": frame_stride,
                         "video_temporal_enabled": True,
                         "training_mode": "sequence_temporal",
+                        "face_roi_enabled": face_roi_enabled,
+                        "yolo_face_model_path": settings.YOLO_FACE_MODEL_PATH,
+                        "face_roi_confidence_threshold": face_roi_confidence_threshold,
+                        "face_roi_crop_padding": face_roi_crop_padding,
+                        "face_roi_policy_version": face_roi_policy[
+                            "face_roi_policy_version"
+                        ],
+                        "face_roi_selection_policy": face_roi_policy[
+                            "face_roi_selection_policy"
+                        ],
+                        "video_aggregation_topk_ratio": aggregation_policy[
+                            "video_aggregation_topk_ratio"
+                        ],
+                        "video_aggregation_mean_weight": aggregation_policy[
+                            "video_aggregation_mean_weight"
+                        ],
+                        "video_aggregation_peak_weight": aggregation_policy[
+                            "video_aggregation_peak_weight"
+                        ],
+                        "video_aggregation_persistence_weight": aggregation_policy[
+                            "video_aggregation_persistence_weight"
+                        ],
+                        "train_clip_overlap_ratio": train_clip_overlap_ratio,
+                        "val_clip_overlap_ratio": val_clip_overlap_ratio,
+                        "train_clip_filter": split_metadata.get("train_clip_filter"),
+                        "temporal_clip_filter_enabled": temporal_clip_filter_enabled,
+                        "temporal_clip_min_frame_std": temporal_clip_min_frame_std,
+                        "temporal_clip_min_motion_delta": temporal_clip_min_motion_delta,
                         "saved_at": datetime.now().isoformat(),
                     },
                     str(best_checkpoint_path),
@@ -3209,6 +3587,7 @@ class TrainingService:
         validation_split: float,
         class_weight_strategy: str = "balanced",
         use_official_test_as_validation: bool = False,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
@@ -3449,12 +3828,17 @@ class TrainingService:
             )
 
         train_dataset = ImageClassificationDataset(
-            train_samples, transform=train_transform
+            train_samples,
+            transform=train_transform,
+            roi_processor=self._face_roi_processor,
+            roi_policy=face_roi_policy,
         )
         val_dataset = ImageClassificationDataset(
             val_samples,
             transform=val_transform,
             include_source_id=True,
+            roi_processor=self._face_roi_processor,
+            roi_policy=face_roi_policy,
         )
         train_sampler = self._build_balanced_sampler(
             [sample.label for sample in train_samples],
@@ -3500,6 +3884,12 @@ class TrainingService:
         frame_stride: int,
         class_weight_strategy: str = "balanced",
         use_official_test_as_validation: bool = False,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
+        train_clip_overlap_ratio: float = 0.7,
+        val_clip_overlap_ratio: float = 0.35,
+        temporal_clip_filter_enabled: bool = True,
+        temporal_clip_min_frame_std: float = 6.0,
+        temporal_clip_min_motion_delta: float = 2.0,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
@@ -3513,6 +3903,12 @@ class TrainingService:
             frame_stride,
             class_weight_strategy=class_weight_strategy,
             use_official_test_as_validation=use_official_test_as_validation,
+            face_roi_policy=face_roi_policy,
+            train_clip_overlap_ratio=train_clip_overlap_ratio,
+            val_clip_overlap_ratio=val_clip_overlap_ratio,
+            temporal_clip_filter_enabled=temporal_clip_filter_enabled,
+            temporal_clip_min_frame_std=temporal_clip_min_frame_std,
+            temporal_clip_min_motion_delta=temporal_clip_min_motion_delta,
             progress_callback=progress_callback,
         )
 
@@ -3525,6 +3921,12 @@ class TrainingService:
         frame_stride: int,
         class_weight_strategy: str = "balanced",
         use_official_test_as_validation: bool = False,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
+        train_clip_overlap_ratio: float = 0.7,
+        val_clip_overlap_ratio: float = 0.35,
+        temporal_clip_filter_enabled: bool = True,
+        temporal_clip_min_frame_std: float = 6.0,
+        temporal_clip_min_motion_delta: float = 2.0,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
@@ -3698,21 +4100,41 @@ class TrainingService:
             sequence_length,
             frame_stride,
             input_size,
+            face_roi_policy=face_roi_policy,
             progress_callback=train_clip_progress,
             progress_label="正在生成训练集时序片段",
             max_clips_per_source=train_clip_budget,
-            clip_overlap_ratio=0.7,
+            clip_overlap_ratio=train_clip_overlap_ratio,
         )
         val_samples = self._expand_temporal_sources_to_clips(
             val_sources,
             sequence_length,
             frame_stride,
             input_size,
+            face_roi_policy=face_roi_policy,
             progress_callback=val_clip_progress,
             progress_label="正在生成验证集时序片段",
             max_clips_per_source=val_clip_budget,
-            clip_overlap_ratio=0.35,
+            clip_overlap_ratio=val_clip_overlap_ratio,
         )
+
+        clip_filter_metadata = {
+            "kept": len(train_samples),
+            "dropped": 0,
+            "min_frame_std": float(temporal_clip_min_frame_std),
+            "min_motion_delta": float(temporal_clip_min_motion_delta),
+        }
+        if temporal_clip_filter_enabled:
+            filter_progress = self._chain_progress_reporter(
+                progress_callback, 0.93, 0.96
+            )
+            train_samples, clip_filter_metadata = self._filter_temporal_clip_samples(
+                train_samples,
+                min_frame_std=temporal_clip_min_frame_std,
+                min_motion_delta=temporal_clip_min_motion_delta,
+                progress_callback=filter_progress,
+            )
+        split_metadata["train_clip_filter"] = clip_filter_metadata
 
         if not train_samples:
             raise ValueError("No labeled training clips found")
@@ -3737,11 +4159,15 @@ class TrainingService:
             train_samples,
             transform=train_transform,
             augment=True,
+            roi_processor=self._face_roi_processor,
+            roi_policy=face_roi_policy,
         )
         val_dataset = SequenceClassificationDataset(
             val_samples,
             transform=val_transform,
             include_source_id=True,
+            roi_processor=self._face_roi_processor,
+            roi_policy=face_roi_policy,
         )
         train_sampler = self._build_balanced_sampler(
             [sample.label for sample in train_samples],
@@ -3780,6 +4206,8 @@ class TrainingService:
                     "current": len(train_dataset) + len(val_dataset),
                     "total": len(train_dataset) + len(val_dataset),
                     "unit": "clips",
+                    "clip_filter_kept": clip_filter_metadata["kept"],
+                    "clip_filter_dropped": clip_filter_metadata["dropped"],
                 },
             )
 
@@ -3852,6 +4280,7 @@ class TrainingService:
         sequence_length: int,
         frame_stride: int,
         input_size: int,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
         max_clips_per_source: Optional[int] = None,
         clip_overlap_ratio: float = 0.5,
         progress_callback: Optional[
@@ -3876,6 +4305,7 @@ class TrainingService:
                         frame_paths=[source.path] * sequence_length,
                         label=source.label,
                         source_id=source_id,
+                        roi_materialized=False,
                     )
                 )
             elif source.kind == "frame_group" and source.frame_paths:
@@ -3904,6 +4334,7 @@ class TrainingService:
                         sequence_length,
                         frame_stride,
                         input_size,
+                        face_roi_policy=face_roi_policy,
                         max_clips=max_clips_per_source,
                         overlap_ratio=clip_overlap_ratio,
                         progress_callback=source_progress,
@@ -3974,6 +4405,7 @@ class TrainingService:
         sequence_length: int,
         frame_stride: int,
         input_size: int,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
         max_clips: Optional[int] = None,
         overlap_ratio: float = 0.5,
         progress_callback: Optional[
@@ -4017,6 +4449,7 @@ class TrainingService:
                             frame_index,
                             cache_root,
                             input_size,
+                            face_roi_policy=face_roi_policy,
                         )
                     )
                 except Exception as exc:
@@ -4035,6 +4468,7 @@ class TrainingService:
                         frame_paths=frame_paths,
                         label=label,
                         source_id=source_id,
+                        roi_materialized=bool(face_roi_policy),
                     )
                 )
 
@@ -4121,6 +4555,7 @@ class TrainingService:
                     frame_paths=padded,
                     label=label,
                     source_id=source_id,
+                    roi_materialized=False,
                 )
             ]
 
@@ -4134,6 +4569,7 @@ class TrainingService:
                     frame_paths=clip,
                     label=label,
                     source_id=source_id,
+                    roi_materialized=False,
                 )
             ]
 
@@ -4159,6 +4595,7 @@ class TrainingService:
                     frame_paths=clip,
                     label=label,
                     source_id=source_id,
+                    roi_materialized=False,
                 )
             )
 
@@ -4529,6 +4966,12 @@ class TrainingService:
         grouped_labels: Dict[str, int] = {}
         sample_subgroup_logits: Dict[str, List[torch.Tensor]] = {}
         sample_subgroup_labels: Dict[str, List[int]] = {}
+        aggregation_policy = getattr(model, "video_aggregation_policy", None) or {
+            "video_aggregation_topk_ratio": settings.VIDEO_AGGREGATION_TOPK_RATIO,
+            "video_aggregation_mean_weight": settings.VIDEO_AGGREGATION_MEAN_WEIGHT,
+            "video_aggregation_peak_weight": settings.VIDEO_AGGREGATION_PEAK_WEIGHT,
+            "video_aggregation_persistence_weight": settings.VIDEO_AGGREGATION_PERSISTENCE_WEIGHT,
+        }
 
         with torch.no_grad():
             for batch in dataloader:
@@ -4609,7 +5052,17 @@ class TrainingService:
             video_subgroup_labels: Dict[str, List[int]] = {}
             aggregated_logits = torch.stack(
                 [
-                    torch.stack(grouped_logits[source_id], dim=0).mean(dim=0)
+                    aggregate_logit_sequence(
+                        grouped_logits[source_id],
+                        confidence_threshold=settings.CONFIDENCE_THRESHOLD,
+                        topk_ratio=aggregation_policy["video_aggregation_topk_ratio"],
+                        mean_weight=aggregation_policy["video_aggregation_mean_weight"],
+                        peak_weight=aggregation_policy["video_aggregation_peak_weight"],
+                        persistence_weight=aggregation_policy[
+                            "video_aggregation_persistence_weight"
+                        ],
+                        device=device,
+                    )[0]
                     for source_id in ordered_source_ids
                 ],
                 dim=0,
@@ -4900,6 +5353,121 @@ class TrainingService:
             class_weight_strategy=class_weight_strategy,
             use_official_test_as_validation=use_official_test_as_validation,
             training_device=training_device,
+            sequence_length=int(
+                active_meta.get(
+                    "sequence_length", checkpoint_parameters.get("sequence_length", 8)
+                )
+                or 8
+            ),
+            frame_stride=int(
+                active_meta.get(
+                    "frame_stride", checkpoint_parameters.get("frame_stride", 2)
+                )
+                or 2
+            ),
+            temporal_hidden_size=int(
+                active_meta.get(
+                    "temporal_hidden_size",
+                    checkpoint_parameters.get("temporal_hidden_size", 256),
+                )
+                or 256
+            ),
+            temporal_num_layers=int(
+                active_meta.get(
+                    "temporal_num_layers",
+                    checkpoint_parameters.get("temporal_num_layers", 2),
+                )
+                or 2
+            ),
+            feature_projection_size=int(
+                active_meta.get(
+                    "feature_projection_size",
+                    checkpoint_parameters.get("feature_projection_size", 256),
+                )
+                or 256
+            ),
+            face_roi_enabled=bool(
+                active_meta.get(
+                    "face_roi_enabled",
+                    checkpoint_parameters.get("face_roi_enabled", True),
+                )
+            ),
+            face_roi_confidence_threshold=float(
+                active_meta.get(
+                    "face_roi_confidence_threshold",
+                    checkpoint_parameters.get("face_roi_confidence_threshold", 0.35),
+                )
+                or 0.35
+            ),
+            face_roi_crop_padding=float(
+                active_meta.get(
+                    "face_roi_crop_padding",
+                    checkpoint_parameters.get("face_roi_crop_padding", 0.18),
+                )
+                or 0.18
+            ),
+            temporal_bidirectional=bool(
+                active_meta.get(
+                    "temporal_bidirectional",
+                    checkpoint_parameters.get(
+                        "temporal_bidirectional", settings.TEMPORAL_BIDIRECTIONAL
+                    ),
+                )
+            ),
+            temporal_attention_pooling=bool(
+                active_meta.get(
+                    "temporal_attention_pooling",
+                    checkpoint_parameters.get(
+                        "temporal_attention_pooling",
+                        settings.TEMPORAL_ATTENTION_POOLING,
+                    ),
+                )
+            ),
+            train_clip_overlap_ratio=float(
+                active_meta.get(
+                    "train_clip_overlap_ratio",
+                    checkpoint_parameters.get(
+                        "train_clip_overlap_ratio",
+                        settings.TEMPORAL_TRAIN_CLIP_OVERLAP_RATIO,
+                    ),
+                )
+            ),
+            val_clip_overlap_ratio=float(
+                active_meta.get(
+                    "val_clip_overlap_ratio",
+                    checkpoint_parameters.get(
+                        "val_clip_overlap_ratio",
+                        settings.TEMPORAL_VAL_CLIP_OVERLAP_RATIO,
+                    ),
+                )
+            ),
+            temporal_clip_filter_enabled=bool(
+                active_meta.get(
+                    "temporal_clip_filter_enabled",
+                    checkpoint_parameters.get(
+                        "temporal_clip_filter_enabled",
+                        settings.TEMPORAL_CLIP_FILTER_ENABLED,
+                    ),
+                )
+            ),
+            temporal_clip_min_frame_std=float(
+                active_meta.get(
+                    "temporal_clip_min_frame_std",
+                    checkpoint_parameters.get(
+                        "temporal_clip_min_frame_std",
+                        settings.TEMPORAL_CLIP_MIN_FRAME_STD,
+                    ),
+                )
+            ),
+            temporal_clip_min_motion_delta=float(
+                active_meta.get(
+                    "temporal_clip_min_motion_delta",
+                    checkpoint_parameters.get(
+                        "temporal_clip_min_motion_delta",
+                        settings.TEMPORAL_CLIP_MIN_MOTION_DELTA,
+                    ),
+                )
+            ),
         )
 
         results = None
@@ -5052,6 +5620,7 @@ class TrainingService:
             ),
             "train_subgroup_counts": checkpoint.get("train_subgroup_counts"),
             "val_subgroup_counts": checkpoint.get("val_subgroup_counts"),
+            "train_clip_filter": checkpoint.get("train_clip_filter"),
             "early_stopping": checkpoint.get("early_stopping"),
             "patience": checkpoint.get("patience"),
             "early_stopping_min_delta": checkpoint.get("early_stopping_min_delta"),
@@ -5065,6 +5634,39 @@ class TrainingService:
             "temporal_hidden_size": checkpoint.get("temporal_hidden_size"),
             "temporal_num_layers": checkpoint.get("temporal_num_layers"),
             "feature_projection_size": checkpoint.get("feature_projection_size"),
+            "temporal_bidirectional": checkpoint.get("temporal_bidirectional"),
+            "temporal_attention_pooling": checkpoint.get("temporal_attention_pooling"),
+            "face_roi_enabled": checkpoint.get("face_roi_enabled"),
+            "yolo_face_model_path": checkpoint.get("yolo_face_model_path"),
+            "face_roi_confidence_threshold": checkpoint.get(
+                "face_roi_confidence_threshold"
+            ),
+            "face_roi_crop_padding": checkpoint.get("face_roi_crop_padding"),
+            "face_roi_policy_version": checkpoint.get("face_roi_policy_version"),
+            "face_roi_selection_policy": checkpoint.get("face_roi_selection_policy"),
+            "video_aggregation_topk_ratio": checkpoint.get(
+                "video_aggregation_topk_ratio"
+            ),
+            "video_aggregation_mean_weight": checkpoint.get(
+                "video_aggregation_mean_weight"
+            ),
+            "video_aggregation_peak_weight": checkpoint.get(
+                "video_aggregation_peak_weight"
+            ),
+            "video_aggregation_persistence_weight": checkpoint.get(
+                "video_aggregation_persistence_weight"
+            ),
+            "train_clip_overlap_ratio": checkpoint.get("train_clip_overlap_ratio"),
+            "val_clip_overlap_ratio": checkpoint.get("val_clip_overlap_ratio"),
+            "temporal_clip_filter_enabled": checkpoint.get(
+                "temporal_clip_filter_enabled"
+            ),
+            "temporal_clip_min_frame_std": checkpoint.get(
+                "temporal_clip_min_frame_std"
+            ),
+            "temporal_clip_min_motion_delta": checkpoint.get(
+                "temporal_clip_min_motion_delta"
+            ),
             "frame_projection_size": checkpoint.get("frame_projection_size"),
             "best_epoch": checkpoint.get("best_epoch"),
             "epochs_trained": checkpoint.get("epochs_trained"),
