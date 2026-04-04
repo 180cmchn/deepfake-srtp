@@ -147,6 +147,23 @@ class Settings(BaseSettings):
     FRAME_EXTRACTION_INTERVAL: int = 4
     MAX_FRAMES_PER_VIDEO: int = 20
     FACE_DETECTION_CONFIDENCE: float = 0.9
+    YOLO_FACE_ENABLED: bool = True
+    YOLO_FACE_MODEL_PATH: Optional[str] = None
+    YOLO_FACE_CONFIDENCE_THRESHOLD: float = 0.35
+    YOLO_FACE_CROP_PADDING: float = 0.18
+    YOLO_FACE_POLICY_VERSION: str = "single_face_v1"
+    YOLO_FACE_SELECTION_POLICY: str = "confidence_area"
+    TEMPORAL_BIDIRECTIONAL: bool = True
+    TEMPORAL_ATTENTION_POOLING: bool = True
+    TEMPORAL_TRAIN_CLIP_OVERLAP_RATIO: float = 0.7
+    TEMPORAL_VAL_CLIP_OVERLAP_RATIO: float = 0.35
+    TEMPORAL_CLIP_FILTER_ENABLED: bool = True
+    TEMPORAL_CLIP_MIN_FRAME_STD: float = 6.0
+    TEMPORAL_CLIP_MIN_MOTION_DELTA: float = 2.0
+    VIDEO_AGGREGATION_TOPK_RATIO: float = 0.3
+    VIDEO_AGGREGATION_MEAN_WEIGHT: float = 0.5
+    VIDEO_AGGREGATION_PEAK_WEIGHT: float = 0.3
+    VIDEO_AGGREGATION_PERSISTENCE_WEIGHT: float = 0.2
 
     @field_validator("MAX_CONCURRENT_TRAINING_JOBS")
     @classmethod
@@ -167,6 +184,37 @@ class Settings(BaseSettings):
     def validate_confidence_threshold(cls, v):
         if not 0.0 <= v <= 1.0:
             raise ValueError("CONFIDENCE_THRESHOLD must be between 0.0 and 1.0")
+        return v
+
+    @field_validator(
+        "YOLO_FACE_CONFIDENCE_THRESHOLD",
+        "TEMPORAL_TRAIN_CLIP_OVERLAP_RATIO",
+        "TEMPORAL_VAL_CLIP_OVERLAP_RATIO",
+        "VIDEO_AGGREGATION_TOPK_RATIO",
+        "VIDEO_AGGREGATION_MEAN_WEIGHT",
+        "VIDEO_AGGREGATION_PEAK_WEIGHT",
+        "VIDEO_AGGREGATION_PERSISTENCE_WEIGHT",
+    )
+    @classmethod
+    def validate_unit_interval_values(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(
+                "configured ratio/weight values must be between 0.0 and 1.0"
+            )
+        return v
+
+    @field_validator("YOLO_FACE_CROP_PADDING")
+    @classmethod
+    def validate_face_crop_padding(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("YOLO_FACE_CROP_PADDING must be between 0.0 and 1.0")
+        return v
+
+    @field_validator("TEMPORAL_CLIP_MIN_FRAME_STD", "TEMPORAL_CLIP_MIN_MOTION_DELTA")
+    @classmethod
+    def validate_non_negative_temporal_quality_thresholds(cls, v):
+        if v < 0.0:
+            raise ValueError("temporal clip quality thresholds must be non-negative")
         return v
 
     @field_validator("DEFAULT_LEARNING_RATE")
@@ -212,6 +260,10 @@ class Settings(BaseSettings):
         "DEBUG",
         "MODEL_USE_PRETRAINED_WEIGHTS",
         "MODEL_ALLOW_RANDOM_INIT_FALLBACK",
+        "YOLO_FACE_ENABLED",
+        "TEMPORAL_CLIP_FILTER_ENABLED",
+        "TEMPORAL_BIDIRECTIONAL",
+        "TEMPORAL_ATTENTION_POOLING",
         mode="before",
     )
     @classmethod
