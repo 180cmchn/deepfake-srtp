@@ -1277,6 +1277,7 @@ class DetectionService:
             "video_aggregation_persistence_weight",
             "temporal_bidirectional",
             "temporal_attention_pooling",
+            "yolo_model_variant",
         ):
             if key in loaded_model and loaded_model.get(key) is not None:
                 model_info[key] = loaded_model.get(key)
@@ -1469,6 +1470,12 @@ class DetectionService:
             "temporal_attention_pooling": checkpoint.get(
                 "temporal_attention_pooling",
                 (model_record.parameters or {}).get("temporal_attention_pooling"),
+            ),
+            "yolo_model_variant": checkpoint.get(
+                "yolo_model_variant",
+                (model_record.parameters or {}).get(
+                    "yolo_model_variant", settings.YOLO_MODEL_VARIANT
+                ),
             ),
         }
         loaded["model"].eval()
@@ -2300,6 +2307,11 @@ class DetectionService:
         kwargs: Dict[str, Any] = {
             "num_classes": checkpoint.get("num_classes", model_record.num_classes or 2)
         }
+        if model_type == "yolo":
+            kwargs["yolo_model_variant"] = checkpoint.get(
+                "yolo_model_variant",
+                parameters.get("yolo_model_variant", settings.YOLO_MODEL_VARIANT),
+            )
         if checkpoint.get("video_temporal_enabled") and model_type != "lrcn":
             kwargs.update(
                 {

@@ -1659,6 +1659,7 @@ class TrainingService:
                     "temporal_attention_pooling": parameters.temporal_attention_pooling,
                     "train_clip_overlap_ratio": parameters.train_clip_overlap_ratio,
                     "val_clip_overlap_ratio": parameters.val_clip_overlap_ratio,
+                    "yolo_model_variant": parameters.yolo_model_variant,
                 },
             )
 
@@ -1859,6 +1860,12 @@ class TrainingService:
             if current_accuracy is None:
                 current_accuracy = job.accuracy
 
+            estimated_time_remaining = self._estimate_time_remaining(
+                status=job.status,
+                progress=job.progress,
+                started_at=job.started_at,
+            )
+
             return TrainingProgress(
                 job_id=job.id,
                 status=self._normalize_job_status(job.status),
@@ -1869,7 +1876,7 @@ class TrainingService:
                 total_epochs=job.epochs,
                 current_loss=current_loss,
                 current_accuracy=current_accuracy,
-                estimated_time_remaining=None,  # TODO: Calculate ETA
+                estimated_time_remaining=estimated_time_remaining,
                 message=message,
                 preprocessing_stage=preprocessing_stage,
                 preprocessing_progress=preprocessing_progress,
@@ -2053,6 +2060,9 @@ class TrainingService:
                     ),
                     "training_device": pending_meta.get(
                         "requested_device", settings.TRAINING_DEVICE
+                    ),
+                    "yolo_model_variant": pending_meta.get(
+                        "yolo_model_variant", settings.YOLO_MODEL_VARIANT
                     ),
                 },
             )
@@ -2468,6 +2478,9 @@ class TrainingService:
                     settings.TEMPORAL_CLIP_MIN_MOTION_DELTA,
                 )
             )
+            yolo_model_variant = str(
+                parameters.get("yolo_model_variant", settings.YOLO_MODEL_VARIANT)
+            )
             training_device = str(
                 parameters.get("training_device", settings.TRAINING_DEVICE)
             )
@@ -2520,6 +2533,7 @@ class TrainingService:
                 "temporal_clip_filter_enabled": temporal_clip_filter_enabled,
                 "temporal_clip_min_frame_std": temporal_clip_min_frame_std,
                 "temporal_clip_min_motion_delta": temporal_clip_min_motion_delta,
+                "yolo_model_variant": yolo_model_variant,
             },
         )
 
@@ -2596,6 +2610,7 @@ class TrainingService:
                 feature_projection_size=feature_projection_size,
                 temporal_bidirectional=temporal_bidirectional,
                 temporal_attention_pooling=temporal_attention_pooling,
+                yolo_model_variant=yolo_model_variant,
             ).to(device)
         else:
             preprocessing_reporter(
@@ -2618,6 +2633,7 @@ class TrainingService:
                 model_type=model_type,
                 num_classes=2,
                 pretrained=settings.MODEL_USE_PRETRAINED_WEIGHTS,
+                yolo_model_variant=yolo_model_variant,
             ).to(device)
 
         setattr(model, "video_aggregation_policy", aggregation_policy)
@@ -2914,6 +2930,7 @@ class TrainingService:
                         "temporal_clip_filter_enabled": temporal_clip_filter_enabled,
                         "temporal_clip_min_frame_std": temporal_clip_min_frame_std,
                         "temporal_clip_min_motion_delta": temporal_clip_min_motion_delta,
+                        "yolo_model_variant": yolo_model_variant,
                     }
                 )
                 torch.save(checkpoint_payload, str(best_checkpoint_path))
@@ -5336,6 +5353,12 @@ class TrainingService:
             elif job.status == JobStatus.PENDING.value:
                 progress_message = "等待开始训练"
 
+        estimated_time_remaining = self._estimate_time_remaining(
+            status=job.status,
+            progress=job.progress,
+            started_at=job.started_at,
+        )
+
         parameters = TrainingParameters(
             epochs=job.epochs if job.epochs is not None else settings.DEFAULT_EPOCHS,
             learning_rate=job.learning_rate
@@ -5496,6 +5519,7 @@ class TrainingService:
             dataset_path=job.dataset_path,
             current_epoch=current_epoch,
             total_epochs=total_epochs,
+            estimated_time_remaining=estimated_time_remaining,
             progress_message=progress_message,
             preprocessing_stage=preprocessing_stage,
             preprocessing_progress=preprocessing_progress,
@@ -5512,6 +5536,34 @@ class TrainingService:
             completed_at=job.completed_at,
             error_message=job.error_message,
         )
+
+    def _estimate_time_remaining(
+        self,
+        *,
+        status: Optional[str],
+        progress: Optional[float],
+        started_at: Optional[datetime],
+    ) -> Optional[int]:
+        normalized_status = self._normalize_job_status(status)
+        if normalized_status != JobStatus.RUNNING:
+            return None
+        if started_at is None:
+            return None
+
+        progress_value = float(progress or 0.0)
+        if progress_value <= 0.0 or progress_value >= 100.0:
+            return None
+
+        elapsed_seconds = max(0.0, (datetime.now() - started_at).total_seconds())
+        if elapsed_seconds <= 0.0:
+            return None
+
+        remaining_seconds = elapsed_seconds * (
+            (100.0 - progress_value) / progress_value
+        )
+        if remaining_seconds <= 0.0:
+            return 0
+        return int(round(remaining_seconds))
 
     def _normalize_job_status(self, raw_status: Optional[str]) -> JobStatus:
         """Normalize persisted status values to supported enum values."""
@@ -5667,6 +5719,7 @@ class TrainingService:
             "temporal_clip_min_motion_delta": checkpoint.get(
                 "temporal_clip_min_motion_delta"
             ),
+            "yolo_model_variant": checkpoint.get("yolo_model_variant"),
             "frame_projection_size": checkpoint.get("frame_projection_size"),
             "best_epoch": checkpoint.get("best_epoch"),
             "epochs_trained": checkpoint.get("epochs_trained"),
