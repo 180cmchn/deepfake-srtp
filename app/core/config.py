@@ -12,6 +12,9 @@ import os
 load_dotenv()
 
 
+DEFAULT_SUPPORTED_MODELS = ("vgg", "lrcn", "swin", "vit", "resnet", "yolo")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=True, extra="allow"
@@ -105,11 +108,12 @@ class Settings(BaseSettings):
 
     # Model Settings
     DEFAULT_MODEL_TYPE: str = "vgg"
-    _SUPPORTED_MODELS: str = "vgg,lrcn,swin,vit,resnet"
+    _SUPPORTED_MODELS: str = ",".join(DEFAULT_SUPPORTED_MODELS)
     MODEL_BATCH_SIZE: int = 32
     MODEL_INPUT_SIZE: int = 224
     MODEL_USE_PRETRAINED_WEIGHTS: bool = True
     MODEL_ALLOW_RANDOM_INIT_FALLBACK: bool = True
+    YOLO_MODEL_VARIANT: str = "yolo11n-cls"
 
     @property
     def SUPPORTED_MODELS(self) -> List[str]:
@@ -123,9 +127,11 @@ class Settings(BaseSettings):
                 model.strip() for model in models_str.split(",") if model.strip()
             ]
         else:
-            self._supported_models_cache = ["vgg", "lrcn", "swin", "vit", "resnet"]
+            self._supported_models_cache = [
+                str(model) for model in DEFAULT_SUPPORTED_MODELS
+            ]
 
-        return self._supported_models_cache
+        return [str(model) for model in self._supported_models_cache]
 
     # Training Settings
     MAX_CONCURRENT_TRAINING_JOBS: int = 2
@@ -297,3 +303,7 @@ class Settings(BaseSettings):
 
 # Initialize settings instance
 settings = Settings()
+
+
+def get_supported_model_types() -> List[str]:
+    return [str(model) for model in settings.SUPPORTED_MODELS]

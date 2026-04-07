@@ -247,7 +247,7 @@ class ModelService:
 
             # Models by type
             models_by_type = {}
-            for model_type in ["vgg", "lrcn", "swin", "vit", "resnet"]:
+            for model_type in settings.SUPPORTED_MODELS:
                 count = (
                     self.db.query(ModelRegistry)
                     .filter(
