@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.metadata
 import json
 from dataclasses import dataclass
@@ -189,7 +190,7 @@ class SingleFaceRoiProcessor:
             return cached, "loaded"
 
         try:
-            from ultralytics import YOLO
+            YOLO = importlib.import_module("ultralytics").YOLO
         except Exception as exc:
             self._detector_cache[cache_key] = exc
             logger.warning(

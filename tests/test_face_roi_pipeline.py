@@ -22,7 +22,7 @@ class _MockRoiProcessor(SingleFaceRoiProcessor):
         super().__init__()
         self.calls = 0
 
-    def crop_pil(self, image, _policy):
+    def crop_pil(self, image, policy=None):
         self.calls += 1
         return image, {"face_roi_applied": True}
 
