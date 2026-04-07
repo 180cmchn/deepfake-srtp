@@ -3,6 +3,7 @@ Machine Learning Models for Deepfake Detection
 """
 
 import os
+import importlib
 from typing import Any, Dict, Optional
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -23,7 +24,7 @@ from app.core.config import settings
 from app.core.logging import logger
 
 
-FRAME_BACKBONE_TYPES = {"vgg", "swin", "vit", "resnet"}
+FRAME_BACKBONE_TYPES = {"vgg", "swin", "vit", "resnet", "yolo"}
 BUILTIN_MODEL_SOURCE = "builtin"
 BUILTIN_MODEL_READINESS = "fallback_only"
 BUILTIN_MODEL_SELECTION_POLICY = "fallback_only"
@@ -78,6 +79,97 @@ def get_model_provenance(model: nn.Module) -> Optional[Dict[str, Any]]:
     if provenance is None:
         return None
     return dict(provenance)
+
+
+def _resolve_yolo_model_sources(model_variant: Optional[str]) -> tuple[str, str]:
+    normalized_variant = (model_variant or settings.YOLO_MODEL_VARIANT).strip()
+    if normalized_variant.endswith(".pt"):
+        normalized_variant = normalized_variant[: -len(".pt")]
+    if normalized_variant.endswith(".yaml"):
+        normalized_variant = normalized_variant[: -len(".yaml")]
+    if not normalized_variant:
+        normalized_variant = "yolo11n-cls"
+    return f"{normalized_variant}.yaml", f"{normalized_variant}.pt"
+
+
+def _replace_last_linear_layer(
+    model: nn.Module, out_features: int
+) -> tuple[nn.Module, int]:
+    target_path = None
+    target_layer = None
+    for module_path, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            target_path = module_path
+            target_layer = module
+    if target_path is None or target_layer is None:
+        raise ValueError(
+            "Ultralytics yolo classifier does not expose a linear classification head"
+        )
+
+    replacement = nn.Linear(target_layer.in_features, out_features)
+    nn.init.normal_(replacement.weight, mean=0.0, std=0.01)
+    nn.init.zeros_(replacement.bias)
+
+    parent = model
+    parts = target_path.split(".")
+    for part in parts[:-1]:
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+
+    leaf = parts[-1]
+    if leaf.isdigit():
+        parent[int(leaf)] = replacement
+    else:
+        setattr(parent, leaf, replacement)
+
+    return replacement, int(target_layer.in_features)
+
+
+def _build_ultralytics_yolo_backbone(
+    *,
+    model_variant: Optional[str],
+    num_classes: int,
+    pretrained: bool,
+) -> tuple[nn.Module, nn.Linear, int, Dict[str, Any]]:
+    try:
+        YOLO = importlib.import_module("ultralytics").YOLO
+    except Exception as exc:
+        raise RuntimeError(
+            "Ultralytics is required for model_type='yolo'. Install backend dependencies with pip install -r requirements.txt"
+        ) from exc
+
+    yaml_source, pretrained_source = _resolve_yolo_model_sources(model_variant)
+    yolo = YOLO(yaml_source, task="classify")
+
+    provenance: Dict[str, Any]
+    if pretrained:
+        try:
+            yolo = yolo.load(pretrained_source)
+            provenance = {
+                "status": BUILTIN_MODEL_STATUS_PRETRAINED,
+                "weight_state": BUILTIN_MODEL_WEIGHT_STATE_PRETRAINED,
+            }
+        except Exception as exc:
+            if not settings.MODEL_ALLOW_RANDOM_INIT_FALLBACK:
+                raise
+            logger.warning(
+                "Failed to load pretrained ultralytics yolo classification weights; using random initialization fallback",
+                model_name=model_variant or settings.YOLO_MODEL_VARIANT,
+                error=str(exc),
+            )
+            provenance = {
+                "status": BUILTIN_MODEL_STATUS_RANDOM_INIT_FALLBACK,
+                "weight_state": BUILTIN_MODEL_WEIGHT_STATE_RANDOM_INIT_FALLBACK,
+                "fallback_reason": str(exc),
+            }
+    else:
+        provenance = {
+            "status": BUILTIN_MODEL_STATUS_RANDOM_INIT,
+            "weight_state": BUILTIN_MODEL_WEIGHT_STATE_RANDOM_INIT,
+        }
+
+    inner_model = yolo.model
+    classifier_layer, feature_dim = _replace_last_linear_layer(inner_model, num_classes)
+    return inner_model, classifier_layer, feature_dim, provenance
 
 
 def _load_torchvision_model(factory, weights, model_name: str, pretrained: bool):
@@ -289,6 +381,7 @@ class VideoTemporalHybridModel(nn.Module):
         feature_projection_size: int = 256,
         temporal_bidirectional: bool = True,
         temporal_attention_pooling: bool = True,
+        yolo_model_variant: Optional[str] = None,
     ):
         super(VideoTemporalHybridModel, self).__init__()
         if backbone_type not in FRAME_BACKBONE_TYPES:
@@ -298,7 +391,10 @@ class VideoTemporalHybridModel(nn.Module):
 
         self.backbone_type = backbone_type
         self.frame_encoder = ModelRegistry.get_model(
-            backbone_type, num_classes=num_classes, pretrained=pretrained
+            backbone_type,
+            num_classes=num_classes,
+            pretrained=pretrained,
+            yolo_model_variant=yolo_model_variant,
         )
         for param in self.frame_encoder.parameters():
             param.requires_grad = False
@@ -508,6 +604,48 @@ class ResNet(nn.Module):
         return self.img_model.fc(features)
 
 
+class YOLOClassifier(nn.Module):
+    def __init__(
+        self, num_classes=2, pretrained=True, yolo_model_variant: Optional[str] = None
+    ):
+        super(YOLOClassifier, self).__init__()
+        self.yolo_model_variant = yolo_model_variant or settings.YOLO_MODEL_VARIANT
+        self.model, self.classifier_layer, self.feature_dim, provenance = (
+            _build_ultralytics_yolo_backbone(
+                model_variant=self.yolo_model_variant,
+                num_classes=num_classes,
+                pretrained=pretrained,
+            )
+        )
+        _attach_builtin_model_provenance(self, **provenance)
+
+    def extract_features(self, x):
+        captured: Dict[str, torch.Tensor] = {}
+
+        def _capture_features(_module, inputs):
+            if inputs:
+                captured["features"] = inputs[0]
+
+        handle = self.classifier_layer.register_forward_pre_hook(_capture_features)
+        try:
+            _ = self.model(x)
+        finally:
+            handle.remove()
+
+        features = captured.get("features")
+        if features is None:
+            raise RuntimeError(
+                "Ultralytics yolo classifier did not expose penultimate features"
+            )
+        return features
+
+    def forward(self, x):
+        outputs = self.model(x)
+        if isinstance(outputs, (list, tuple)):
+            outputs = outputs[0]
+        return outputs
+
+
 class ModelRegistry:
     """Registry for managing different model types"""
 
@@ -517,6 +655,7 @@ class ModelRegistry:
         "swin": SwinModel,
         "vit": ViTModel,
         "resnet": ResNet,
+        "yolo": YOLOClassifier,
     }
 
     @classmethod
@@ -544,6 +683,9 @@ class ModelRegistry:
                     "temporal_attention_pooling",
                     settings.TEMPORAL_ATTENTION_POOLING,
                 ),
+                yolo_model_variant=kwargs.get(
+                    "yolo_model_variant", settings.YOLO_MODEL_VARIANT
+                ),
             )
 
         model_class = cls._models[model_type]
@@ -567,6 +709,14 @@ class ModelRegistry:
         else:
             # Other models use standard initialization
             num_classes = kwargs.get("num_classes", 2)
+            if model_type == "yolo":
+                return model_class(
+                    num_classes=num_classes,
+                    pretrained=pretrained,
+                    yolo_model_variant=kwargs.get(
+                        "yolo_model_variant", settings.YOLO_MODEL_VARIANT
+                    ),
+                )
             return model_class(num_classes=num_classes, pretrained=pretrained)
 
     @classmethod
