@@ -35,7 +35,7 @@ class DetectionModelsRouteContractTests(unittest.IsolatedAsyncioTestCase):
     ):
         with patch(
             "app.models.ml_models.ModelRegistry.list_models",
-            return_value=["vit", "resnet"],
+            return_value=["vit", "resnet", "yolo"],
         ):
             response = await detection_routes.get_available_models(db=FakeModelsDB([]))
 
@@ -48,12 +48,17 @@ class DetectionModelsRouteContractTests(unittest.IsolatedAsyncioTestCase):
         )
         expected_fallback_type = (
             settings.DEFAULT_MODEL_TYPE
-            if settings.DEFAULT_MODEL_TYPE in {"vit", "resnet"}
+            if settings.DEFAULT_MODEL_TYPE in {"vit", "resnet", "yolo"}
             else "resnet"
         )
         self.assertEqual(
             response["default"]["fallback_model_type"],
             expected_fallback_type,
+        )
+        self.assertIn("yolo", response["model_types"])
+        self.assertIn(
+            "yolo",
+            {model["model_type"] for model in response["models"]},
         )
         self.assertTrue(
             all(model["source"] == "builtin" for model in response["models"])
@@ -72,7 +77,7 @@ class DetectionModelsRouteContractTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.models.ml_models.ModelRegistry.list_models",
-            return_value=["vit", "resnet"],
+            return_value=["vit", "resnet", "yolo"],
         ):
             response = await detection_routes.get_available_models(
                 db=FakeModelsDB([ready_model])
@@ -83,6 +88,7 @@ class DetectionModelsRouteContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["default"]["source"], "registry")
         self.assertTrue(response["default"]["is_ready"])
         self.assertEqual(response["default"]["selection_policy"], "primary")
+        self.assertIn("yolo", response["model_types"])
 
 
 if __name__ == "__main__":

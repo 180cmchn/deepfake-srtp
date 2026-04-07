@@ -7,6 +7,8 @@ from pydantic import BaseModel as PydanticBaseModel, Field, validator, ConfigDic
 from datetime import datetime
 from enum import Enum
 
+from app.core.config import get_supported_model_types
+
 
 class BaseModel(PydanticBaseModel):
     model_config = ConfigDict(protected_namespaces=())
@@ -50,7 +52,7 @@ class DetectionRequest(BaseModel):
     @validator("model_type")
     def validate_model_type(cls, v):
         if v is not None:
-            supported_models = ["vgg", "lrcn", "swin", "vit", "resnet"]
+            supported_models = get_supported_model_types()
             if v not in supported_models:
                 raise ValueError(f"Model type must be one of: {supported_models}")
         return v
@@ -244,7 +246,7 @@ class BatchDetectionRequest(BaseModel):
     @validator("model_type")
     def validate_model_type(cls, v):
         if v is not None:
-            supported_models = ["vgg", "lrcn", "swin", "vit", "resnet"]
+            supported_models = get_supported_model_types()
             if v not in supported_models:
                 raise ValueError(f"Model type must be one of: {supported_models}")
         return v
@@ -292,7 +294,7 @@ class VideoDetectionRequest(BaseModel):
     @validator("model_type")
     def validate_model_type(cls, v):
         if v is not None:
-            supported_models = ["vgg", "lrcn", "swin", "vit", "resnet"]
+            supported_models = get_supported_model_types()
             if v not in supported_models:
                 raise ValueError(f"Model type must be one of: {supported_models}")
         return v
@@ -417,7 +419,7 @@ class DetectionConfig(BaseModel):
 
     @validator("default_model_type")
     def validate_default_model_type(cls, v):
-        supported_models = ["vgg", "lrcn", "swin", "vit", "resnet"]
+        supported_models = get_supported_model_types()
         if v not in supported_models:
             raise ValueError(f"Default model type must be one of: {supported_models}")
         return v

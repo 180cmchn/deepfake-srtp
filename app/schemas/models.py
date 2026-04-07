@@ -7,6 +7,8 @@ from pydantic import BaseModel as PydanticBaseModel, Field, validator, ConfigDic
 from datetime import datetime
 from enum import Enum
 
+from app.core.config import get_supported_model_types
+
 
 class BaseModel(PydanticBaseModel):
     model_config = ConfigDict(protected_namespaces=())
@@ -33,7 +35,7 @@ class ModelInfo(BaseModel):
 
     @validator("model_type")
     def validate_model_type(cls, v):
-        supported_models = ["vgg", "lrcn", "swin", "vit", "resnet"]
+        supported_models = get_supported_model_types()
         if v not in supported_models:
             raise ValueError(f"Model type must be one of: {supported_models}")
         return v

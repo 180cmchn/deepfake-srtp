@@ -7,6 +7,8 @@ from pydantic import BaseModel as PydanticBaseModel, Field, validator, ConfigDic
 from datetime import datetime
 from enum import Enum
 
+from app.core.config import get_supported_model_types
+
 
 class BaseModel(PydanticBaseModel):
     model_config = ConfigDict(protected_namespaces=())
@@ -143,6 +145,11 @@ class TrainingParameters(BaseModel):
         ge=0.0,
         description="Minimum average grayscale frame-to-frame delta required for a training clip to be kept.",
     )
+    yolo_model_variant: str = Field(
+        default="yolo11n-cls",
+        min_length=1,
+        description="Ultralytics classification model variant used when model_type is yolo.",
+    )
 
     @validator("validation_split")
     def validate_validation_split(cls, v):
@@ -245,14 +252,14 @@ class TrainingJobBase(BaseModel):
         None, max_length=1000, description="Job description"
     )
     model_type: str = Field(
-        ..., description="Model type (vgg, lrcn, swin, vit, resnet)"
+        ..., description="Model type (vgg, lrcn, swin, vit, resnet, yolo)"
     )
     dataset_path: str = Field(..., description="Path to dataset")
     parameters: TrainingParameters = Field(default_factory=TrainingParameters)
 
     @validator("model_type")
     def validate_model_type(cls, v):
-        supported_models = ["vgg", "lrcn", "swin", "vit", "resnet"]
+        supported_models = get_supported_model_types()
         if v not in supported_models:
             raise ValueError(f"Model type must be one of: {supported_models}")
         return v
@@ -283,6 +290,9 @@ class TrainingJobResponse(TrainingJobBase):
     progress: float
     current_epoch: Optional[int] = None
     total_epochs: Optional[int] = None
+    estimated_time_remaining: Optional[int] = Field(
+        None, ge=0, description="Estimated time remaining in seconds"
+    )
     progress_message: Optional[str] = None
     preprocessing_stage: Optional[str] = None
     preprocessing_progress: Optional[float] = Field(None, ge=0.0, le=100.0)
