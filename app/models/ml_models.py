@@ -396,8 +396,26 @@ class VideoTemporalHybridModel(nn.Module):
             pretrained=pretrained,
             yolo_model_variant=yolo_model_variant,
         )
-        for param in self.frame_encoder.parameters():
-            param.requires_grad = False
+        encoder_provenance = get_model_provenance(self.frame_encoder)
+        encoder_has_pretrained_weights = bool(
+            encoder_provenance
+            and encoder_provenance.get("weight_state")
+            in (
+                BUILTIN_MODEL_WEIGHT_STATE_PRETRAINED,
+                "pretrained",
+            )
+        )
+        if encoder_has_pretrained_weights:
+            for param in self.frame_encoder.parameters():
+                param.requires_grad = False
+        else:
+            logger.warning(
+                "Frame encoder lacks pretrained weights; leaving backbone trainable",
+                backbone_type=backbone_type,
+                weight_state=encoder_provenance.get("weight_state")
+                if encoder_provenance
+                else None,
+            )
 
         feature_dim = getattr(self.frame_encoder, "feature_dim", None)
         if not feature_dim or not hasattr(self.frame_encoder, "extract_features"):
