@@ -111,6 +111,36 @@ class TrainingParameters(BaseModel):
         le=1.0,
         description="Padding ratio applied when expanding the selected face ROI crop.",
     )
+    face_region_mode: str = Field(
+        default="face_eyes_mouth_fusion",
+        description="Region focus mode for temporal/video-hybrid models: face_only or face_eyes_mouth_fusion.",
+    )
+    face_region_eye_padding: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Padding ratio used when extracting the combined eye region from a face crop.",
+    )
+    face_region_mouth_padding: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Padding ratio used when extracting the mouth region from a face crop.",
+    )
+    face_region_require_landmarks: bool = Field(
+        default=False,
+        description="Require successful face landmarks for region extraction instead of using fallback eye and mouth boxes.",
+    )
+    face_region_eye_weight: float = Field(
+        default=1.25,
+        gt=0.0,
+        description="Relative emphasis applied to eye-region features before temporal fusion.",
+    )
+    face_region_mouth_weight: float = Field(
+        default=1.35,
+        gt=0.0,
+        description="Relative emphasis applied to mouth-region features before temporal fusion.",
+    )
     temporal_bidirectional: bool = Field(
         default=True,
         description="Enable bidirectional temporal fusion in the hybrid video backbone.",
@@ -169,6 +199,13 @@ class TrainingParameters(BaseModel):
         allowed = {"none", "balanced", "fake_prior"}
         if v not in allowed:
             raise ValueError(f"class_weight_strategy must be one of: {sorted(allowed)}")
+        return v
+
+    @validator("face_region_mode")
+    def validate_face_region_mode(cls, v):
+        allowed = {"face_only", "face_eyes_mouth_fusion"}
+        if v not in allowed:
+            raise ValueError(f"face_region_mode must be one of: {sorted(allowed)}")
         return v
 
 
