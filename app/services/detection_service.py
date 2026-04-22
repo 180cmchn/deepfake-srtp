@@ -17,6 +17,7 @@ from PIL import Image
 import numpy as np
 
 from app.core.database import get_db_session
+from app.core.face_region_extractor import FaceRegionExtractor
 from app.core.logging import logger
 from app.core.config import settings
 from app.core.video_aggregation import aggregate_probability_sequence
@@ -62,6 +63,7 @@ class DetectionService:
         self.db = db
         self._model_cache = {}
         self._face_roi_processor = SingleFaceRoiProcessor()
+        self._face_region_extractor = FaceRegionExtractor()
 
     def _resolve_detection_status(
         self, status_value: Optional[str], error_message: Optional[str]
@@ -169,18 +171,28 @@ class DetectionService:
             loaded_model = await self._load_model(request.model_id, request.model_type)
             model = loaded_model["model"]
             face_roi_policy = self._resolve_face_roi_policy(loaded_model)
+            face_region_policy = self._resolve_face_region_policy(loaded_model)
 
             if loaded_model["model_type"] == "lrcn":
                 raise ValueError("LRCN models only support video detection")
 
             input_size = loaded_model.get("input_size", settings.MODEL_INPUT_SIZE)
             if loaded_model.get("video_temporal_enabled"):
-                image = self._preprocess_image_clip(
-                    file_path,
-                    sequence_length=loaded_model.get("sequence_length", 8),
-                    input_size=input_size,
-                    face_roi_policy=face_roi_policy,
-                )
+                if face_region_policy.get("face_region_effective_enabled"):
+                    image = self._preprocess_image_clip_regions(
+                        file_path,
+                        sequence_length=loaded_model.get("sequence_length", 8),
+                        input_size=input_size,
+                        face_roi_policy=face_roi_policy,
+                        face_region_policy=face_region_policy,
+                    )
+                else:
+                    image = self._preprocess_image_clip(
+                        file_path,
+                        sequence_length=loaded_model.get("sequence_length", 8),
+                        input_size=input_size,
+                        face_roi_policy=face_roi_policy,
+                    )
             else:
                 image = self._preprocess_image(
                     file_path,
@@ -514,6 +526,7 @@ class DetectionService:
             loaded_model = await self._load_model(request.model_id, request.model_type)
             model = loaded_model["model"]
             face_roi_policy = self._resolve_face_roi_policy(loaded_model)
+            face_region_policy = self._resolve_face_region_policy(loaded_model)
             aggregation_policy = self._resolve_video_aggregation_policy(loaded_model)
 
             if loaded_model["model_type"] == "lrcn" or loaded_model.get(
@@ -527,6 +540,7 @@ class DetectionService:
                     frames,
                     loaded_model,
                     face_roi_policy,
+                    face_region_policy,
                 )
                 analyzed_frame_count = len(frames)
                 fallback_filled_frame_count = 0
@@ -657,6 +671,10 @@ class DetectionService:
                 "face_roi_policy_version": face_roi_policy["face_roi_policy_version"],
                 "face_roi_selection_policy": face_roi_policy[
                     "face_roi_selection_policy"
+                ],
+                "face_region_mode": face_region_policy["face_region_mode"],
+                "face_region_policy_version": face_region_policy[
+                    "face_region_policy_version"
                 ],
                 "video_aggregation_topk_ratio": aggregation_policy["topk_ratio"],
             }
@@ -1271,6 +1289,13 @@ class DetectionService:
             "face_roi_crop_padding",
             "face_roi_policy_version",
             "face_roi_selection_policy",
+            "face_region_mode",
+            "face_region_policy_version",
+            "face_region_eye_padding",
+            "face_region_mouth_padding",
+            "face_region_require_landmarks",
+            "face_region_eye_weight",
+            "face_region_mouth_weight",
             "video_aggregation_topk_ratio",
             "video_aggregation_mean_weight",
             "video_aggregation_peak_weight",
@@ -1298,6 +1323,40 @@ class DetectionService:
             if loaded_model and loaded_model.get(key) is not None:
                 parameters[key] = loaded_model.get(key)
         return self._face_roi_processor.build_policy(parameters)
+
+    def _resolve_face_region_policy(
+        self, loaded_model: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        parameters = dict((loaded_model or {}).get("parameters") or {})
+        parameters.setdefault("face_region_mode", "face_only")
+        parameters.setdefault(
+            "face_region_policy_version", settings.FACE_REGION_POLICY_VERSION
+        )
+        parameters.setdefault(
+            "face_region_eye_padding", settings.FACE_REGION_EYE_PADDING
+        )
+        parameters.setdefault(
+            "face_region_mouth_padding", settings.FACE_REGION_MOUTH_PADDING
+        )
+        parameters.setdefault(
+            "face_region_require_landmarks", settings.FACE_REGION_REQUIRE_LANDMARKS
+        )
+        parameters.setdefault("face_region_eye_weight", settings.FACE_REGION_EYE_WEIGHT)
+        parameters.setdefault(
+            "face_region_mouth_weight", settings.FACE_REGION_MOUTH_WEIGHT
+        )
+        for key in (
+            "face_region_mode",
+            "face_region_policy_version",
+            "face_region_eye_padding",
+            "face_region_mouth_padding",
+            "face_region_require_landmarks",
+            "face_region_eye_weight",
+            "face_region_mouth_weight",
+        ):
+            if loaded_model and loaded_model.get(key) is not None:
+                parameters[key] = loaded_model.get(key)
+        return self._face_region_extractor.build_policy(parameters)
 
     def _resolve_video_aggregation_policy(
         self, loaded_model: Optional[Dict[str, Any]] = None
@@ -1445,6 +1504,47 @@ class DetectionService:
                 "face_roi_selection_policy",
                 (model_record.parameters or {}).get("face_roi_selection_policy"),
             ),
+            "face_region_mode": checkpoint.get(
+                "face_region_mode",
+                (model_record.parameters or {}).get("face_region_mode", "face_only"),
+            ),
+            "face_region_policy_version": checkpoint.get(
+                "face_region_policy_version",
+                (model_record.parameters or {}).get(
+                    "face_region_policy_version", settings.FACE_REGION_POLICY_VERSION
+                ),
+            ),
+            "face_region_eye_padding": checkpoint.get(
+                "face_region_eye_padding",
+                (model_record.parameters or {}).get(
+                    "face_region_eye_padding", settings.FACE_REGION_EYE_PADDING
+                ),
+            ),
+            "face_region_mouth_padding": checkpoint.get(
+                "face_region_mouth_padding",
+                (model_record.parameters or {}).get(
+                    "face_region_mouth_padding", settings.FACE_REGION_MOUTH_PADDING
+                ),
+            ),
+            "face_region_require_landmarks": checkpoint.get(
+                "face_region_require_landmarks",
+                (model_record.parameters or {}).get(
+                    "face_region_require_landmarks",
+                    settings.FACE_REGION_REQUIRE_LANDMARKS,
+                ),
+            ),
+            "face_region_eye_weight": checkpoint.get(
+                "face_region_eye_weight",
+                (model_record.parameters or {}).get(
+                    "face_region_eye_weight", settings.FACE_REGION_EYE_WEIGHT
+                ),
+            ),
+            "face_region_mouth_weight": checkpoint.get(
+                "face_region_mouth_weight",
+                (model_record.parameters or {}).get(
+                    "face_region_mouth_weight", settings.FACE_REGION_MOUTH_WEIGHT
+                ),
+            ),
             "video_aggregation_topk_ratio": checkpoint.get(
                 "video_aggregation_topk_ratio",
                 (model_record.parameters or {}).get("video_aggregation_topk_ratio"),
@@ -1500,6 +1600,38 @@ class DetectionService:
             image_array = np.array(rgb_image, dtype=np.float32) / 255.0
         return self._normalize_image_array(image_array)
 
+    def _preprocess_face_regions_from_pil(
+        self,
+        image: Image.Image,
+        *,
+        input_size: Optional[int] = None,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
+        face_region_policy: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        target_size = input_size or settings.MODEL_INPUT_SIZE
+        rgb_image = image.convert("RGB")
+        if face_roi_policy:
+            rgb_image, _ = self._face_roi_processor.crop_pil(rgb_image, face_roi_policy)
+
+        if face_region_policy and face_region_policy.get(
+            "face_region_effective_enabled"
+        ):
+            regions = self._face_region_extractor.extract_regions(
+                rgb_image,
+                target_size=target_size,
+                policy=face_region_policy,
+            )
+            region_images = [regions.face, regions.eyes, regions.mouth]
+        else:
+            resized = rgb_image.resize((target_size, target_size), Image.BILINEAR)
+            region_images = [resized]
+
+        region_tensors = []
+        for region_image in region_images:
+            image_array = np.array(region_image, dtype=np.float32) / 255.0
+            region_tensors.append(self._normalize_image_array(image_array).squeeze(0))
+        return torch.stack(region_tensors, dim=0)
+
     def _preprocess_frame(
         self,
         frame: np.ndarray,
@@ -1514,6 +1646,22 @@ class DetectionService:
         image = Image.fromarray(frame_rgb).resize((target_size, target_size))
         image_array = np.array(image, dtype=np.float32) / 255.0
         return self._normalize_image_array(image_array)
+
+    def _preprocess_frame_regions(
+        self,
+        frame: np.ndarray,
+        input_size: Optional[int] = None,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
+        face_region_policy: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(frame_rgb)
+        return self._preprocess_face_regions_from_pil(
+            image,
+            input_size=input_size,
+            face_roi_policy=face_roi_policy,
+            face_region_policy=face_region_policy,
+        )
 
     def _normalize_image_array(self, image_array: np.ndarray) -> torch.Tensor:
         """Apply the same tensor normalization used during training."""
@@ -1552,6 +1700,38 @@ class DetectionService:
         ]
         return torch.stack(processed_frames, dim=0).unsqueeze(0)
 
+    def _preprocess_video_clip_regions(
+        self,
+        frames: List[tuple],
+        sequence_length: int,
+        input_size: Optional[int] = None,
+        clip_indices: Optional[List[int]] = None,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
+        face_region_policy: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        if not frames:
+            raise ValueError("No frames available for video clip preprocessing")
+
+        if clip_indices:
+            selected_frames = [frames[idx][0] for idx in clip_indices]
+            target_length = len(selected_frames)
+        else:
+            target_length = max(1, sequence_length)
+            selected_frames = [frame for frame, _ in frames[:target_length]]
+        while len(selected_frames) < target_length:
+            selected_frames.append(selected_frames[-1])
+
+        processed_frames = [
+            self._preprocess_frame_regions(
+                frame,
+                input_size=input_size,
+                face_roi_policy=face_roi_policy,
+                face_region_policy=face_region_policy,
+            )
+            for frame in selected_frames
+        ]
+        return torch.stack(processed_frames, dim=0).unsqueeze(0)
+
     def _preprocess_image_clip(
         self,
         image_path: str,
@@ -1566,6 +1746,24 @@ class DetectionService:
             face_roi_policy=face_roi_policy,
         ).squeeze(0)
         clip = frame_tensor.unsqueeze(0).repeat(max(1, sequence_length), 1, 1, 1)
+        return clip.unsqueeze(0)
+
+    def _preprocess_image_clip_regions(
+        self,
+        image_path: str,
+        sequence_length: int,
+        input_size: Optional[int] = None,
+        face_roi_policy: Optional[Dict[str, Any]] = None,
+        face_region_policy: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        with Image.open(image_path) as image:
+            region_tensor = self._preprocess_face_regions_from_pil(
+                image,
+                input_size=input_size,
+                face_roi_policy=face_roi_policy,
+                face_region_policy=face_region_policy,
+            )
+        clip = region_tensor.unsqueeze(0).repeat(max(1, sequence_length), 1, 1, 1, 1)
         return clip.unsqueeze(0)
 
     async def _predict_tensor(
@@ -1721,6 +1919,7 @@ class DetectionService:
         frames: List[tuple],
         loaded_model: Dict[str, Any],
         face_roi_policy: Optional[Dict[str, Any]] = None,
+        face_region_policy: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """Infer clip-level predictions and project them back to frame timeline."""
         sequence_length = max(1, int(loaded_model.get("sequence_length", 8)))
@@ -1735,13 +1934,25 @@ class DetectionService:
         ]
 
         for clip_indices in clip_indices_list:
-            processed_clip = self._preprocess_video_clip(
-                frames,
-                sequence_length=sequence_length,
-                input_size=input_size,
-                clip_indices=clip_indices,
-                face_roi_policy=face_roi_policy,
-            )
+            if face_region_policy and face_region_policy.get(
+                "face_region_effective_enabled"
+            ):
+                processed_clip = self._preprocess_video_clip_regions(
+                    frames,
+                    sequence_length=sequence_length,
+                    input_size=input_size,
+                    clip_indices=clip_indices,
+                    face_roi_policy=face_roi_policy,
+                    face_region_policy=face_region_policy,
+                )
+            else:
+                processed_clip = self._preprocess_video_clip(
+                    frames,
+                    sequence_length=sequence_length,
+                    input_size=input_size,
+                    clip_indices=clip_indices,
+                    face_roi_policy=face_roi_policy,
+                )
             prediction = await self._predict_tensor(model, processed_clip)
             weights = self._clip_frame_weights(len(clip_indices))
 
@@ -1771,19 +1982,41 @@ class DetectionService:
                     loaded_model.get("video_temporal_enabled")
                     or loaded_model.get("model_type") == "lrcn"
                 ):
-                    fallback_tensor = self._preprocess_video_clip(
-                        frames,
-                        sequence_length=sequence_length,
-                        input_size=input_size,
-                        clip_indices=[frame_index] * sequence_length,
-                        face_roi_policy=face_roi_policy,
-                    )
+                    if face_region_policy and face_region_policy.get(
+                        "face_region_effective_enabled"
+                    ):
+                        fallback_tensor = self._preprocess_video_clip_regions(
+                            frames,
+                            sequence_length=sequence_length,
+                            input_size=input_size,
+                            clip_indices=[frame_index] * sequence_length,
+                            face_roi_policy=face_roi_policy,
+                            face_region_policy=face_region_policy,
+                        )
+                    else:
+                        fallback_tensor = self._preprocess_video_clip(
+                            frames,
+                            sequence_length=sequence_length,
+                            input_size=input_size,
+                            clip_indices=[frame_index] * sequence_length,
+                            face_roi_policy=face_roi_policy,
+                        )
                 else:
-                    fallback_tensor = self._preprocess_frame(
-                        frame,
-                        input_size=input_size,
-                        face_roi_policy=face_roi_policy,
-                    )
+                    if face_region_policy and face_region_policy.get(
+                        "face_region_effective_enabled"
+                    ):
+                        fallback_tensor = self._preprocess_frame_regions(
+                            frame,
+                            input_size=input_size,
+                            face_roi_policy=face_roi_policy,
+                            face_region_policy=face_region_policy,
+                        ).unsqueeze(0)
+                    else:
+                        fallback_tensor = self._preprocess_frame(
+                            frame,
+                            input_size=input_size,
+                            face_roi_policy=face_roi_policy,
+                        )
                 frame_prediction = await self._predict_tensor(
                     model,
                     fallback_tensor,
@@ -2340,6 +2573,23 @@ class DetectionService:
                         parameters.get(
                             "temporal_attention_pooling",
                             settings.TEMPORAL_ATTENTION_POOLING,
+                        ),
+                    ),
+                    "face_region_mode": checkpoint.get(
+                        "face_region_mode",
+                        parameters.get("face_region_mode", "face_only"),
+                    ),
+                    "face_region_eye_weight": checkpoint.get(
+                        "face_region_eye_weight",
+                        parameters.get(
+                            "face_region_eye_weight", settings.FACE_REGION_EYE_WEIGHT
+                        ),
+                    ),
+                    "face_region_mouth_weight": checkpoint.get(
+                        "face_region_mouth_weight",
+                        parameters.get(
+                            "face_region_mouth_weight",
+                            settings.FACE_REGION_MOUTH_WEIGHT,
                         ),
                     ),
                 }

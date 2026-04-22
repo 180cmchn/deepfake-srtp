@@ -30,6 +30,7 @@ from fastapi import BackgroundTasks
 from app.core.database import get_db_session
 from app.core.logging import logger
 from app.core.config import settings
+from app.core.face_region_extractor import FaceRegionExtractor
 from app.core.video_aggregation import aggregate_logit_sequence
 from app.core.video_face_roi import SingleFaceRoiProcessor
 from app.models.database_models import ModelRegistry, TrainingJob
@@ -221,6 +222,8 @@ class SequenceClassificationDataset(Dataset):
         include_source_id: bool = False,
         roi_processor: Optional[SingleFaceRoiProcessor] = None,
         roi_policy: Optional[Dict[str, Any]] = None,
+        region_extractor: Optional[FaceRegionExtractor] = None,
+        region_policy: Optional[Dict[str, Any]] = None,
     ):
         self.samples = samples
         self.transform = transform
@@ -228,6 +231,8 @@ class SequenceClassificationDataset(Dataset):
         self.include_source_id = include_source_id
         self.roi_processor = roi_processor
         self.roi_policy = roi_policy
+        self.region_extractor = region_extractor
+        self.region_policy = region_policy
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -249,7 +254,31 @@ class SequenceClassificationDataset(Dataset):
             frames = self._apply_clip_augmentation(frames)
 
         if self.transform:
-            frames = [self.transform(frame) for frame in frames]
+            if (
+                self.region_extractor
+                and self.region_policy
+                and self.region_policy.get("face_region_effective_enabled")
+            ):
+                region_frames = []
+                for frame in frames:
+                    regions = self.region_extractor.extract_regions(
+                        frame,
+                        target_size=frame.size[0],
+                        policy=self.region_policy,
+                    )
+                    region_frames.append(
+                        torch.stack(
+                            [
+                                self.transform(regions.face),
+                                self.transform(regions.eyes),
+                                self.transform(regions.mouth),
+                            ],
+                            dim=0,
+                        )
+                    )
+                frames = region_frames
+            else:
+                frames = [self.transform(frame) for frame in frames]
 
         clip = torch.stack(frames, dim=0)
         if self.include_source_id:
@@ -316,11 +345,17 @@ class TrainingService:
         self.db = db
         self._active_jobs = self._shared_active_jobs
         self._face_roi_processor = SingleFaceRoiProcessor()
+        self._face_region_extractor = FaceRegionExtractor()
 
     def _build_face_roi_policy(
         self, parameters: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         return self._face_roi_processor.build_policy(parameters or {})
+
+    def _build_face_region_policy(
+        self, parameters: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        return self._face_region_extractor.build_policy(parameters or {})
 
     def _estimate_temporal_clip_quality(
         self, frame_paths: List[str]
@@ -2064,6 +2099,25 @@ class TrainingService:
                     "yolo_model_variant": pending_meta.get(
                         "yolo_model_variant", settings.YOLO_MODEL_VARIANT
                     ),
+                    "face_region_mode": pending_meta.get(
+                        "face_region_mode", settings.FACE_REGION_MODE
+                    ),
+                    "face_region_eye_padding": pending_meta.get(
+                        "face_region_eye_padding", settings.FACE_REGION_EYE_PADDING
+                    ),
+                    "face_region_mouth_padding": pending_meta.get(
+                        "face_region_mouth_padding", settings.FACE_REGION_MOUTH_PADDING
+                    ),
+                    "face_region_require_landmarks": pending_meta.get(
+                        "face_region_require_landmarks",
+                        settings.FACE_REGION_REQUIRE_LANDMARKS,
+                    ),
+                    "face_region_eye_weight": pending_meta.get(
+                        "face_region_eye_weight", settings.FACE_REGION_EYE_WEIGHT
+                    ),
+                    "face_region_mouth_weight": pending_meta.get(
+                        "face_region_mouth_weight", settings.FACE_REGION_MOUTH_WEIGHT
+                    ),
                 },
             )
 
@@ -2437,6 +2491,35 @@ class TrainingService:
                     settings.YOLO_FACE_CROP_PADDING,
                 )
             )
+            face_region_mode = str(
+                parameters.get("face_region_mode", settings.FACE_REGION_MODE)
+            )
+            face_region_eye_padding = float(
+                parameters.get(
+                    "face_region_eye_padding", settings.FACE_REGION_EYE_PADDING
+                )
+            )
+            face_region_mouth_padding = float(
+                parameters.get(
+                    "face_region_mouth_padding", settings.FACE_REGION_MOUTH_PADDING
+                )
+            )
+            face_region_require_landmarks = bool(
+                parameters.get(
+                    "face_region_require_landmarks",
+                    settings.FACE_REGION_REQUIRE_LANDMARKS,
+                )
+            )
+            face_region_eye_weight = float(
+                parameters.get(
+                    "face_region_eye_weight", settings.FACE_REGION_EYE_WEIGHT
+                )
+            )
+            face_region_mouth_weight = float(
+                parameters.get(
+                    "face_region_mouth_weight", settings.FACE_REGION_MOUTH_WEIGHT
+                )
+            )
             temporal_bidirectional = bool(
                 parameters.get(
                     "temporal_bidirectional", settings.TEMPORAL_BIDIRECTIONAL
@@ -2494,6 +2577,10 @@ class TrainingService:
             1.0, max(0.0, face_roi_confidence_threshold)
         )
         face_roi_crop_padding = min(1.0, max(0.0, face_roi_crop_padding))
+        face_region_eye_padding = min(1.0, max(0.0, face_region_eye_padding))
+        face_region_mouth_padding = min(1.0, max(0.0, face_region_mouth_padding))
+        face_region_eye_weight = max(0.1, face_region_eye_weight)
+        face_region_mouth_weight = max(0.1, face_region_mouth_weight)
         train_clip_overlap_ratio = min(0.95, max(0.0, train_clip_overlap_ratio))
         val_clip_overlap_ratio = min(0.95, max(0.0, val_clip_overlap_ratio))
         temporal_clip_min_frame_std = max(0.0, temporal_clip_min_frame_std)
@@ -2526,6 +2613,12 @@ class TrainingService:
                 "face_roi_enabled": face_roi_enabled,
                 "face_roi_confidence_threshold": face_roi_confidence_threshold,
                 "face_roi_crop_padding": face_roi_crop_padding,
+                "face_region_mode": face_region_mode,
+                "face_region_eye_padding": face_region_eye_padding,
+                "face_region_mouth_padding": face_region_mouth_padding,
+                "face_region_require_landmarks": face_region_require_landmarks,
+                "face_region_eye_weight": face_region_eye_weight,
+                "face_region_mouth_weight": face_region_mouth_weight,
                 "temporal_bidirectional": temporal_bidirectional,
                 "temporal_attention_pooling": temporal_attention_pooling,
                 "train_clip_overlap_ratio": train_clip_overlap_ratio,
@@ -2543,6 +2636,22 @@ class TrainingService:
                 "face_roi_confidence_threshold": face_roi_confidence_threshold,
                 "face_roi_crop_padding": face_roi_crop_padding,
             }
+        )
+        face_region_policy = self._build_face_region_policy(
+            {
+                "face_region_mode": face_region_mode
+                if uses_temporal_context
+                else "face_only",
+                "face_region_eye_padding": face_region_eye_padding,
+                "face_region_mouth_padding": face_region_mouth_padding,
+                "face_region_require_landmarks": face_region_require_landmarks,
+                "face_region_eye_weight": face_region_eye_weight,
+                "face_region_mouth_weight": face_region_mouth_weight,
+            }
+        )
+        self._set_active_job_metadata(
+            job_id,
+            {"face_region_mode": face_region_policy["face_region_mode"]},
         )
         aggregation_policy = {
             "video_aggregation_topk_ratio": settings.VIDEO_AGGREGATION_TOPK_RATIO,
@@ -2597,6 +2706,7 @@ class TrainingService:
                     temporal_clip_filter_enabled=temporal_clip_filter_enabled,
                     temporal_clip_min_frame_std=temporal_clip_min_frame_std,
                     temporal_clip_min_motion_delta=temporal_clip_min_motion_delta,
+                    face_region_policy=face_region_policy,
                     progress_callback=preprocessing_reporter,
                 )
             )
@@ -2611,6 +2721,9 @@ class TrainingService:
                 temporal_bidirectional=temporal_bidirectional,
                 temporal_attention_pooling=temporal_attention_pooling,
                 yolo_model_variant=yolo_model_variant,
+                face_region_mode=face_region_policy["face_region_mode"],
+                face_region_eye_weight=face_region_eye_weight,
+                face_region_mouth_weight=face_region_mouth_weight,
             ).to(device)
         else:
             preprocessing_reporter(
@@ -2912,6 +3025,18 @@ class TrainingService:
                         "face_roi_selection_policy": face_roi_policy[
                             "face_roi_selection_policy"
                         ],
+                        "face_region_mode": face_region_policy["face_region_mode"],
+                        "face_region_policy_version": face_region_policy[
+                            "face_region_policy_version"
+                        ],
+                        "face_region_policy_fingerprint": face_region_policy[
+                            "face_region_policy_fingerprint"
+                        ],
+                        "face_region_eye_padding": face_region_eye_padding,
+                        "face_region_mouth_padding": face_region_mouth_padding,
+                        "face_region_require_landmarks": face_region_require_landmarks,
+                        "face_region_eye_weight": face_region_eye_weight,
+                        "face_region_mouth_weight": face_region_mouth_weight,
                         "video_aggregation_topk_ratio": aggregation_policy[
                             "video_aggregation_topk_ratio"
                         ],
@@ -3907,6 +4032,7 @@ class TrainingService:
         temporal_clip_filter_enabled: bool = True,
         temporal_clip_min_frame_std: float = 6.0,
         temporal_clip_min_motion_delta: float = 2.0,
+        face_region_policy: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
@@ -3926,6 +4052,7 @@ class TrainingService:
             temporal_clip_filter_enabled=temporal_clip_filter_enabled,
             temporal_clip_min_frame_std=temporal_clip_min_frame_std,
             temporal_clip_min_motion_delta=temporal_clip_min_motion_delta,
+            face_region_policy=face_region_policy,
             progress_callback=progress_callback,
         )
 
@@ -3944,6 +4071,7 @@ class TrainingService:
         temporal_clip_filter_enabled: bool = True,
         temporal_clip_min_frame_std: float = 6.0,
         temporal_clip_min_motion_delta: float = 2.0,
+        face_region_policy: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[
             Callable[[float, str, Optional[Dict[str, Any]]], None]
         ] = None,
@@ -4178,6 +4306,8 @@ class TrainingService:
             augment=True,
             roi_processor=self._face_roi_processor,
             roi_policy=face_roi_policy,
+            region_extractor=self._face_region_extractor,
+            region_policy=face_region_policy,
         )
         val_dataset = SequenceClassificationDataset(
             val_samples,
@@ -4185,6 +4315,8 @@ class TrainingService:
             include_source_id=True,
             roi_processor=self._face_roi_processor,
             roi_policy=face_roi_policy,
+            region_extractor=self._face_region_extractor,
+            region_policy=face_region_policy,
         )
         train_sampler = self._build_balanced_sampler(
             [sample.label for sample in train_samples],
@@ -5429,6 +5561,55 @@ class TrainingService:
                 )
                 or 0.18
             ),
+            face_region_mode=str(
+                active_meta.get(
+                    "face_region_mode",
+                    checkpoint_parameters.get("face_region_mode", "face_only"),
+                )
+                or "face_only"
+            ),
+            face_region_eye_padding=float(
+                active_meta.get(
+                    "face_region_eye_padding",
+                    checkpoint_parameters.get(
+                        "face_region_eye_padding", settings.FACE_REGION_EYE_PADDING
+                    ),
+                )
+            ),
+            face_region_mouth_padding=float(
+                active_meta.get(
+                    "face_region_mouth_padding",
+                    checkpoint_parameters.get(
+                        "face_region_mouth_padding",
+                        settings.FACE_REGION_MOUTH_PADDING,
+                    ),
+                )
+            ),
+            face_region_require_landmarks=bool(
+                active_meta.get(
+                    "face_region_require_landmarks",
+                    checkpoint_parameters.get(
+                        "face_region_require_landmarks",
+                        settings.FACE_REGION_REQUIRE_LANDMARKS,
+                    ),
+                )
+            ),
+            face_region_eye_weight=float(
+                active_meta.get(
+                    "face_region_eye_weight",
+                    checkpoint_parameters.get(
+                        "face_region_eye_weight", settings.FACE_REGION_EYE_WEIGHT
+                    ),
+                )
+            ),
+            face_region_mouth_weight=float(
+                active_meta.get(
+                    "face_region_mouth_weight",
+                    checkpoint_parameters.get(
+                        "face_region_mouth_weight", settings.FACE_REGION_MOUTH_WEIGHT
+                    ),
+                )
+            ),
             temporal_bidirectional=bool(
                 active_meta.get(
                     "temporal_bidirectional",
@@ -5696,6 +5877,18 @@ class TrainingService:
             "face_roi_crop_padding": checkpoint.get("face_roi_crop_padding"),
             "face_roi_policy_version": checkpoint.get("face_roi_policy_version"),
             "face_roi_selection_policy": checkpoint.get("face_roi_selection_policy"),
+            "face_region_mode": checkpoint.get("face_region_mode"),
+            "face_region_policy_version": checkpoint.get("face_region_policy_version"),
+            "face_region_policy_fingerprint": checkpoint.get(
+                "face_region_policy_fingerprint"
+            ),
+            "face_region_eye_padding": checkpoint.get("face_region_eye_padding"),
+            "face_region_mouth_padding": checkpoint.get("face_region_mouth_padding"),
+            "face_region_require_landmarks": checkpoint.get(
+                "face_region_require_landmarks"
+            ),
+            "face_region_eye_weight": checkpoint.get("face_region_eye_weight"),
+            "face_region_mouth_weight": checkpoint.get("face_region_mouth_weight"),
             "video_aggregation_topk_ratio": checkpoint.get(
                 "video_aggregation_topk_ratio"
             ),
