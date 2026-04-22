@@ -153,6 +153,32 @@ class YoloModelFactoryTests(unittest.TestCase):
             builder_mock.call_args.kwargs["model_variant"], "custom-yolo-cls"
         )
 
+    def test_factory_creates_multi_region_temporal_hybrid_yolo(self):
+        dummy_model = _DummyUltralyticsClassifier(num_classes=2)
+
+        with patch(
+            "app.models.ml_models._build_ultralytics_yolo_backbone",
+            return_value=(
+                dummy_model,
+                dummy_model.classifier,
+                16,
+                {"status": "builtin_random_init", "weight_state": "random_init"},
+            ),
+        ):
+            model = create_model(
+                "yolo",
+                num_classes=2,
+                pretrained=False,
+                video_temporal_enabled=True,
+                face_region_mode="face_eyes_mouth_fusion",
+            )
+            model.eval()
+            with torch.no_grad():
+                logits = model(torch.zeros(2, 4, 3, 3, 224, 224))
+
+        self.assertEqual(tuple(logits.shape), (2, 2))
+        self.assertTrue(model.face_region_enabled)
+
 
 class YoloTrainingModeSupportTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_job_allows_yolo_for_temporal_dataset(self):

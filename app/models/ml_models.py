@@ -382,6 +382,9 @@ class VideoTemporalHybridModel(nn.Module):
         temporal_bidirectional: bool = True,
         temporal_attention_pooling: bool = True,
         yolo_model_variant: Optional[str] = None,
+        face_region_mode: str = "face_only",
+        face_region_eye_weight: float = 1.25,
+        face_region_mouth_weight: float = 1.35,
     ):
         super(VideoTemporalHybridModel, self).__init__()
         if backbone_type not in FRAME_BACKBONE_TYPES:
@@ -416,6 +419,7 @@ class VideoTemporalHybridModel(nn.Module):
                 if encoder_provenance
                 else None,
             )
+        self.freeze_frame_encoder = encoder_has_pretrained_weights
 
         feature_dim = getattr(self.frame_encoder, "feature_dim", None)
         if not feature_dim or not hasattr(self.frame_encoder, "extract_features"):
@@ -424,13 +428,20 @@ class VideoTemporalHybridModel(nn.Module):
             )
 
         self.feature_dim = feature_dim
+        self.face_region_mode = face_region_mode
+        self.face_region_enabled = face_region_mode == "face_eyes_mouth_fusion"
+        self.face_region_eye_weight = face_region_eye_weight
+        self.face_region_mouth_weight = face_region_mouth_weight
         self.temporal_bidirectional = temporal_bidirectional
         self.temporal_attention_pooling = temporal_attention_pooling
+        per_frame_feature_dim = (
+            feature_dim * 3 if self.face_region_enabled else feature_dim
+        )
         self.feature_projection_size = max(
-            32, min(feature_projection_size, feature_dim)
+            32, min(feature_projection_size, per_frame_feature_dim)
         )
         self.feature_projection = nn.Sequential(
-            nn.Linear(feature_dim, self.feature_projection_size),
+            nn.Linear(per_frame_feature_dim, self.feature_projection_size),
             nn.ReLU(),
             nn.Dropout(0.3),
         )
@@ -478,13 +489,45 @@ class VideoTemporalHybridModel(nn.Module):
 
         _inherit_builtin_model_provenance(self, self.frame_encoder)
 
+    def _encode_frame_features(self, x: torch.Tensor) -> torch.Tensor:
+        if self.freeze_frame_encoder:
+            self.frame_encoder.eval()
+            with torch.no_grad():
+                return self.frame_encoder.extract_features(x)
+        return self.frame_encoder.extract_features(x)
+
+    def _fuse_region_features(self, region_features: torch.Tensor) -> torch.Tensor:
+        if not self.face_region_enabled or region_features.size(2) < 3:
+            return region_features[:, :, 0, :]
+
+        face_features = region_features[:, :, 0, :]
+        eye_features = region_features[:, :, 1, :] * self.face_region_eye_weight
+        mouth_features = region_features[:, :, 2, :] * self.face_region_mouth_weight
+        return torch.cat([face_features, eye_features, mouth_features], dim=-1)
+
     def forward(self, x):
-        batch_size, seq_length, channels, height, width = x.size()
-        x = x.view(batch_size * seq_length, channels, height, width)
-        self.frame_encoder.eval()
-        with torch.no_grad():
-            frame_features = self.frame_encoder.extract_features(x)
-        frame_features = frame_features.view(batch_size, seq_length, -1)
+        if x.ndim == 6:
+            batch_size, seq_length, region_count, channels, height, width = x.size()
+            flattened = x.view(
+                batch_size * seq_length * region_count, channels, height, width
+            )
+            encoded = self._encode_frame_features(flattened)
+            region_features = encoded.view(batch_size, seq_length, region_count, -1)
+            frame_features = self._fuse_region_features(region_features)
+        else:
+            batch_size, seq_length, channels, height, width = x.size()
+            flattened = x.view(batch_size * seq_length, channels, height, width)
+            frame_features = self._encode_frame_features(flattened)
+            frame_features = frame_features.view(batch_size, seq_length, -1)
+            if self.face_region_enabled:
+                frame_features = torch.cat(
+                    [
+                        frame_features,
+                        frame_features * self.face_region_eye_weight,
+                        frame_features * self.face_region_mouth_weight,
+                    ],
+                    dim=-1,
+                )
 
         projected_features = self.feature_projection(
             frame_features.reshape(batch_size * seq_length, -1)
@@ -703,6 +746,15 @@ class ModelRegistry:
                 ),
                 yolo_model_variant=kwargs.get(
                     "yolo_model_variant", settings.YOLO_MODEL_VARIANT
+                ),
+                face_region_mode=kwargs.get(
+                    "face_region_mode", settings.FACE_REGION_MODE
+                ),
+                face_region_eye_weight=kwargs.get(
+                    "face_region_eye_weight", settings.FACE_REGION_EYE_WEIGHT
+                ),
+                face_region_mouth_weight=kwargs.get(
+                    "face_region_mouth_weight", settings.FACE_REGION_MOUTH_WEIGHT
                 ),
             )
 

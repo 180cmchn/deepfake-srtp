@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from app.core.face_region_extractor import FaceRegionExtractor
 from app.core.video_face_roi import SingleFaceRoiProcessor
 from app.services.detection_service import DetectionService
 from app.services.training_service import (
@@ -28,6 +29,25 @@ class _MockRoiProcessor(SingleFaceRoiProcessor):
 
 
 class FaceRoiPipelineTests(unittest.TestCase):
+    def test_face_region_extractor_uses_fallback_regions_when_landmarks_are_missing(
+        self,
+    ):
+        extractor = FaceRegionExtractor()
+        image = Image.new("RGB", (120, 120), color=(100, 80, 60))
+
+        with patch.object(extractor, "_get_or_create_mesh", return_value=None):
+            regions = extractor.extract_regions(
+                image,
+                target_size=64,
+                policy={"face_region_mode": "face_eyes_mouth_fusion"},
+            )
+
+        self.assertEqual(regions.face.size, (64, 64))
+        self.assertEqual(regions.eyes.size, (64, 64))
+        self.assertEqual(regions.mouth.size, (64, 64))
+        self.assertTrue(regions.metadata["face_region_fallback_used"])
+        self.assertFalse(regions.metadata["face_region_landmark_detected"])
+
     def test_face_roi_processor_falls_back_when_detector_is_disabled_or_unconfigured(
         self,
     ):
@@ -219,6 +239,13 @@ class FaceRoiPipelineTests(unittest.TestCase):
                     "face_roi_crop_padding": 0.2,
                     "face_roi_policy_version": "single_face_v1",
                     "face_roi_selection_policy": "confidence_area",
+                    "face_region_mode": "face_eyes_mouth_fusion",
+                    "face_region_policy_version": "face_regions_v1",
+                    "face_region_eye_padding": 0.35,
+                    "face_region_mouth_padding": 0.25,
+                    "face_region_require_landmarks": False,
+                    "face_region_eye_weight": 1.25,
+                    "face_region_mouth_weight": 1.35,
                     "temporal_bidirectional": True,
                     "temporal_attention_pooling": True,
                     "video_aggregation_topk_ratio": 0.25,
@@ -244,6 +271,9 @@ class FaceRoiPipelineTests(unittest.TestCase):
         self.assertEqual(parameters["yolo_face_model_path"], "/models/yolo-face.pt")
         self.assertAlmostEqual(parameters["face_roi_confidence_threshold"], 0.42)
         self.assertAlmostEqual(parameters["face_roi_crop_padding"], 0.2)
+        self.assertEqual(parameters["face_region_mode"], "face_eyes_mouth_fusion")
+        self.assertAlmostEqual(parameters["face_region_eye_padding"], 0.35)
+        self.assertAlmostEqual(parameters["face_region_mouth_padding"], 0.25)
         self.assertTrue(parameters["temporal_bidirectional"])
         self.assertTrue(parameters["temporal_attention_pooling"])
         self.assertAlmostEqual(parameters["video_aggregation_topk_ratio"], 0.25)
