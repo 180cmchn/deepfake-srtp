@@ -64,6 +64,7 @@ structlog==23.2.0
 # Additional ML libraries
 timm==0.9.10
 ultralytics==8.3.39
+mediapipe==0.10.14
 # transformers==4.36.0
 # albumentations==1.3.1
 

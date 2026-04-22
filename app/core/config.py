@@ -159,6 +159,13 @@ class Settings(BaseSettings):
     YOLO_FACE_CROP_PADDING: float = 0.18
     YOLO_FACE_POLICY_VERSION: str = "single_face_v1"
     YOLO_FACE_SELECTION_POLICY: str = "confidence_area"
+    FACE_REGION_MODE: str = "face_eyes_mouth_fusion"
+    FACE_REGION_POLICY_VERSION: str = "face_regions_v1"
+    FACE_REGION_EYE_PADDING: float = 0.35
+    FACE_REGION_MOUTH_PADDING: float = 0.25
+    FACE_REGION_REQUIRE_LANDMARKS: bool = False
+    FACE_REGION_EYE_WEIGHT: float = 1.25
+    FACE_REGION_MOUTH_WEIGHT: float = 1.35
     TEMPORAL_BIDIRECTIONAL: bool = True
     TEMPORAL_ATTENTION_POOLING: bool = True
     TEMPORAL_TRAIN_CLIP_OVERLAP_RATIO: float = 0.7
@@ -216,6 +223,20 @@ class Settings(BaseSettings):
             raise ValueError("YOLO_FACE_CROP_PADDING must be between 0.0 and 1.0")
         return v
 
+    @field_validator("FACE_REGION_EYE_PADDING", "FACE_REGION_MOUTH_PADDING")
+    @classmethod
+    def validate_face_region_padding(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("face region padding must be between 0.0 and 1.0")
+        return v
+
+    @field_validator("FACE_REGION_EYE_WEIGHT", "FACE_REGION_MOUTH_WEIGHT")
+    @classmethod
+    def validate_face_region_weights(cls, v):
+        if v <= 0.0:
+            raise ValueError("face region weights must be positive")
+        return v
+
     @field_validator("TEMPORAL_CLIP_MIN_FRAME_STD", "TEMPORAL_CLIP_MIN_MOTION_DELTA")
     @classmethod
     def validate_non_negative_temporal_quality_thresholds(cls, v):
@@ -267,6 +288,7 @@ class Settings(BaseSettings):
         "MODEL_USE_PRETRAINED_WEIGHTS",
         "MODEL_ALLOW_RANDOM_INIT_FALLBACK",
         "YOLO_FACE_ENABLED",
+        "FACE_REGION_REQUIRE_LANDMARKS",
         "TEMPORAL_CLIP_FILTER_ENABLED",
         "TEMPORAL_BIDIRECTIONAL",
         "TEMPORAL_ATTENTION_POOLING",
