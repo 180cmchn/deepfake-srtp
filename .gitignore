@@ -26,6 +26,10 @@ __pycache__/
 .coverage
 htmlcov/
 .sisyphus/
+AGENTS.md
+**/AGENTS.md
+agent.md
+**/agent.md
 
 .DS_Store
 .vscode/
