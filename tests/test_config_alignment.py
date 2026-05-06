@@ -43,6 +43,52 @@ class FakeDB:
 
 
 class ConfigAlignmentTests(unittest.TestCase):
+    def test_settings_accept_sqlite_database_url(self):
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": "sqlite:///./custom_detection.db"},
+            clear=True,
+        ):
+            settings = Settings(_env_file=None)
+
+        self.assertEqual(settings.DATABASE_URL, "sqlite:///./custom_detection.db")
+
+    def test_settings_reject_mysql_database_url(self):
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": "mysql+pymysql://user:pass@localhost:3306/deepfake_detection"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                Settings(_env_file=None)
+
+    def test_settings_reject_postgresql_database_url(self):
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": "postgresql://user:pass@localhost:5432/deepfake_detection"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                Settings(_env_file=None)
+
+    def test_settings_reject_in_memory_sqlite_database_url(self):
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": "sqlite:///:memory:"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                Settings(_env_file=None)
+
+    def test_settings_reject_sqlite_uri_memory_database_url(self):
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": "sqlite:///file::memory:?cache=shared&uri=true"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                Settings(_env_file=None)
+
     def test_settings_accept_legacy_api_v1_prefix_env_key(self):
         with patch.dict(os.environ, {"API_V1_PREFIX": "/legacy-api"}, clear=True):
             settings = Settings(_env_file=None)
