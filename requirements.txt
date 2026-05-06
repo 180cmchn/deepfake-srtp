@@ -8,9 +8,6 @@ pydantic-settings==2.1.0
 sqlalchemy==2.0.23
 alembic==1.13.1
 
-# Database drivers (for MySQL support)
-pymysql==1.1.0
-
 # Machine Learning
 # Use the PyTorch 2.7 line for both Apple Silicon and remote CUDA training.
 # Blackwell / RTX 5090 servers must install the torch stack from the CUDA 12.8 index:
