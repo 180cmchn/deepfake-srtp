@@ -9,8 +9,7 @@
 - 服务器系统：Ubuntu 22.04 / 24.04
 - Python：建议 3.9+，优先 3.10（仓库当前 torch 版本要求 Python 3.9+）
 - 同机部署后端、前端、Nginx
-- 后端默认先使用 SQLite 单机基线方案
-- 若后续并发写入、训练任务和历史写入压力较大，可切换到 MySQL
+- 后端数据库固定使用 SQLite 单机方案
 
 ### 重要说明
 
@@ -226,7 +225,6 @@ EOF"
 
 - CPU 机器：`TRAINING_DEVICE=auto` 或 `TRAINING_DEVICE=cpu`
 - CUDA 机器：确认 `nvidia-smi` 和 torch CUDA 可用后再改为 `TRAINING_DEVICE=cuda`
-- 如果使用 MySQL，连接串必须写成 `mysql+pymysql://...`，不要写 `mysql://...`
 
 ## 9. 配置前端 `config.js`
 
@@ -528,52 +526,16 @@ sqlite3 deepfake_detection.db ".tables"
 '
 ```
 
-## 17. 切换到 MySQL（可选）
+## 17. SQLite 维护（可选）
 
-当你预计会有多人同时使用、较高并发写入、训练任务与历史记录频繁写入时，建议切换到 MySQL。
-
-### 17.1 安装 MySQL
-
-```bash
-sudo apt-get install -y mysql-server
-sudo systemctl enable --now mysql
-sudo systemctl status mysql --no-pager
-```
-
-### 17.2 创建库和用户
-
-```bash
-sudo mysql -e "CREATE DATABASE deepfake_detection CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-sudo mysql -e "CREATE USER 'deepfake'@'localhost' IDENTIFIED BY 'CHANGE_THIS_PASSWORD';"
-sudo mysql -e "GRANT ALL PRIVILEGES ON deepfake_detection.* TO 'deepfake'@'localhost';"
-sudo mysql -e "FLUSH PRIVILEGES;"
-```
-
-### 17.3 修改 `.env`
-
-把：
-
-```env
-DATABASE_URL=sqlite:///./deepfake_detection.db
-```
-
-改成：
-
-```env
-DATABASE_URL=mysql+pymysql://deepfake:CHANGE_THIS_PASSWORD@127.0.0.1:3306/deepfake_detection
-```
-
-### 17.4 重跑初始化与连接检查
+如果你想确认当前 SQLite 数据库是否正常，可执行：
 
 ```bash
 sudo -u deepfake -H bash -lc '
 cd /opt/deepfake/deepfake-srtp
-venv/bin/python init_db.py
-venv/bin/python test_db_connection.py
+ls -lh deepfake_detection.db
+sqlite3 deepfake_detection.db ".tables"
 '
-
-sudo systemctl restart deepfake-backend
-sudo systemctl status deepfake-backend --no-pager
 ```
 
 ## 18. 常见坑

@@ -112,7 +112,7 @@ cp .env.example .env
 # 编辑 .env 文件配置您的设置
 # 建议修改以下配置项：
 # - SECRET_KEY: 生产环境中必须更改
-# - DATABASE_URL: 根据需要配置数据库
+# - DATABASE_URL: 保持为 SQLite 数据库文件路径
 # - GPU_ENABLED: 根据硬件配置设置
 ```
 
@@ -156,10 +156,10 @@ HOST=127.0.0.1 PORT=8000 WORKERS=1 RELOAD=False python run.py
 
 ### Docker / Compose 说明
 
-当前仓库包含的是 MySQL 辅助用的 `docker-compose.yml`，并未提供完整应用镜像的 `Dockerfile`。
+当前仓库未提供完整应用镜像的 `Dockerfile`，后端数据库固定使用 SQLite，不依赖外部数据库容器。
 
 ```bash
-docker compose up -d mysql
+docker compose config
 ```
 
 如果你要按仓库当前支持的方式部署完整应用，请参考 [docs/ubuntu-remote-deployment.md](docs/ubuntu-remote-deployment.md)。
@@ -197,7 +197,7 @@ ssh -p 13114 -L 8000:127.0.0.1:8000 root@connect.westd.seetacloud.com
 | `ENVIRONMENT` | 环境类型 | `development` | 生产环境设为`production` |
 | `HOST` | 服务器主机 | `0.0.0.0` | - |
 | `PORT` | 服务器端口 | `8000` | - |
-| `DATABASE_URL` | 数据库连接字符串 | `sqlite:///./deepfake_detection.db` | 生产环境建议使用PostgreSQL/MySQL |
+| `DATABASE_URL` | 数据库连接字符串 | `sqlite:///./deepfake_detection.db` | 使用文件型 SQLite 数据库 |
 | `SECRET_KEY` | 应用密钥 | 需要更改 | 生产环境必须更改 |
 | `DEFAULT_MODEL_TYPE` | 默认的 fallback 模型类型提示；真正检测仍要求存在 ready/deployed 的已登记模型 | `vgg` | - |
 | `MODEL_INPUT_SIZE` | 模型输入图像尺寸 | `224` | - |
@@ -215,15 +215,7 @@ ssh -p 13114 -L 8000:127.0.0.1:8000 root@connect.westd.seetacloud.com
 DATABASE_URL=sqlite:///./deepfake_detection.db
 ```
 
-#### PostgreSQL
-```bash
-DATABASE_URL=postgresql://username:password@localhost:5432/deepfake_detection
-```
-
-#### MySQL
-```bash
-DATABASE_URL=mysql+pymysql://username:password@localhost:3306/deepfake_detection
-```
+当前后端仅支持 SQLite 文件数据库，不再保留 PostgreSQL / MySQL 运行支持。
 
 ### Redis配置（可选）
 ```bash

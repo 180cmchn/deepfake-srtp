@@ -137,9 +137,6 @@ deepfake-srtp/
    ```bash
    # Test database connection
    python test_db_connection.py
-   
-   # For MySQL, ensure pymysql is installed
-   pip install pymysql
    ```
 
 3. **Memory Issues**
@@ -166,10 +163,10 @@ deepfake-srtp/
    - Set `GPU_ENABLED=True` in `.env`
    - Use appropriate batch sizes
 
-2. **Database optimization**
-   - Use PostgreSQL/MySQL for production
-   - Configure connection pooling
-   - Enable query logging for debugging
+2. **Database maintenance**
+   - Keep the SQLite file on fast local storage
+   - Back up `deepfake_detection.db` regularly
+   - Keep disk space available for checkpoints and uploads
 
 3. **Model optimization**
    - Use model quantization for inference
@@ -192,10 +189,10 @@ For a same-host production deployment behind Nginx, see [docs/ubuntu-remote-depl
 
 ### Docker / Compose Notes
 
-The repository currently includes `docker-compose.yml` for a MySQL helper service, but it does not ship a full application `Dockerfile` yet.
+The repository does not ship a full application `Dockerfile`, and the backend uses SQLite directly instead of an external database container.
 
 ```bash
-docker compose up -d mysql
+docker compose config
 ```
 
 For the supported non-container Ubuntu deployment flow, see [docs/ubuntu-remote-deployment.md](docs/ubuntu-remote-deployment.md).
@@ -235,11 +232,9 @@ Key environment variables:
 
 ### Database Configuration
 
-The platform supports multiple database backends:
+The backend is SQLite-only:
 
-- **SQLite** (default): `sqlite:///./deepfake_detection.db`
-- **PostgreSQL**: `postgresql://user:password@localhost/dbname`
-- **MySQL**: `mysql+pymysql://user:password@localhost/dbname`
+- **SQLite**: `sqlite:///./deepfake_detection.db`
 
 ### GPU Support
 
