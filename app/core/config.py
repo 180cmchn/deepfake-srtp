@@ -6,6 +6,7 @@ from typing import List, Optional
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
+from sqlalchemy.engine import make_url
 import os
 
 # Load environment variables from .env file
@@ -75,18 +76,6 @@ class Settings(BaseSettings):
 
     # Database Settings
     DATABASE_URL: str = "sqlite:///./deepfake_detection.db"
-
-    # MySQL Settings (for MySQL database)
-    MYSQL_HOST: str = "localhost"
-    MYSQL_PORT: int = 3306
-    MYSQL_USER: str = "root"
-    MYSQL_PASSWORD: str = ""
-    MYSQL_DATABASE: str = "deepfake_detection"
-
-    @property
-    def MYSQL_URL(self) -> str:
-        """Generate MySQL connection URL"""
-        return f"mysql+pymysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DATABASE}"
 
     # Redis Settings (for Celery)
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -305,10 +294,18 @@ class Settings(BaseSettings):
     def validate_urls(self):
         """Validate URL formats"""
         # Validate database URL
-        if not self.DATABASE_URL.startswith(
-            ("sqlite:///", "mysql+pymysql://", "postgresql://")
+        if not self.DATABASE_URL.startswith("sqlite:///"):
+            raise ValueError("DATABASE_URL must be a SQLite connection string")
+        parsed_database_url = make_url(self.DATABASE_URL)
+        database_target = parsed_database_url.database or ""
+        if (
+            database_target == ":memory:"
+            or database_target.startswith("file:")
+            or parsed_database_url.query
         ):
-            raise ValueError("DATABASE_URL must be a valid database connection string")
+            raise ValueError(
+                "DATABASE_URL must reference a file-backed SQLite database"
+            )
 
         # Validate Redis URLs
         redis_urls = [

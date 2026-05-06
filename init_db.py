@@ -100,9 +100,6 @@ def sync_legacy_sqlite_schema() -> bool:
     Some historical databases were created outside Alembic and can miss
     columns that newer code expects.
     """
-    if not settings.DATABASE_URL.startswith("sqlite"):
-        return True
-
     try:
         required_columns = {
             "model_registry": [

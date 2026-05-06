@@ -9,32 +9,19 @@ from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from contextlib import contextmanager
 from typing import Any, Dict, Generator
 import time
-import sqlite3
-import pymysql
 from .config import settings
 from .logging import logger
 
 
 def create_database_engine():
-    """Create database engine with optimized configuration based on ai-manager-plateform"""
-    if settings.DATABASE_URL.startswith("sqlite"):
-        engine = create_engine(
-            settings.DATABASE_URL,
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-            echo=False,
-            pool_pre_ping=True,
-        )
-    else:
-        engine = create_engine(
-            settings.DATABASE_URL,
-            pool_pre_ping=True,
-            pool_recycle=300,  # Shorter recycle time like ai-manager-plateform
-            pool_size=10,  # Base connection pool size
-            max_overflow=20,  # Additional connections when needed
-            echo=False,  # Set to True for SQL debugging
-        )
-    return engine
+    """Create the SQLite engine used by the application."""
+    return create_engine(
+        settings.DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        echo=False,
+        pool_pre_ping=True,
+    )
 
 
 # Create database engine
